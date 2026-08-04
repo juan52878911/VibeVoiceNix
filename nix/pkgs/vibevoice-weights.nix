@@ -1,0 +1,74 @@
+# Pesos de VibeVoice-Realtime-0.5B y los recursos del repo que el paquete
+# Python NO incluye.
+#
+# El pyproject de VibeVoice solo empaqueta `vibevoice*` y `vllm_plugin*`, asi
+# que las voces (demo/voices/streaming_model/*.pt) y el script de inferencia se
+# traen aparte desde el mismo commit que fija el uv.lock.
+#
+# Importante sobre idiomas: el 1.5B y el Large-7B son ingles+chino. Solo este
+# Realtime-0.5B tiene voces en espanol (sp-Spk0_woman / sp-Spk1_man), anadidas
+# por Microsoft en diciembre de 2025 y marcadas como experimentales.
+{ lib, fetchurl, fetchFromGitHub, runCommand }:
+
+let
+  # Mismo commit que fija pkgs/vibevoice/uv.lock. Si cambia uno, cambia el otro.
+  commit = "94da20d98b2fa7688e9cbfaf7692ddb4954f7600";
+
+  repo = fetchFromGitHub {
+    owner = "microsoft";
+    repo = "VibeVoice";
+    rev = commit;
+    hash = "sha256-v/QpYOmUYwAi8s0QYuGbZkM8JYa0OC6zAbSqLlEhDQA=";
+  };
+
+  baseHF = "https://huggingface.co/microsoft/VibeVoice-Realtime-0.5B/resolve/main";
+
+  ficheros = {
+    "config.json" = "sha256-yu4mkeeQsEBUu+FKdTtAFJ+nwMFvrbWNmt9UEjQ9z1c=";
+    # 1,9 GB en fp32: es el motivo de que el servicio pida ~4 GB de RAM.
+    "model.safetensors" = "sha256-d1ixULgTnetIrB/28YH3Rcj+3VURIy/ZdLPrIX2DtRQ=";
+    "preprocessor_config.json" = "sha256-6/UUtdMKAS5a4A2aGdAec141sndow5JtmAgV24+nQuU=";
+  };
+
+  descargas = lib.mapAttrsToList
+    (nombre: hash: {
+      inherit nombre;
+      fichero = fetchurl { url = "${baseHF}/${nombre}"; inherit hash; };
+    })
+    ficheros;
+in
+rec {
+  inherit repo;
+
+  # Directorio en formato "modelo de Hugging Face": se le pasa tal cual como
+  # --model_path y evita que el servicio tenga que salir a la red.
+  modelo = runCommand "vibevoice-realtime-0.5b" { } ''
+    mkdir -p "$out"
+    ${lib.concatMapStringsSep "\n"
+      (d: ''ln -s ${d.fichero} "$out/${d.nombre}"'')
+      descargas}
+  '';
+
+  # Voces preentrenadas (.pt). Las de espanol son sp-Spk0_woman y sp-Spk1_man.
+  voces = runCommand "vibevoice-voces" { } ''
+    mkdir -p "$out"
+    cp -r ${repo}/demo/voices/streaming_model/. "$out/"
+  '';
+
+  # Script de inferencia con el parche del weights_only.
+  #
+  # Los .pt guardan un BaseModelOutputWithPast, subclase de OrderedDict, y el
+  # desempaquetador seguro de torch >=2.6 solo admite dict/OrderedDict/Counter
+  # exactos -> falla con "Can only SETITEMS for dict...". Como el fichero viene
+  # del repo oficial fijado por commit, desactivamos la comprobacion ahi.
+  inferencia = runCommand "vibevoice-inferencia" { } ''
+    mkdir -p "$out/bin"
+    substitute \
+      ${repo}/demo/realtime_model_inference_from_file.py \
+      "$out/bin/vibevoice-inferencia.py" \
+      --replace-fail \
+        'torch.load(voice_sample, map_location=target_device, weights_only=True)' \
+        'torch.load(voice_sample, map_location=target_device, weights_only=False)'
+    chmod +x "$out/bin/vibevoice-inferencia.py"
+  '';
+}

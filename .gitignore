@@ -1,0 +1,33 @@
+# Nix
+result
+result-*
+.direnv/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Ansible
+*.retry
+ansible/inventory/hosts.generated.yml
+
+# Secretos: el token de la API y las credenciales de Proxmox nunca entran al repo
+secrets/
+*.age
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Audio de pruebas
+*.wav
+*.ogg
+*.mp3
+!pkgs/voz-api/tests/fixtures/*.wav
