@@ -1,0 +1,83 @@
+# Paso 1: crear la VM en Proxmox y esperar a que responda por SSH.
+#
+# Ansible aqui NO configura el sistema: de eso se encarga el flake. Su papel es
+# encadenar los pasos y verificar que cada uno ha dejado la maquina como toca.
+---
+- name: Provisionar la VM de voz en Proxmox
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    raiz_repo: "{{ playbook_dir }}/../.."
+    dir_terraform: "{{ raiz_repo }}/terraform"
+
+  tasks:
+    - name: Comprobar que existe terraform.tfvars
+      ansible.builtin.stat:
+        path: "{{ dir_terraform }}/terraform.tfvars"
+      register: tfvars
+
+    - name: Avisar si falta la configuracion
+      ansible.builtin.fail:
+        msg: >-
+          Falta {{ dir_terraform }}/terraform.tfvars.
+          Copia terraform.tfvars.example y rellena el token de Proxmox.
+      when: not tfvars.stat.exists
+
+    - name: Inicializar Terraform
+      ansible.builtin.command:
+        cmd: tofu init -input=false
+        chdir: "{{ dir_terraform }}"
+      register: init
+      changed_when: "'has been successfully initialized' in init.stdout"
+
+    - name: Crear la VM
+      ansible.builtin.command:
+        cmd: tofu apply -auto-approve -input=false
+        chdir: "{{ dir_terraform }}"
+      register: apply
+      changed_when: "'0 added, 0 changed, 0 destroyed' not in apply.stdout"
+
+    - name: Leer las salidas de Terraform
+      ansible.builtin.command:
+        cmd: tofu output -json
+        chdir: "{{ dir_terraform }}"
+      register: salidas
+      changed_when: false
+
+    - name: Guardar la IP de la VM
+      ansible.builtin.set_fact:
+        ip_voz: "{{ (salidas.stdout | from_json).ip.value }}"
+
+    - name: Comprobar que hay IP
+      ansible.builtin.fail:
+        msg: >-
+          Terraform no ha devuelto IP. Si la VM va por DHCP, espera a que el
+          agente reporte y vuelve a lanzar, o pon ip_cidr fija en terraform.tfvars.
+      when: ip_voz is none or ip_voz | length == 0
+
+    - name: Esperar a que SSH responda
+      ansible.builtin.wait_for:
+        host: "{{ ip_voz }}"
+        port: 22
+        timeout: 300
+        delay: 10
+
+    - name: Escribir el inventario para los siguientes playbooks
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../inventory/hosts.generated.yml"
+        mode: "0644"
+        content: |
+          # Generado por provision.yml. No editar a mano.
+          voz:
+            hosts:
+              voz:
+                ansible_host: {{ ip_voz }}
+                ansible_user: root
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "VM creada y accesible en {{ ip_voz }}"
+          - "Siguiente paso: ansible-playbook ansible/playbooks/install.yml"

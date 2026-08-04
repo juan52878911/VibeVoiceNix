@@ -1,0 +1,30 @@
+# Copiar a terraform.tfvars y rellenar. Ese fichero esta en .gitignore:
+# el token de Proxmox no entra al repo.
+#
+# Crear el token en el host Proxmox:
+#   pveum user token add root@pam terraform --privsep 0
+# Devuelve un UUID que solo se muestra UNA vez.
+
+proxmox_endpoint  = "https://192.168.2.100:8006/"
+proxmox_api_token = "root@pam!terraform=00000000-0000-0000-0000-000000000000"
+proxmox_insecure  = true
+
+node = "pve"
+vmid = 210
+
+# IDs ya ocupados en este homelab: 100 (app-noticias), 200 (aura-sandbox),
+# 201 (portainer), 202 (voz, el contenedor Debian que sustituye este proyecto).
+
+cores      = 8
+memoria_mb = 6144
+disco_gb   = 40
+
+# IP fija: nixos-anywhere necesita saber a donde conectarse, y con DHCP hay que
+# esperar al agente. Con fija el despliegue es de un tiron.
+ip_cidr = "192.168.2.54/24"
+gateway = "192.168.2.1"
+
+# Debe coincidir con nix/host.nix
+claves_ssh = [
+  "ssh-rsa AAAAB3NzaC1yc2E... ssh-key-2026-08-01"
+]
