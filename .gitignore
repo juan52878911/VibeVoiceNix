@@ -31,3 +31,6 @@ __pycache__/
 *.ogg
 *.mp3
 !pkgs/voz-api/tests/fixtures/*.wav
+
+# macOS
+.DS_Store
