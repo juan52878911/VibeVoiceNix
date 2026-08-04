@@ -70,8 +70,8 @@ Módulo: [`nix/modules/voz-api.nix`](../nix/modules/voz-api.nix).
 ### Notas sobre las que tienen truco
 
 **`voces`** es un `enum` sobre el catálogo, así que escribir mal el nombre de una voz es un error de
-evaluación con la lista de opciones válidas, no un fallo en tiempo de ejecución. Cada voz `high` ocupa
-entre ~60 y 109 MB, así que conviene no instalarlas todas si el disco va justo.
+evaluación con la lista de opciones válidas, no un fallo en tiempo de ejecución. Van de 61 a 109 MB por
+voz, así que conviene no instalarlas todas si el disco va justo.
 
 **`promptSTT`** es el ajuste que más cambia la calidad del reconocimiento. Sin él, *«WireGuard»* se
 transcribe *«We The War»* y *«homelab»* se convierte en *«omelab»*. Merece la pena poner ahí la jerga
@@ -125,21 +125,34 @@ Módulo: [`nix/modules/vibevoice.nix`](../nix/modules/vibevoice.nix).
 |---|---|---|---|
 | `enable` | `bool` | `false` | Instala la orden `vibevoice` en el sistema. |
 | `hilos` | `int` | `8` | Hilos de OpenMP para la inferencia en CPU. |
-| `cfgScale` | `float` | `1.5` | Escala del *classifier-free guidance*. |
+| `cfgScale` | `float` | `1.5` | Escala del *classifier-free guidance*. **Calidad, no velocidad.** |
 
-**`cfgScale` es la palanca de velocidad.** Con CFG activo, cada paso de difusión hace dos pasadas
-—condicional e incondicional—, así que bajarlo a `1.0` casi duplica la velocidad a cambio de
-expresividad. `1.5` es el valor original del modelo.
+**`cfgScale` no acelera nada, y está medido.** Parecía la palanca obvia —con CFG cada paso de difusión
+hace una pasada condicional y otra incondicional— pero bajarlo sale peor por los dos lados:
+
+| `cfg_scale` | RTF | Audio generado |
+|---|---|---|
+| 1.5 | **3,92** | 10,93 s |
+| 1.3 | 4,02 | 11,87 s |
+| 1.0 | 4,20 | 17,07 s ← divaga |
+
+`sample_speech_tokens` concatena condicional e incondicional en un mismo batch **siempre**, sin rama que
+se salte la segunda; parchearlo tampoco sirvió (RTF 3,90). Con dimensión 896 y batch 2 el cuello es el
+ancho de banda de memoria, no los FLOPs. **Déjalo en `1.5`.** El detalle está en
+[rendimiento.md](rendimiento.md#cfgscale-no-acelera-se-midió).
+
+**`hilos` sí importa:** pasar de 4 a 8 núcleos bajó el RTF de 4,80 a 3,92. Fue el único ajuste que movió
+la aguja.
 
 Las dos se pueden pisar por llamada sin reconstruir el sistema:
 
 ```bash
-VIBEVOICE_HILOS=12 VIBEVOICE_CFG=1.0 vibevoice --txt_path guion.txt --speaker_names sp-Spk0_woman
+VIBEVOICE_HILOS=12 vibevoice --txt_path guion.txt --speaker_names sp-Spk0_woman
 ```
 
-La orden prepara el entorno antes de invocar el script: crea un directorio temporal con las voces
-enlazadas donde el script las busca (`./demo/voices/…`), fija `OMP_NUM_THREADS` y pone `HF_HUB_OFFLINE=1`
-para que no intente salir a internet. El modelo se le pasa como ruta del store.
+La orden es un envoltorio fino: fija `OMP_NUM_THREADS`, pone `HF_HUB_OFFLINE=1` para que no intente salir
+a internet, y le pasa el modelo como ruta del store. No prepara ningún directorio de trabajo — el script
+de inferencia lleva la ruta de las voces sustituida en la propia derivación.
 
 **Voces disponibles:** las españolas son `sp-Spk0_woman` y `sp-Spk1_man`, añadidas por Microsoft en
 diciembre de 2025 y marcadas por ellos como experimentales. Los modelos 1.5B y Large-7B solo hablan inglés
@@ -152,13 +165,13 @@ y chino; este `Realtime-0.5B` es el único con español.
 El catálogo está en [`nix/pkgs/piper-voices.nix`](../nix/pkgs/piper-voices.nix). Cinco voces en español,
 cada una fijada por el hash de su `.onnx` y de su `.onnx.json`.
 
-| Voz | Región | Calidad | RTF relativo | Notas |
+| Voz | Región | Calidad | RTF relativo | Tamaño |
 |---|---|---|---|---|
-| `es_MX-claude-high` | México | high | 0,152 | **la voz por defecto**: latinoamericana y la más rápida de las `high` |
-| `es_MX-ald-medium` | México | medium | 0,151 | la más rápida del catálogo |
-| `es_ES-sharvard-medium` | España | medium | 0,177 | |
-| `es_ES-davefx-medium` | España | medium | 0,191 | |
-| `es_AR-daniela-high` | Argentina | high | 0,408 | la más pesada: 109 MB |
+| `es_MX-claude-high` | México | high | 0,152 | 61 MB — **la voz por defecto**: latinoamericana y la más rápida de las `high` |
+| `es_MX-ald-medium` | México | medium | 0,151 | 61 MB — la más rápida del catálogo |
+| `es_ES-sharvard-medium` | España | medium | 0,177 | 74 MB |
+| `es_ES-davefx-medium` | España | medium | 0,191 | 61 MB |
+| `es_AR-daniela-high` | Argentina | high | 0,408 | 109 MB — la más pesada |
 
 > **Sobre estas cifras.** Se midieron con el mismo texto (~10 s de audio) para **comparar las voces entre
 > sí**; úsalas como orden relativo. El repositorio documenta aparte un RTF de **0,042** para el servicio
@@ -173,19 +186,19 @@ hace fallar la compilación, no instala otra cosa en silencio.
 
 ## Aserciones y avisos
 
-El sistema se niega a construirse en tres casos, todos ellos errores que se notarían tarde y mal.
+El sistema se niega a construirse en estos casos, todos ellos errores que se notarían tarde y mal.
 
 | Dónde | Condición | Por qué |
 |---|---|---|
 | `configuration.nix` | `homelab.clavesSSH != [ ]` | la VM se instalaría sin ninguna forma de entrar |
 | `voz-api.nix` | `vozDefecto ∈ voces` | la voz por defecto no estaría instalada; fallaría en la primera petición |
 | `voz-api.nix` | `abrirCortafuegos → ficheroToken != null` | **abrir el puerto sin token deja el TTS y el STT accesibles a cualquiera de la LAN** |
+| `vibevoice.nix` | `swapDevices != [ ]` | VibeVoice hace pico de ~3,9 GB; sin swap, una generación se lleva por delante al que pida memoria |
 | `piper-voices.nix` | las voces pedidas están en el catálogo | mensaje con los nombres desconocidos y la lista de válidos |
 
-Y un aviso que no bloquea:
-
-> VibeVoice necesita ~4 GB de RAM libres durante la generación. Si esta VM tiene menos de 6 GB, lanzarlo
-> mientras `voz-api` sirve peticiones puede empujar el sistema a swap.
+La última es la más fácil de encontrarse: si desactivas la swap que declara
+[`nix/disko.nix`](../nix/disko.nix) y dejas `services.vibevoice.enable = true`, el sistema no construye
+hasta que añadas `swapDevices` o apagues el laboratorio.
 
 ---
 
@@ -281,7 +294,7 @@ services.voz-api = {
   promptSTT = "Vocabulario: Proxmox, NixOS, WireGuard, systemd, backup, contenedor.";
 };
 
-services.vibevoice.enable = false;   # ahorra ~4 GB de disco
+services.vibevoice.enable = false;   # ahorra ~4 GB de disco y la asercion de swap
 ```
 
 ### Multivoz, para distinguir contextos

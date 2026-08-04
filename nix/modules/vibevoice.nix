@@ -18,19 +18,14 @@ let
   pesos = pkgs.vibevoicePesos;
 
   # Envoltorio que cablea el entorno: modelo local (sin salir a la red), voces
-  # del repo y el script ya parcheado.
+  # del repo y el script ya parcheado. El script trae la ruta de las voces
+  # sustituida, asi que no hace falta preparar ningun directorio.
   vibevoice = pkgs.writeShellApplication {
     name = "vibevoice";
     runtimeInputs = [ pkgs.vibevoice-env pkgs.ffmpeg ];
     text = ''
-      # Directorio de trabajo: el script busca las voces en ./demo/voices/...
-      trabajo="$(mktemp -d)"
-      trap 'rm -rf "$trabajo"' EXIT
-      mkdir -p "$trabajo/demo/voices"
-      ln -s ${pesos.voces} "$trabajo/demo/voices/streaming_model"
-
-      cd "$trabajo"
       export OMP_NUM_THREADS="''${VIBEVOICE_HILOS:-${toString cfg.hilos}}"
+      # El modelo esta en el store: nada que descargar en tiempo de ejecucion.
       export HF_HUB_OFFLINE=1
 
       exec python ${pesos.inferencia}/bin/vibevoice-inferencia.py \
@@ -58,9 +53,16 @@ in
       type = lib.types.float;
       default = 1.5;
       description = ''
-        Escala del classifier-free guidance. Con CFG cada paso de difusion hace
-        dos pasadas (condicional e incondicional), asi que bajarlo a 1.0 casi
-        duplica la velocidad a cambio de expresividad. 1.5 es el valor original.
+        Escala del classifier-free guidance. Afecta a la CALIDAD, no a la
+        velocidad: medido en un i7-8700T da RTF 3,92 (1.5), 4,02 (1.3) y 4,20
+        (1.0), y a 1.0 el modelo ademas divaga (17 s de audio para un texto de
+        11 s). Dejalo en 1.5.
+
+        El motivo de que no acelere es que sample_speech_tokens concatena
+        siempre condicional e incondicional en un mismo batch, sin rama que se
+        salte el segundo. Parchearlo tampoco sirve: se probo y dio RTF 3,90,
+        porque con dim 896 y batch 2 el cuello es el ancho de banda de memoria
+        y no los FLOPs, asi que la segunda mitad del batch sale casi gratis.
       '';
     };
   };
@@ -68,13 +70,14 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ vibevoice ];
 
-    # 1,9 GB de modelo mas el runtime: por debajo de 6 GB el sistema va a swap
-    # y el RTF, que ya es malo, se vuelve inservible.
-    warnings = lib.optional (config.systemd.services ? voz-api && cfg.enable)
-      ''
-        VibeVoice necesita ~4 GB de RAM libres durante la generacion. Si esta VM
-        tiene menos de 6 GB, lanzarlo mientras voz-api sirve peticiones puede
-        empujar el sistema a swap.
+    # 1,9 GB de modelo mas el runtime dan ~3,9 GB de pico. Sin swap, una
+    # generacion en una VM justa se lleva por delante al que pida memoria.
+    assertions = [{
+      assertion = config.swapDevices != [ ];
+      message = ''
+        services.vibevoice necesita ~4 GB de RAM durante la generacion y esta
+        configuracion no define swap. Anade swapDevices o desactiva vibevoice.
       '';
+    }];
   };
 }

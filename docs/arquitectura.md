@@ -4,7 +4,8 @@ Cómo encaja el proyecto y, sobre todo, **por qué** cada pieza es la que es. Ca
 aparecen aquí están justificadas por una medición o por una restricción concreta; cuando es así, se dice
 cuál.
 
-- [Las cuatro capas](#las-cuatro-capas)
+- [Las capas](#las-capas)
+- [Por qué Ansible no configura nada](#por-qué-ansible-no-configura-nada)
 - [El flake](#el-flake)
 - [El overlay: de `uv.lock` a derivación](#el-overlay-de-uvlock-a-derivación)
 - [Los modelos como paquetes](#los-modelos-como-paquetes)
@@ -17,7 +18,7 @@ cuál.
 
 ---
 
-## Las cuatro capas
+## Las capas
 
 ```mermaid
 flowchart TD
@@ -54,7 +55,15 @@ flowchart TD
     NP --> MW
     MW & MA & MV --> SYS
     DK --> SYS
-    SYS -->|"nixos-anywhere"| VM["VM «voz» en Proxmox"]
+
+    subgraph L5["5 · Orquestación — terraform/ + ansible/"]
+        TF["OpenTofu<br/>crea la VM en Proxmox"]
+        AN["Ansible<br/>provision → install → update"]
+        AN --> TF
+    end
+
+    TF --> VM["VM «voz» en Proxmox"]
+    SYS -->|"nixos-anywhere"| VM
     NA -.-> VM
 ```
 
@@ -62,6 +71,29 @@ La regla que organiza todo esto está escrita en la cabecera de
 [`nix/configuration.nix`](../nix/configuration.nix): *si algo no está en el flake, no existe*. No hay un
 `README` con «y ahora ejecuta esto a mano»; no hay estado que sobreviva a una reinstalación salvo el token,
 y ese se regenera solo.
+
+---
+
+## Por qué Ansible no configura nada
+
+Es la decisión que más sorprende al mirar el repositorio: hay Ansible, pero **no toca la configuración del
+sistema**.
+
+NixOS ya *es* configuración declarativa. Si Ansible instalara paquetes o escribiera ficheros habría **dos
+fuentes de verdad** —el flake y los playbooks— y se perdería justo la propiedad que se busca: que la
+máquina sea una función pura de su descripción.
+
+Así que aquí Ansible hace lo que Nix no hace: **encadenar el ciclo y verificar cada paso.**
+
+| Playbook | Qué hace |
+|---|---|
+| `provision.yml` | comprueba que existe `terraform.tfvars`, lanza `tofu init` y `tofu apply`, y genera el inventario con la IP de la VM |
+| `install.yml` | **pide confirmación antes de formatear**, comprueba que el flake evalúa, lanza `nixos-anywhere`, espera al arranque y verifica que la API responde |
+| `update.yml` | comprueba que el flake evalúa, aplica la configuración y confirma que la API sigue en pie |
+
+Fíjate en el patrón: los tres validan **antes** de tocar nada (`nix eval` del `toplevel`) y verifican
+**después** (la API contesta). El reparto es Terraform para la infraestructura, el flake para el sistema, y
+Ansible solo como pegamento.
 
 ---
 
@@ -126,8 +158,36 @@ arena de Nix en un i7-8700T no es una opción realista. Nix parchea las ruedas `
 
 **`libsNativas`.** Una rueda binaria declara sus dependencias de Python, pero no las librerías del sistema
 contra las que enlaza. `autoPatchelf` necesita tenerlas en `buildInputs` o falla la compilación. El helper
-añade `libstdc++` y `zlib` a los paquetes que lo necesitan: `onnxruntime` para `voz-api`, y `torch`,
-`numpy`, `scipy` y `llvmlite` para VibeVoice.
+añade `libstdc++` y `zlib` a los paquetes que lo necesitan —`onnxruntime` para `voz-api`, y `torch`,
+`numpy`, `scipy` y `llvmlite` para VibeVoice— y acepta un `extra` para los que piden algo más:
+`numba` enlaza `libtbb.so.12` sin declararlo, así que recibe además `pkgs.tbb`.
+
+Junto a él hay otros dos ajustes, y ninguno se descubrió leyendo código:
+
+- **`sistemasDeConstruccion`.** VibeVoice se instala desde git y su `pyproject` usa
+  `setuptools.build_meta`, pero **uv2nix construye sin aislamiento** y no se lo encuentra. Se le inyecta
+  con `resolveBuildSystem`.
+- **`arreglarSoundfile`.** `soundfile` carga `libsndfile` con `dlopen` **por nombre y en tiempo de
+  ejecución**. `autoPatchelf` no puede verlo —no es una dependencia enlazada—, así que se sustituye el
+  nombre por la ruta absoluta del store, igual que hace nixpkgs.
+
+### Evaluar no es construir
+
+Los tres ajustes anteriores son la moraleja del proyecto. El flake **evaluaba limpio desde el principio**
+y aun así fallaba al compilar de verdad en un x86-64:
+
+| Fallo | Causa | Arreglo |
+|---|---|---|
+| `No module named 'setuptools'` | uv2nix compila sin aislamiento y VibeVoice usa `setuptools.build_meta` | `resolveBuildSystem { setuptools = []; }` |
+| `libtbb.so.12` no satisfecha en `numba` | la rueda enlaza oneTBB sin declararlo | `pkgs.tbb` en `buildInputs` |
+| `cannot load library 'libsndfile.so'` | `soundfile` hace `dlopen` por nombre **en ejecución** | sustituir por la ruta absoluta del store |
+
+Un cuarto apareció ya en ejecución y está en el apartado siguiente. La conclusión práctica: `nix eval`
+verde no dice nada sobre si el sistema construye.
+
+> **Nota sobre `transformers`.** El entorno resuelve la **4.57.6**, no la 4.51.3 que fija el extra
+> `streamingtts` del repositorio original. Se probó y genera audio correctamente, pero es lo primero que
+> hay que mirar si algo se rompe tras un `uv lock`.
 
 Y la razón de todo el ejercicio, en [`pkgs/vibevoice/pyproject.toml`](../pkgs/vibevoice/pyproject.toml):
 
@@ -171,14 +231,21 @@ aparte **desde el mismo commit** que fija el `uv.lock`. Salen tres derivaciones:
 |---|---|
 | `modelo` | `config.json`, `model.safetensors` (1,9 GB, fp32) y `preprocessor_config.json` en formato «modelo de Hugging Face», para pasarlo tal cual como `--model_path` y no salir a la red |
 | `voces` | los `.pt` de `demo/voices/streaming_model/` — las españolas son `sp-Spk0_woman` y `sp-Spk1_man` |
-| `inferencia` | el script `realtime_model_inference_from_file.py` con un parche |
+| `inferencia` | el script `realtime_model_inference_from_file.py` con **dos** parches |
 
-**El parche merece una explicación.** Los `.pt` de las voces guardan un `BaseModelOutputWithPast`, que es
-subclase de `OrderedDict`. El desempaquetador seguro de `torch >= 2.6` (`weights_only=True`) solo admite
-`dict`, `OrderedDict` y `Counter` exactos, así que falla con *«Can only SETITEMS for dict…»*. Como el
-fichero viene del repositorio oficial y está fijado por commit, se desactiva la comprobación justo ahí con
-un `substitute --replace-fail`: si Microsoft cambiara esa línea, la compilación fallaría en vez de aplicar
-el parche a ciegas.
+**Los dos parches merecen una explicación.**
+
+**1 · `weights_only`.** Los `.pt` de las voces guardan un `BaseModelOutputWithPast`, que es subclase de
+`OrderedDict`. El desempaquetador seguro de `torch >= 2.6` (`weights_only=True`) solo admite `dict`,
+`OrderedDict` y `Counter` exactos, así que falla con *«Can only SETITEMS for dict…»*.
+
+**2 · `voices_dir`.** El script busca las voces **junto a sí mismo** (`dirname(__file__)`), no en el
+directorio de trabajo. Al vivir en el store no encontraba ninguna. Se sustituye la ruta por la derivación
+`voces` — y gracias a eso el envoltorio del módulo ya no necesita montar un directorio temporal, como hacía
+antes.
+
+Los dos usan `substitute --replace-fail`: si Microsoft cambiara esas líneas, la compilación fallaría en vez
+de aplicar el parche a ciegas.
 
 ---
 
@@ -212,13 +279,13 @@ cualquiera de la red**, y es el tipo de error que no se nota hasta que importa.
 
 ### `services.vibevoice`
 
-No levanta ningún servicio. Instala una orden `vibevoice` construida con `writeShellApplication` que
-prepara el terreno antes de invocar el script: crea un directorio temporal —el script busca las voces en
-`./demo/voices/…`—, enlaza las voces del store, fija `OMP_NUM_THREADS` y pone `HF_HUB_OFFLINE=1` para que
-no intente salir a internet.
+No levanta ningún servicio. Instala una orden `vibevoice` construida con `writeShellApplication` que es un
+envoltorio fino: fija `OMP_NUM_THREADS`, pone `HF_HUB_OFFLINE=1` para que no intente salir a internet, y
+le pasa el modelo como ruta del store. No prepara ningún directorio de trabajo, porque el script ya lleva
+la ruta de las voces sustituida en su propia derivación.
 
-También emite un aviso: VibeVoice necesita ~4 GB de RAM libres durante la generación, y lanzarlo mientras
-`voz-api` sirve peticiones en una VM con menos de 6 GB empuja el sistema a la swap.
+Y trae una aserción: **el sistema no construye si no hay `swapDevices` declarada**. VibeVoice hace pico de
+~3,9 GB y, sin swap, una generación en una VM justa se lleva por delante al primero que pida memoria.
 
 ---
 
@@ -336,7 +403,7 @@ Un resumen de todo lo anterior, con el porqué en una línea.
 
 | Decisión | Motivo |
 |---|---|
-| Piper sirve la producción, no VibeVoice | RTF 0,042 frente a 4,80: ~100× de diferencia ([medidas](rendimiento.md)) |
+| Piper sirve la producción, no VibeVoice | RTF 0,042 frente a 3,92: casi 100× de diferencia ([medidas](rendimiento.md)) |
 | whisper con el modelo `small`, no `base` | `base` es 3× más rápido pero confunde «Proxmox» y «backup» |
 | Todo en CPU, sin GPU | la iGPU Intel UHD 630 con Vulkan resultó **2,5× más lenta** que la CPU |
 | `torch` desde el índice `pytorch-cpu` | la rueda de CUDA pesa ~2,5 GB y no hay GPU NVIDIA |
@@ -346,8 +413,10 @@ Un resumen de todo lo anterior, con el porqué en una línea.
 | Modelos por `fetchurl` con hash fijo | si el origen sirve otra cosa, falla la compilación en vez de instalarla |
 | `sourcePreference = "wheel"` | compilar PyTorch en la caja de arena de Nix no es viable en este hardware |
 | Un solo intérprete, `python312` | es el solape de los `requires-python` de ambos workspaces |
-| VibeVoice como orden, no como servicio | ~4 GB de pico de RAM; no debe competir con la API |
+| VibeVoice como orden, no como servicio | ~3,9 GB de pico de RAM; no debe competir con la API |
+| Ansible no configura el sistema, solo encadena | dos fuentes de verdad romperían la reproducibilidad |
+| `cfgScale` se queda en 1.5 | bajarlo no acelera —está medido— y además el modelo divaga |
 | Sin LVM ni cifrado en el disco | la VM se reconstruye desde el flake, no se repara |
-| Swapfile de 4 GB | red de seguridad para el pico de VibeVoice en una VM de ~8 GB |
+| Swapfile de 4 GB | red de seguridad para el pico de VibeVoice; una aserción lo exige si el laboratorio está activo |
 | `options.nix` en su propio fichero | un módulo con `options` no puede llevar además atributos de `config` sueltos en la raíz |
 | `host.nix` separado del resto | es lo único que hay que editar al clonar; todo lo demás sirve tal cual |

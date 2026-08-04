@@ -1,98 +1,98 @@
 # Despliegue
 
-De una VM vacía en Proxmox a un sistema de voz funcionando. Después: cómo actualizarlo, cómo volver atrás
-y qué hacer cuando algo falla.
+De nada a un sistema de voz funcionando. El ciclo es **`provision → install → update`**: Terraform crea la
+VM, `nixos-anywhere` la reinstala desde el flake, y Ansible encadena y verifica los pasos.
 
 - [Antes de empezar](#antes-de-empezar)
-- [1 · Crear la VM en Proxmox](#1--crear-la-vm-en-proxmox)
-- [2 · Configurar el repositorio](#2--configurar-el-repositorio)
-- [3 · Instalar con nixos-anywhere](#3--instalar-con-nixos-anywhere)
+- [1 · Configurar los dos ficheros](#1--configurar-los-dos-ficheros)
+- [2 · Crear la VM](#2--crear-la-vm)
+- [3 · Instalar NixOS](#3--instalar-nixos)
 - [4 · Comprobar que funciona](#4--comprobar-que-funciona)
-- [Actualizar el sistema](#actualizar-el-sistema)
+- [El día a día: actualizar](#el-día-a-día-actualizar)
 - [Volver atrás](#volver-atrás)
 - [Problemas frecuentes](#problemas-frecuentes)
-- [Provisión automática (pendiente)](#provisión-automática-pendiente)
+- [Apéndice: despliegue manual](#apéndice-despliegue-manual)
 
 ---
 
 ## Antes de empezar
 
-En tu máquina hace falta **Nix con flakes activados** y poco más:
+En tu máquina, **Nix con flakes** y nada más. El resto lo trae el entorno:
 
 ```bash
 nix develop
 ```
 
-Eso trae OpenTofu, Ansible, `uv`, `jq`, `curl` y —en Linux— `nixos-anywhere` y `nixos-rebuild`. No hay que
-instalar nada en el sistema.
+Eso pone en el `PATH` OpenTofu, Ansible, `uv`, `jq`, `curl` y —en Linux— `nixos-anywhere` y
+`nixos-rebuild`.
 
-En el hipervisor hace falta un **Proxmox VE** con sitio para una VM x86-64. No hace falta GPU: todo el
-stack corre en CPU a propósito, y el motivo está medido en [rendimiento.md](rendimiento.md).
+En el hipervisor, un **Proxmox VE** y un token de API. Se crea en el host con:
 
-> **Aviso.** `disko` formatea el disco que le indiques **sin preguntar nada**. Antes del primer despliegue,
-> comprueba con `lsblk` qué disco es y que está vacío.
+```bash
+pveum user token add root@pam terraform --privsep 0
+```
+
+Devuelve un UUID que **solo se muestra una vez**.
+
+> **Aviso.** `install.yml` formatea el disco de la VM. Pide confirmación antes de hacerlo, pero conviene
+> saberlo: `disko` no pregunta nada por su cuenta.
+
+### Lo que crea Terraform
+
+Con los valores por defecto de [`terraform/variables.tf`](../terraform/variables.tf):
+
+| | |
+|---|---|
+| VM | id `210`, nombre `voz`, en el nodo `pve` |
+| CPU | 8 núcleos, tipo `host` — [8 núcleos bajan el RTF de VibeVoice un 18%](rendimiento.md#el-único-lever-real-fueron-los-núcleos) |
+| RAM | 6144 MB — valida que no bajes de 4 GB, porque VibeVoice hace pico de 3,9 GB |
+| Disco | 40 GB en `local-lvm`, interfaz `scsi0` → **`/dev/sda`** |
+| Red | VirtIO en `vmbr0`, con agente QEMU |
+| Imagen base | Debian 12 *genericcloud*, sobre la que `nixos-anywhere` hace `kexec` |
+
+No hay *passthrough* de GPU, y es deliberado: [la iGPU resultó 2,5× más lenta que la
+CPU](rendimiento.md#por-qué-no-hay-gpu).
 
 ---
 
-## 1 · Crear la VM en Proxmox
+## 1 · Configurar los dos ficheros
 
-### Ajustes que importan
-
-| Ajuste | Valor | Por qué |
-|---|---|---|
-| BIOS | **OVMF (UEFI)** | el sistema arranca con `systemd-boot`, que necesita una partición EFI |
-| Máquina | `q35` | recomendada para UEFI |
-| Controladora SCSI | **VirtIO SCSI** | el disco aparece como `/dev/sda` — es lo que asume `nix/host.nix` |
-| Disco | 40 GB (30 sin VibeVoice) | ver la tabla de recursos en el [README](../README.md#la-vm) |
-| CPU | 6–8 núcleos, tipo `host` | `whisper` usa 6 hilos y VibeVoice 8 |
-| RAM | 8 GB | VibeVoice pide ~4 GB en el pico |
-| Red | VirtIO, puente a la LAN, DHCP | |
-| Agente QEMU | activado | el perfil `qemu-guest` ya está importado en el sistema |
-
-Desde la interfaz web se hace en un par de minutos. Desde la consola del nodo, el equivalente sería algo
-así —**revisa los nombres de almacenamiento, que varían en cada instalación**:
+Son dos, y **las claves SSH tienen que coincidir en ambos**.
 
 ```bash
-qm create 120 --name voz --machine q35 --bios ovmf --cpu host --cores 6 --memory 8192 --scsihw virtio-scsi-single --scsi0 local-lvm:40 --efidisk0 local-lvm:0,efitype=4m --net0 virtio,bridge=vmbr0 --ide2 local:iso/latest-nixos-minimal-x86_64-linux.iso,media=cdrom --boot 'order=ide2;scsi0' --agent 1
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+$EDITOR terraform/terraform.tfvars   # token de Proxmox, IP, recursos
+$EDITOR nix/host.nix                 # tu clave pública y el disco
 ```
 
-### Arrancarla con acceso SSH
+**`terraform/terraform.tfvars`** — está en el `.gitignore`, el token no entra al repositorio:
 
-`nixos-anywhere` necesita entrar por SSH como `root` en la máquina destino. Lo más cómodo es el **ISO
-mínimo de NixOS**: arranca, y en la consola de Proxmox pon una contraseña temporal para poder entrar.
+```hcl
+proxmox_endpoint  = "https://192.168.2.100:8006/"
+proxmox_api_token = "root@pam!terraform=00000000-0000-0000-0000-000000000000"
 
-```bash
-sudo passwd root          # en la consola de la VM
-ip addr                   # apunta la IP
+node = "pve"
+vmid = 210
+
+cores      = 8
+memoria_mb = 6144
+disco_gb   = 40
+
+# IP fija: nixos-anywhere necesita saber a dónde conectarse. Con DHCP hay que
+# esperar al agente; con fija, el despliegue va de un tirón.
+ip_cidr = "192.168.2.54/24"
+gateway = "192.168.2.1"
+
+claves_ssh = [ "ssh-ed25519 AAAA... tu-usuario@tu-maquina" ]
 ```
 
-Cualquier sistema Linux con SSH y `root` vale igual: `nixos-anywhere` usa `kexec` para saltar al instalador.
-
-### Comprobar el disco
-
-Ya dentro de la VM por SSH, antes de nada:
-
-```bash
-lsblk
-```
-
-Con VirtIO SCSI verás `sda`. Si ves `vda`, la controladora es VirtIO Block y hay que cambiar
-`homelab.disco` en el paso siguiente.
-
----
-
-## 2 · Configurar el repositorio
-
-Solo hay un fichero que tocar: [`nix/host.nix`](../nix/host.nix).
+**[`nix/host.nix`](../nix/host.nix)** — lo único específico de tu máquina dentro del flake:
 
 ```nix
 {
   homelab = {
-    clavesSSH = [
-      "ssh-ed25519 AAAA... tu-usuario@tu-maquina"   # ← tu clave pública
-    ];
-
-    disco = "/dev/sda";                              # ← lo que viste en lsblk
+    clavesSSH = [ "ssh-ed25519 AAAA... tu-usuario@tu-maquina" ];  # la misma de arriba
+    disco = "/dev/sda";                                            # scsi0 → sda
   };
 
   networking.hostName = "voz";
@@ -103,53 +103,46 @@ Solo hay un fichero que tocar: [`nix/host.nix`](../nix/host.nix).
 [`nix/configuration.nix`](../nix/configuration.nix) que lo impide, porque la VM quedaría sin ninguna forma
 de entrar —no hay contraseñas ni consola configurada.
 
-Si quieres cambiar voces, modelo de whisper o puertos, es el momento; la referencia está en
-[opciones.md](opciones.md). Todo tiene valores por defecto razonables.
-
-Y antes de lanzar la instalación, comprueba que el sistema evalúa y compila:
-
-```bash
-nix build .#nixosConfigurations.voz.config.system.build.toplevel
-```
-
-La primera vez tarda: hay que traerse los modelos y construir los entornos de Python.
+Si quieres cambiar voces, modelo de whisper o puertos, es el momento: la referencia está en
+[opciones.md](opciones.md).
 
 ---
 
-## 3 · Instalar con nixos-anywhere
+## 2 · Crear la VM
 
 ```bash
-nix run github:nix-community/nixos-anywhere -- --flake .#voz root@IP-DE-LA-VM
+ansible-playbook ansible/playbooks/provision.yml
 ```
 
-O, si ya estás dentro del `devShell` en Linux, directamente `nixos-anywhere --flake .#voz root@IP-DE-LA-VM`.
+El playbook comprueba que existe `terraform.tfvars`, lanza `tofu init` y `tofu apply`, y deja el
+inventario con la IP de la VM para los pasos siguientes.
 
-Lo que ocurre, en orden:
+---
+
+## 3 · Instalar NixOS
+
+```bash
+ansible-playbook ansible/playbooks/install.yml
+```
 
 ```mermaid
 flowchart TD
-    A["Conecta por SSH como root"] --> B["kexec al instalador de NixOS"]
-    B --> C["disko particiona el disco<br/>GPT · ESP 512M · ext4 · swapfile 4G"]
-    C --> D["Copia el sistema construido al disco"]
-    D --> E["Instala systemd-boot en la ESP"]
-    E --> F["Reinicia"]
-    F --> G["Primer arranque: voz-token genera el secreto"]
-    G --> H["whisper-server y voz-api levantan"]
+    A["Lee la IP del inventario generado"] --> B["Pide confirmación:<br/>se va a formatear el disco"]
+    B --> C["Comprueba que el flake evalúa<br/>nix eval del toplevel"]
+    C --> D["nixos-anywhere: kexec + disko + copia el sistema"]
+    D --> E["Espera a que NixOS arranque"]
+    E --> F["Primer arranque: voz-token genera el secreto"]
+    F --> G["Verifica que la API responde"]
 ```
 
-No hay preguntas ni pasos manuales. Cuando termine y la VM reinicie, ya está.
+Fíjate en el orden: **valida el flake antes de tocar la VM**. Si la configuración no evalúa, te enteras
+antes de haber formateado nada, no después.
 
 ---
 
 ## 4 · Comprobar que funciona
 
-**El sistema responde:**
-
-```bash
-ssh juan@IP-DE-LA-VM systemctl status voz-api homelab-whisper --no-pager
-```
-
-**La API está viva.** `/health` no pide token a propósito, para poder monitorizarla:
+El playbook ya verifica que la API responde, pero para mirarlo tú:
 
 ```bash
 curl -s http://IP-DE-LA-VM:8080/health | jq
@@ -169,10 +162,10 @@ curl -s http://IP-DE-LA-VM:8080/health | jq
 }
 ```
 
-Fíjate en dos campos: `stt.disponible` tiene que ser `true` —si es `false`, whisper no arrancó— y `auth`
+Dos campos que mirar: `stt.disponible` tiene que ser `true` —si es `false`, whisper no arrancó— y `auth`
 tiene que decir `bearer`; si dice `abierta`, el token no llegó al servicio.
 
-**Coge el token**, que se generó solo en el primer arranque:
+**Coge el token**, que se generó solo en el primer arranque y vive fuera del store:
 
 ```bash
 ssh juan@IP-DE-LA-VM sudo cat /var/lib/voz/token.env
@@ -192,35 +185,27 @@ Las cabeceras `X-Duracion-S`, `X-Proceso-S` y `X-RTF` te dan la medición de esa
 curl -X POST http://IP-DE-LA-VM:8080/stt -H "Authorization: Bearer TU_TOKEN" -F "archivo=@saludo.ogg" -F "idioma=es" | jq
 ```
 
-**Prueba el laboratorio** (opcional, tarda; ~44 s de cómputo por cada 9 s de audio):
+**Prueba el laboratorio** (opcional, y tarda: RTF ~3,9, unos 39 s de cómputo por cada 10 s de audio):
 
 ```bash
 ssh juan@IP-DE-LA-VM
 vibevoice --txt_path guion.txt --speaker_names sp-Spk0_woman
 ```
 
-La referencia completa de la API, con todos los parámetros y errores, está en [api.md](api.md).
+La referencia completa de la API está en [api.md](api.md).
 
 ---
 
-## Actualizar el sistema
+## El día a día: actualizar
 
-Todo cambio pasa por el flake: se edita, se reconstruye, y el sistema pasa a la nueva generación.
-
-**Desde Linux**, contra la VM:
+Tras cambiar cualquier cosa en `nix/`:
 
 ```bash
-nixos-rebuild switch --flake .#voz --target-host root@IP-DE-LA-VM
+ansible-playbook ansible/playbooks/update.yml
 ```
 
-**Desde macOS** no funciona igual: `nixos-rebuild` no está en el `devShell` para Darwin y construir
-`x86_64-linux` desde un Mac ARM necesitaría un constructor remoto. La vía práctica es reconstruir desde la
-propia VM:
-
-```bash
-ssh juan@IP-DE-LA-VM
-sudo nixos-rebuild switch --flake github:juan52878911/VibeVoiceNix#voz
-```
+Comprueba que el flake evalúa, aplica la configuración con `nixos-rebuild` y confirma que la API sigue en
+pie. Nunca formatea nada.
 
 **Actualizar las dependencias** (nixpkgs, disko, uv2nix…):
 
@@ -229,13 +214,17 @@ nix flake update                       # todas
 nix flake update nixpkgs               # solo una
 ```
 
-Después reconstruye. El `flake.lock` que cambia es la única prueba de qué versión estaba corriendo.
+Después, `update.yml`. El `flake.lock` que cambia es la única prueba de qué versión estaba corriendo.
 
 **Cambiar el código Python de la API** requiere además regenerar el lock de su workspace:
 
 ```bash
 cd pkgs/voz-api && uv lock
 ```
+
+Si tocas el de VibeVoice, revisa la versión de `transformers` que resuelve: el entorno usa la **4.57.6**,
+no la 4.51.3 que fija el extra `streamingtts` del repositorio original. Funciona, pero es lo primero que
+hay que mirar si algo se rompe.
 
 ---
 
@@ -267,17 +256,19 @@ arranque genera uno nuevo y hay que actualizar los clientes.
 
 | Síntoma | Causa y solución |
 |---|---|
+| *«Falta terraform/terraform.tfvars»* | `provision.yml` para antes de hacer nada. Copia el `.example` y rellénalo. |
 | La evaluación falla con *«homelab.clavesSSH está vacío»* | No pusiste tu clave pública en `nix/host.nix`. Es una aserción a propósito. |
-| `disko` no encuentra el disco, o formatea el que no era | `homelab.disco` no coincide con la controladora. `lsblk` en la VM: VirtIO SCSI → `/dev/sda`, VirtIO Block → `/dev/vda`. |
-| El sistema instala pero no arranca | La VM no está en modo UEFI (OVMF). `systemd-boot` necesita una ESP. |
+| *«services.vibevoice necesita ~4 GB… no define swap»* | Aserción del módulo: añade `swapDevices` o desactiva `services.vibevoice`. |
+| `nixos-anywhere` no conecta | La VM no tiene IP fija y el inventario quedó a medias. Pon `ip_cidr` en `terraform.tfvars`. |
+| `disko` formatea el disco que no era | `homelab.disco` no coincide con la controladora. Terraform usa `scsi0` → `/dev/sda`. Comprueba con `lsblk`. |
+| El sistema instala pero no arranca | La VM no está en modo UEFI. `systemd-boot` necesita una ESP. |
 | *«vozDefecto tiene que estar en voces»* | La voz por defecto no está en la lista instalada. Ver [opciones.md](opciones.md). |
-| *«abrir voz-api en la LAN sin ficheroToken…»* | `abrirCortafuegos = true` exige `ficheroToken`. Es la aserción que evita exponer el servicio sin autenticación. |
-| `401 token invalido o ausente` | Falta la cabecera `Authorization: Bearer …`, o el token no es el de `/var/lib/voz/token.env`. |
+| *«abrir voz-api en la LAN sin ficheroToken…»* | `abrirCortafuegos = true` exige `ficheroToken`. Evita exponer el servicio sin autenticación. |
+| `401 token invalido o ausente` | Falta la cabecera `Authorization: Bearer …`, o no es el token de `/var/lib/voz/token.env`. |
 | `/health` dice `"disponible": false` | `whisper-server` no está levantado: `journalctl -u homelab-whisper -e`. |
-| `503 whisper-server no responde` | Lo mismo, visto desde una petición de STT. |
 | `400 no pude decodificar el audio` | `ffmpeg` no reconoce el fichero. El mensaje incluye su salida de error. |
-| El STT transcribe mal la jerga | Ajusta `services.voz-api.promptSTT` con tu propio vocabulario; es el parámetro que más cambia el resultado. |
-| VibeVoice se va a swap o muere | Necesita ~4 GB libres. No lo lances mientras `voz-api` está sirviendo si la VM tiene menos de 6 GB. |
+| El STT transcribe mal la jerga | Ajusta `services.voz-api.promptSTT` con tu vocabulario; es el parámetro que más cambia el resultado. |
+| VibeVoice se va a swap | Necesita ~3,9 GB. No lo lances mientras `voz-api` sirve si la VM va justa de RAM. |
 
 **Dónde mirar cuando nada de lo anterior encaja:**
 
@@ -285,14 +276,43 @@ arranque genera uno nuevo y hay que actualizar los clientes.
 journalctl -u voz-api -u homelab-whisper -u voz-token -e
 ```
 
+### Si construyes desde un Mac ARM
+
+Necesitas una máquina `x86_64-linux` para construir el sistema. Dos detalles que muerden al instalar Nix en
+un LXC de Proxmox:
+
+- El **sandbox funciona** en contenedores no privilegiados; no hace falta `sandbox = false`.
+- `channels.nixos.org` resuelve **solo por IPv6**. Sin ruta IPv6, cualquier `nix run nixpkgs#loquesea`
+  falla con *«Could not resolve host»*. Se desactiva con `flake-registry = ` (vacío) en
+  `/etc/nix/nix.conf`. Este repositorio no lo necesita porque todo va por `flake.lock`.
+
 ---
 
-## Provisión automática (pendiente)
+## Apéndice: despliegue manual
 
-El `devShell` trae OpenTofu y Ansible, y su `shellHook` anuncia un
-`ansible-playbook ansible/playbooks/provision.yml` que **todavía no existe en el repositorio**. El
-`.gitignore` ya reserva sitio para el estado de Terraform y el inventario generado de Ansible.
+Si no quieres usar Terraform —porque la VM ya existe, o porque el hipervisor no es Proxmox— el ciclo se
+reduce a `nixos-anywhere` contra cualquier máquina con SSH y `root`:
 
-La intención es cerrar el círculo: que OpenTofu cree la VM contra la API de Proxmox y Ansible encadene
-`provision → install → update`, de modo que pasar de nada a un sistema funcionando sea una sola orden. Hasta
-entonces, el paso 1 de esta guía se hace a mano.
+```bash
+nix run github:nix-community/nixos-anywhere -- --flake .#voz root@IP-DE-LA-VM
+```
+
+Los requisitos de la máquina destino son los mismos que crea Terraform: **UEFI (OVMF)**, controladora
+**VirtIO SCSI** (→ `/dev/sda`; con VirtIO Block sería `/dev/vda` y hay que ajustar `homelab.disco`), 8
+núcleos, 6 GB de RAM y 40 GB de disco. Arranca con el ISO mínimo de NixOS o con cualquier Linux que tenga
+SSH: `nixos-anywhere` usa `kexec` para saltar al instalador.
+
+Para actualizar sin Ansible, desde Linux:
+
+```bash
+nixos-rebuild switch --flake .#voz --target-host root@IP-DE-LA-VM
+```
+
+Desde macOS no funciona igual —`nixos-rebuild` no está en el `devShell` para Darwin y construir
+`x86_64-linux` desde un Mac ARM necesitaría un constructor remoto—, así que la vía práctica es reconstruir
+desde la propia VM:
+
+```bash
+ssh juan@IP-DE-LA-VM
+sudo nixos-rebuild switch --flake github:juan52878911/VibeVoiceNix#voz
+```
