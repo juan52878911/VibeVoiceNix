@@ -158,12 +158,27 @@ services.voz-api = {
 
 services.homelab-whisper.modelo = "small";  # o "base", 3x más rápido y peor
 
-services.vibevoice.cfgScale = 1.5;  # a 1.0 casi duplica la velocidad
+services.vibevoice.cfgScale = 1.5;  # calidad, no velocidad — ver abajo
 ```
 
-Sobre `cfgScale`: con classifier-free guidance cada paso de difusión hace dos
-pasadas (condicional e incondicional). Bajarlo a 1.0 se salta la segunda a
-cambio de expresividad.
+### `cfgScale` no acelera nada (medido)
+
+Parecía el ajuste obvio para ganar velocidad y **resultó que no**:
+
+| `cfg_scale` | RTF | Audio generado |
+|---|---|---|
+| 1.5 | **3,92** | 10,93 s |
+| 1.3 | 4,02 | 11,87 s |
+| 1.0 | 4,20 | 17,07 s ← divaga |
+
+El motivo está en `sample_speech_tokens`: concatena condicional e incondicional
+en un mismo batch **siempre**, sin rama que se salte el segundo. Se parcheó para
+saltárselo con `cfg_scale == 1.0` y tampoco sirvió — **RTF 3,90**, dentro del
+ruido. Con dim 896 y batch 2 el cuello es el ancho de banda de memoria, no los
+FLOPs, así que la segunda mitad del batch sale casi gratis.
+
+**El único lever real fue el número de núcleos**: de 4 a 8 cores el RTF bajó de
+4,80 a 3,92 (~18%). Déjalo en 1.5.
 
 ### Voces disponibles
 
