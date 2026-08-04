@@ -31,7 +31,7 @@ provider "proxmox" {
 
 # Imagen base: cualquier cloud image con SSH sirve, porque nixos-anywhere la
 # sustituye entera. Debian se usa por ser pequena y traer cloud-init.
-resource "proxmox_virtual_environment_download_file" "base" {
+resource "proxmox_download_file" "base" {
   content_type = "iso"
   datastore_id = var.datastore_iso
   node_name    = var.node
@@ -72,7 +72,7 @@ resource "proxmox_virtual_environment_vm" "voz" {
 
   disk {
     datastore_id = var.datastore_vm
-    file_id      = proxmox_virtual_environment_download_file.base.id
+    file_id      = proxmox_download_file.base.id
     interface    = "scsi0"
     size         = var.disco_gb
     discard      = "on"
