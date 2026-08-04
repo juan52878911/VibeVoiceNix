@@ -14,6 +14,10 @@
   # ------------------------------------------------------------------
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
+
+  # Consola serie: `qm terminal 210` desde el host Proxmox. Es la unica via de
+  # entrada si la red falla, asi que conviene tenerla desde el primer arranque.
+  boot.kernelParams = [ "console=tty1" "console=ttyS0,115200" ];
   boot.initrd.availableKernelModules = [
     "ahci"
     "xhci_pci"
@@ -28,9 +32,25 @@
   # ------------------------------------------------------------------
   networking = {
     hostName = lib.mkDefault "voz";
-    useDHCP = lib.mkDefault true;
+    # DHCP solo si no se declaro IP fija en host.nix.
+    useDHCP = lib.mkDefault (config.homelab.ip == null);
     firewall.enable = true;
   };
+
+  # Red estatica con systemd-networkd. Se empareja por `en*` a proposito: el
+  # nombre real depende del hardware virtual (ens18, enp0s18, eth0...) y
+  # fijarlo a mano es la forma facil de quedarse sin red tras un cambio.
+  systemd.network = lib.mkIf (config.homelab.ip != null) {
+    enable = true;
+    networks."10-lan" = {
+      matchConfig.Name = "en*";
+      address = [ config.homelab.ip ];
+      gateway = lib.optional (config.homelab.puertaEnlace != null) config.homelab.puertaEnlace;
+      dns = config.homelab.dns;
+      networkConfig.IPv6AcceptRA = true;
+    };
+  };
+  networking.useNetworkd = lib.mkIf (config.homelab.ip != null) true;
 
   time.timeZone = lib.mkDefault "America/Bogota";
   i18n.defaultLocale = "es_ES.UTF-8";
@@ -49,6 +69,13 @@
   };
 
   users.users.root.openssh.authorizedKeys.keys = config.homelab.clavesSSH;
+
+  # Contrasena de emergencia SOLO para la consola serie. SSH la ignora
+  # (PasswordAuthentication = false), asi que no abre la maquina a la red;
+  # sirve para no quedarte fuera si la red se cae, que es exactamente lo que
+  # paso en el primer despliegue de esta VM.
+  users.users.root.hashedPassword = lib.mkIf (config.homelab.passwordConsola != null)
+    config.homelab.passwordConsola;
   users.users.juan = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];

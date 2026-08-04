@@ -54,7 +54,21 @@ resource "proxmox_virtual_environment_vm" "voz" {
   on_boot = true
 
   agent {
-    enabled = true
+    # Desactivado a proposito. Con enabled=true el provider ESPERA a que el
+    # qemu-guest-agent reporte, y la cloud image de Debian no lo trae: el apply
+    # se queda colgado tras crear la VM. Como la IP es fija no hace falta para
+    # nada, y de todas formas nixos-anywhere reemplaza el sistema entero.
+    enabled = false
+  }
+
+  # UEFI, no el SeaBIOS por defecto: nix/disko.nix crea GPT + ESP y el sistema
+  # arranca con systemd-boot, que solo funciona con UEFI. Con SeaBIOS la VM
+  # instala bien y luego se queda colgada sin encontrar arranque.
+  bios = "ovmf"
+
+  efi_disk {
+    datastore_id = var.datastore_vm
+    type         = "4m"
   }
 
   cpu {

@@ -12,6 +12,12 @@
     # Terraform crea el disco con virtio-scsi -> /dev/sda.
     # Comprobar con `lsblk` antes del primer despliegue: disko formatea sin preguntar.
     disco = "/dev/sda";
+
+    # Tiene que coincidir con ip_cidr/gateway de terraform.tfvars.
+    # Sin esto NixOS arranca en DHCP y, si el DHCP no responde, la VM queda
+    # inaccesible: no hay contrasena para SSH y solo entran claves.
+    ip = "192.168.2.54/24";
+    puertaEnlace = "192.168.2.1";
   };
 
   networking.hostName = "voz";
