@@ -31,6 +31,12 @@ let
       ''}
       # El modelo y el tokenizador estan en el store: nada que descargar.
       export HF_HUB_OFFLINE=1
+      # El modelo pinta una barra de tqdm por token que hace ilegible la
+      # salida y la vuelve inutil en una tuberia. VIBEVOICE_PROGRESO=1 la trae
+      # de vuelta si hace falta ver el avance de una generacion larga.
+      if [ -z "''${VIBEVOICE_PROGRESO:-}" ]; then
+        export TQDM_DISABLE=1
+      fi
       export VIBEVOICE_MODELO="${pesos.modelo}"
       export VIBEVOICE_VOCES="${pesos.voces}"
       export VIBEVOICE_PASOS="''${VIBEVOICE_PASOS:-${toString cfg.pasosDifusion}}"
