@@ -73,26 +73,36 @@ rec {
   # Directorio en formato "modelo de Hugging Face": se le pasa tal cual como
   # --model_path y evita que el servicio tenga que salir a la red.
   #
-  # config.json se PARCHEA para apuntar el tokenizador al store. Sin esto,
+  # Se PARCHEA la config para apuntar el tokenizador al store. Sin esto,
   # vibevoice_streaming_processor.py cae al literal "Qwen/Qwen2.5-1.5B" y se lo
   # baja de Hugging Face: en una maquina limpia con HF_HUB_OFFLINE eso revienta
-  # con un TypeError de vocab_file=None. No basta con copiar el tokenizador
-  # dentro del modelo, porque el procesador ni lo mira.
+  # con un TypeError de vocab_file=None. Copiar el tokenizador dentro del
+  # modelo NO basta, porque el procesador ni mira ese directorio.
+  #
+  # El fichero que lee es preprocessor_config.json (from_pretrained hace
+  # os.path.join(ruta, "preprocessor_config.json")). Se parchean los dos por si
+  # alguna ruta del codigo usa el otro.
   modelo = runCommand "vibevoice-realtime-0.5b" { nativeBuildInputs = [ jq ]; } ''
     mkdir -p "$out"
     ${lib.concatMapStringsSep "\n"
-      (d: lib.optionalString (d.nombre != "config.json")
+      (d: lib.optionalString (!lib.elem d.nombre [ "config.json" "preprocessor_config.json" ])
         ''ln -s ${d.fichero} "$out/${d.nombre}"'')
       descargas}
 
-    jq --arg tok "${tokenizadorQwen}" \
-      '.language_model_pretrained_name = $tok' \
-      ${(lib.findFirst (d: d.nombre == "config.json") null descargas).fichero} \
-      > "$out/config.json"
+    ${lib.concatMapStringsSep "\n"
+      (nombre: ''
+        jq --arg tok "${tokenizadorQwen}" \
+          '.language_model_pretrained_name = $tok' \
+          ${(lib.findFirst (d: d.nombre == nombre) null descargas).fichero} \
+          > "$out/${nombre}"
+      '')
+      [ "config.json" "preprocessor_config.json" ]}
 
     # Comprobacion: si el campo no queda puesto, el fallo aparece mucho mas
     # tarde y con un error que no lo señala.
-    grep -q "language_model_pretrained_name" "$out/config.json"
+    for f in config.json preprocessor_config.json; do
+      grep -q "language_model_pretrained_name" "$out/$f"
+    done
   '';
 
   # Voces preentrenadas (.pt). Las de espanol son sp-Spk0_woman y sp-Spk1_man.
