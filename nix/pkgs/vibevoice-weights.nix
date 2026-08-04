@@ -111,28 +111,13 @@ rec {
     cp -r ${repo}/demo/voices/streaming_model/. "$out/"
   '';
 
-  # Script de inferencia con dos parches.
-  inferencia = runCommand "vibevoice-inferencia" { } ''
+  # CLI propia, en pkgs/vibevoice-cli/. Antes se parcheaba el demo de Microsoft
+  # con tres `substitute` encadenados (ruta de voces, weights_only, y ningun
+  # control de cuantizacion); cualquier cambio suyo rompia el build. Un fichero
+  # propio depende solo de la API publica del modelo.
+  inferencia = runCommand "vibevoice-cli" { } ''
     mkdir -p "$out/bin"
-    substitute \
-      ${repo}/demo/realtime_model_inference_from_file.py \
-      "$out/bin/vibevoice-inferencia.py" \
-      \
-      `# 1. Los .pt guardan un BaseModelOutputWithPast, subclase de OrderedDict,` \
-      `# y el desempaquetador seguro de torch >=2.6 solo admite dict/OrderedDict/` \
-      `# Counter exactos -> "Can only SETITEMS for dict...". El fichero viene del` \
-      `# repo oficial fijado por commit, asi que se desactiva la comprobacion.` \
-      --replace-fail \
-        'torch.load(voice_sample, map_location=target_device, weights_only=True)' \
-        'torch.load(voice_sample, map_location=target_device, weights_only=False)' \
-      \
-      `# 2. El script busca las voces junto a SI MISMO (dirname(__file__)), no en` \
-      `# el directorio de trabajo. Al vivir en el store hay que apuntarlo al` \
-      `# paquete de voces o no encuentra ninguna.` \
-      --replace-fail \
-        'voices_dir = os.path.join(os.path.dirname(__file__), "voices/streaming_model")' \
-        'voices_dir = "${voces}"'
-
-    chmod +x "$out/bin/vibevoice-inferencia.py"
+    cp ${../../pkgs/vibevoice-cli/vibevoice_cli.py} "$out/bin/vibevoice-cli.py"
+    chmod +x "$out/bin/vibevoice-cli.py"
   '';
 }

@@ -25,13 +25,20 @@ let
     runtimeInputs = [ pkgs.vibevoice-env pkgs.ffmpeg ];
     text = ''
       export OMP_NUM_THREADS="''${VIBEVOICE_HILOS:-${toString cfg.hilos}}"
-      # El modelo esta en el store: nada que descargar en tiempo de ejecucion.
+      ${lib.optionalString cfg.anclarNucleos ''
+        export OMP_PLACES="''${OMP_PLACES:-cores}"
+        export OMP_PROC_BIND="''${OMP_PROC_BIND:-close}"
+      ''}
+      # El modelo y el tokenizador estan en el store: nada que descargar.
       export HF_HUB_OFFLINE=1
+      export VIBEVOICE_MODELO="${pesos.modelo}"
+      export VIBEVOICE_VOCES="${pesos.voces}"
+      export VIBEVOICE_PASOS="''${VIBEVOICE_PASOS:-${toString cfg.pasosDifusion}}"
+      export VIBEVOICE_VOZ="''${VIBEVOICE_VOZ:-${cfg.vozDefecto}}"
 
-      exec python ${pesos.inferencia}/bin/vibevoice-inferencia.py \
-        --model_path ${pesos.modelo} \
-        --device cpu \
-        --cfg_scale "''${VIBEVOICE_CFG:-${toString cfg.cfgScale}}" \
+      exec python ${pesos.inferencia}/bin/vibevoice-cli.py \
+        --cfg-scale "''${VIBEVOICE_CFG:-${toString cfg.cfgScale}}" \
+        ${lib.optionalString (!cfg.cuantizar) "--sin-cuantizar"} \
         "$@"
     '';
   };
@@ -45,8 +52,75 @@ in
 
     hilos = lib.mkOption {
       type = lib.types.int;
-      default = 8;
-      description = "Hilos de OpenMP para la inferencia en CPU.";
+      default = 6;
+      description = ''
+        Hilos de OpenMP. 6 = los nucleos FISICOS del i7-8700T. Medido en la VM
+        (RTF, menor es mejor):
+
+          2 hilos  4,19    8 hilos  4,31
+          4 hilos  4,19   10 hilos  4,46
+          6 hilos  4,24   12 hilos  5,18  <- 24% PEOR que con 2
+
+        Mas hilos empeora: la carga esta limitada por ancho de banda de
+        memoria, no por computo. Con 2 hilos ya se satura el bus DDR4 de un
+        solo canal, y del 7 al 12 encima compiten por las mismas unidades AVX2
+        de los 6 nucleos fisicos.
+      '';
+    };
+
+    anclarNucleos = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Ancla cada hilo a un nucleo fisico (OMP_PLACES=cores). Evita que dos
+        hilos compartan unidad vectorial. Medido: 4,04 frente a 4,24 con 6
+        hilos, un 3% gratis y sin tocar la calidad.
+      '';
+    };
+
+    cuantizar = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        int8 dinamico en las capas Linear. Medido en la VM: RTF 5,39 -> 2,75 a
+        20 pasos, y 2,18 a 6 pasos. El usuario comparo las muestras y NO
+        distingue la salida int8 de la fp32.
+
+        Funciona pese a que esta CPU no tiene VNNI (la multiplicacion int8 va
+        emulada) porque divide por cuatro los BYTES de peso que hay que traer
+        de RAM, y el cuello es justo ese.
+
+        Coste: el pico de memoria al cargar sube a ~4,6 GB, porque hay que
+        materializar el fp32 antes de convertirlo. Con menos de 5 GB de RAM en
+        la maquina, esto puede acabar en OOM.
+      '';
+    };
+
+    pasosDifusion = lib.mkOption {
+      type = lib.types.int;
+      default = 6;
+      description = ''
+        Pasos del muestreador de difusion. El modelo usa
+        DPMSolverMultistepScheduler, disenado para pocos pasos, y viene
+        configurado a 20.
+
+        Medido con int8: 20 pasos RTF 2,75 · 8 pasos 2,18 · 6 pasos 2,18 ·
+        4 pasos 2,11. De 6 a 4 solo se gana un 3%, asi que 6 deja margen de
+        calidad casi gratis.
+
+        Por debajo de 6 apenas se gana: la cabeza de difusion (84 MB) deja de
+        dominar y pasa a mandar el backbone (869 MB), que no depende de los
+        pasos.
+      '';
+    };
+
+    vozDefecto = lib.mkOption {
+      type = lib.types.str;
+      default = "sp-Spk1_man";
+      description = ''
+        Hablante por defecto. Las voces en espanol del modelo son
+        sp-Spk1_man y sp-Spk0_woman, ambas experimentales segun Microsoft.
+      '';
     };
 
     cfgScale = lib.mkOption {
