@@ -37,13 +37,16 @@
     firewall.enable = true;
   };
 
-  # Red estatica con systemd-networkd. Se empareja por `en*` a proposito: el
-  # nombre real depende del hardware virtual (ens18, enp0s18, eth0...) y
-  # fijarlo a mano es la forma facil de quedarse sin red tras un cambio.
+  # Red estatica con systemd-networkd.
+  #
+  # Se empareja por TIPO, no por nombre. Un glob como "en*" parece razonable
+  # hasta que la interfaz se llama eth0 y la maquina arranca sin IP: como aqui
+  # solo se entra por clave SSH, eso deja la VM inaccesible. `Type = "ether"`
+  # casa con cualquier interfaz ethernet y no depende del esquema de nombres.
   systemd.network = lib.mkIf (config.homelab.ip != null) {
     enable = true;
     networks."10-lan" = {
-      matchConfig.Name = "en*";
+      matchConfig.Type = "ether";
       address = [ config.homelab.ip ];
       gateway = lib.optional (config.homelab.puertaEnlace != null) config.homelab.puertaEnlace;
       dns = config.homelab.dns;

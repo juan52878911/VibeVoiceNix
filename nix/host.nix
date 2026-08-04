@@ -18,6 +18,14 @@
     # inaccesible: no hay contrasena para SSH y solo entran claves.
     ip = "192.168.2.54/24";
     puertaEnlace = "192.168.2.1";
+
+    # Contrasena de emergencia SOLO para `qm terminal 210` desde el host
+    # Proxmox. SSH no la acepta (PasswordAuthentication = false).
+    #
+    # Existe porque durante el primer despliegue la VM arranco dos veces sin
+    # IPv4 y, al haber unicamente acceso por clave, no hubo forma de entrar a
+    # diagnosticar. CAMBIALA por una tuya: `mkpasswd -m yescrypt`.
+    passwordConsola = "$y$j9T$DHjfYbxX4LesoMFInS.Rg0$iEHa6HsbI6GvW.TQ.LWSpRlTPv7uZNf7FMP0Ziu81a6";
   };
 
   networking.hostName = "voz";

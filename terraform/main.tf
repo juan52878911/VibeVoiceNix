@@ -100,6 +100,11 @@ resource "proxmox_virtual_environment_vm" "voz" {
   initialization {
     datastore_id = var.datastore_vm
 
+    # En scsi1 y no en el ide2 por defecto: con OVMF/UEFI el disco de
+    # cloud-init en IDE no se detecta y la VM arranca sin IP ni clave SSH
+    # (se comprobo: hostname localhost y sin IPv4).
+    interface = "scsi1"
+
     ip_config {
       ipv4 {
         address = var.ip_cidr
