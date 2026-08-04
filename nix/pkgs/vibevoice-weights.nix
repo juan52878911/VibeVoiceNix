@@ -30,12 +30,35 @@ let
     "preprocessor_config.json" = "sha256-6/UUtdMKAS5a4A2aGdAec141sndow5JtmAgV24+nQuU=";
   };
 
-  descargas = lib.mapAttrsToList
-    (nombre: hash: {
-      inherit nombre;
-      fichero = fetchurl { url = "${baseHF}/${nombre}"; inherit hash; };
-    })
-    ficheros;
+  # El repo del modelo NO incluye tokenizador: vibevoice_streaming_processor.py
+  # cae a "Qwen/Qwen2.5-1.5B" y se lo baja de Hugging Face en tiempo de
+  # ejecucion. Eso rompe la reproducibilidad y ademas falla en una maquina
+  # limpia sin red (o con HF_HUB_OFFLINE), asi que se vendoriza aqui.
+  #
+  # Con tokenizer.json presente se usa el tokenizador RAPIDO; sin el,
+  # transformers cae al lento y exige protobuf + sentencepiece.
+  baseQwen = "https://huggingface.co/Qwen/Qwen2.5-1.5B/resolve/main";
+
+  tokenizador = {
+    "tokenizer.json" = "sha256-wDghF+oynN8JcEETL21zWSS2l5JNb2/DlFcT6WzodTk=";
+    "tokenizer_config.json" = "sha256-yR78oVzv9unulCTbWKb1nNQSlOVQqGy9B+PB+1ALNPk=";
+    "vocab.json" = "sha256-yhDX6fs+0YV13R4neiV5wW0QjjLydDloSvoOELFECRA=";
+    "merges.txt" = "sha256-WZurVAdQiHdLFzP96GXVvXR8vMelR8W8EmEOh04m9eM=";
+  };
+
+  descargas =
+    lib.mapAttrsToList
+      (nombre: hash: {
+        inherit nombre;
+        fichero = fetchurl { url = "${baseHF}/${nombre}"; inherit hash; };
+      })
+      ficheros
+    ++ lib.mapAttrsToList
+      (nombre: hash: {
+        inherit nombre;
+        fichero = fetchurl { url = "${baseQwen}/${nombre}"; inherit hash; };
+      })
+      tokenizador;
 in
 rec {
   inherit repo;
