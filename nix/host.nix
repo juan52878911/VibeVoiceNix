@@ -26,6 +26,16 @@
     # IPv4 y, al haber unicamente acceso por clave, no hubo forma de entrar a
     # diagnosticar. CAMBIALA por una tuya: `mkpasswd -m yescrypt`.
     passwordConsola = "$y$j9T$DHjfYbxX4LesoMFInS.Rg0$iEHa6HsbI6GvW.TQ.LWSpRlTPv7uZNf7FMP0Ziu81a6";
+
+    # Tunel hacia el edge de Oracle. La clave privada NO esta aqui: vive en
+    # /var/lib/wireguard/privada con permisos 600, fuera del store.
+    # Publica de esta VM: xOQrGF/NjbD9UmWHwqkjGG4oWaA8p+yKlZq+QVtyTjQ=
+    tunel = {
+      enable = true;
+      ip = "10.10.10.5/24";
+      clavePublicaEdge = "0zKhpcPb5eQkU0DgABE8pjYRwTs9UcyNXPbeQ94s/C0=";
+      endpoint = "149.130.186.157:51820";
+    };
   };
 
   networking.hostName = "voz";
