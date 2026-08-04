@@ -8,7 +8,7 @@
 # Importante sobre idiomas: el 1.5B y el Large-7B son ingles+chino. Solo este
 # Realtime-0.5B tiene voces en espanol (sp-Spk0_woman / sp-Spk1_man), anadidas
 # por Microsoft en diciembre de 2025 y marcadas como experimentales.
-{ lib, fetchurl, fetchFromGitHub, runCommand }:
+{ lib, fetchurl, fetchFromGitHub, runCommand, jq }:
 
 let
   # Mismo commit que fija pkgs/vibevoice/uv.lock. Si cambia uno, cambia el otro.
@@ -46,30 +46,53 @@ let
     "merges.txt" = "sha256-WZurVAdQiHdLFzP96GXVvXR8vMelR8W8EmEOh04m9eM=";
   };
 
-  descargas =
-    lib.mapAttrsToList
-      (nombre: hash: {
-        inherit nombre;
-        fichero = fetchurl { url = "${baseHF}/${nombre}"; inherit hash; };
-      })
-      ficheros
-    ++ lib.mapAttrsToList
-      (nombre: hash: {
-        inherit nombre;
-        fichero = fetchurl { url = "${baseQwen}/${nombre}"; inherit hash; };
-      })
-      tokenizador;
+  descargas = lib.mapAttrsToList
+    (nombre: hash: {
+      inherit nombre;
+      fichero = fetchurl { url = "${baseHF}/${nombre}"; inherit hash; };
+    })
+    ficheros;
+
+  # El nombre de la derivacion DEBE contener "qwen": el procesador comprueba
+  # `if 'qwen' in language_model_pretrained_name.lower()` y si no, lanza
+  # ValueError. Como le pasamos una ruta del store, esa ruta lleva el nombre.
+  tokenizadorQwen = runCommand "qwen2.5-1.5b-tokenizer" { } ''
+    mkdir -p "$out"
+    ${lib.concatStringsSep "\n" (lib.mapAttrsToList
+      (nombre: hash: ''
+        ln -s ${fetchurl { url = "${baseQwen}/${nombre}"; inherit hash; }} "$out/${nombre}"
+      '')
+      tokenizador)}
+  '';
 in
 rec {
   inherit repo;
 
+  inherit tokenizadorQwen;
+
   # Directorio en formato "modelo de Hugging Face": se le pasa tal cual como
   # --model_path y evita que el servicio tenga que salir a la red.
-  modelo = runCommand "vibevoice-realtime-0.5b" { } ''
+  #
+  # config.json se PARCHEA para apuntar el tokenizador al store. Sin esto,
+  # vibevoice_streaming_processor.py cae al literal "Qwen/Qwen2.5-1.5B" y se lo
+  # baja de Hugging Face: en una maquina limpia con HF_HUB_OFFLINE eso revienta
+  # con un TypeError de vocab_file=None. No basta con copiar el tokenizador
+  # dentro del modelo, porque el procesador ni lo mira.
+  modelo = runCommand "vibevoice-realtime-0.5b" { nativeBuildInputs = [ jq ]; } ''
     mkdir -p "$out"
     ${lib.concatMapStringsSep "\n"
-      (d: ''ln -s ${d.fichero} "$out/${d.nombre}"'')
+      (d: lib.optionalString (d.nombre != "config.json")
+        ''ln -s ${d.fichero} "$out/${d.nombre}"'')
       descargas}
+
+    jq --arg tok "${tokenizadorQwen}" \
+      '.language_model_pretrained_name = $tok' \
+      ${(lib.findFirst (d: d.nombre == "config.json") null descargas).fichero} \
+      > "$out/config.json"
+
+    # Comprobacion: si el campo no queda puesto, el fallo aparece mucho mas
+    # tarde y con un error que no lo señala.
+    grep -q "language_model_pretrained_name" "$out/config.json"
   '';
 
   # Voces preentrenadas (.pt). Las de espanol son sp-Spk0_woman y sp-Spk1_man.
