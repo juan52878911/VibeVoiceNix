@@ -18,19 +18,14 @@ let
   pesos = pkgs.vibevoicePesos;
 
   # Envoltorio que cablea el entorno: modelo local (sin salir a la red), voces
-  # del repo y el script ya parcheado.
+  # del repo y el script ya parcheado. El script trae la ruta de las voces
+  # sustituida, asi que no hace falta preparar ningun directorio.
   vibevoice = pkgs.writeShellApplication {
     name = "vibevoice";
     runtimeInputs = [ pkgs.vibevoice-env pkgs.ffmpeg ];
     text = ''
-      # Directorio de trabajo: el script busca las voces en ./demo/voices/...
-      trabajo="$(mktemp -d)"
-      trap 'rm -rf "$trabajo"' EXIT
-      mkdir -p "$trabajo/demo/voices"
-      ln -s ${pesos.voces} "$trabajo/demo/voices/streaming_model"
-
-      cd "$trabajo"
       export OMP_NUM_THREADS="''${VIBEVOICE_HILOS:-${toString cfg.hilos}}"
+      # El modelo esta en el store: nada que descargar en tiempo de ejecucion.
       export HF_HUB_OFFLINE=1
 
       exec python ${pesos.inferencia}/bin/vibevoice-inferencia.py \

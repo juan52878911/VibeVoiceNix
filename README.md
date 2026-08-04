@@ -204,8 +204,40 @@ Con menos, el sistema se va a swap y un RTF ya malo se vuelve inservible.
 - [x] El flake evalúa y produce el sistema completo
 - [x] Los dos `uv.lock` resuelven, con torch CPU y sin CUDA
 - [x] Voces y pesos con hash verificado contra los ficheros reales
-- [ ] Build completo de las derivaciones (necesita una máquina x86_64-linux)
+- [x] **`voz-api` construye** y sus rutas cargan (`/tts`, `/stt`, `/health`, `/voces`)
+- [x] **`vibevoice-env` construye** y genera audio en español desde el store (RTF 4,24x)
 - [ ] Despliegue de punta a punta contra Proxmox
+
+### Lo que costó que el build funcionara
+
+El flake evaluaba limpio desde el principio y aun así tenía **tres fallos de
+construcción**. Evaluar no es construir:
+
+| Fallo | Causa | Arreglo |
+|---|---|---|
+| `No module named 'setuptools'` | uv2nix compila sin aislamiento y VibeVoice usa `setuptools.build_meta` | `resolveBuildSystem { setuptools = []; }` |
+| `libtbb.so.12` no satisfecha en `numba` | la rueda enlaza oneTBB sin declararlo | añadir `pkgs.tbb` a `buildInputs` |
+| `cannot load library 'libsndfile.so'` | `soundfile` hace `dlopen` **por nombre en ejecución**, que autoPatchelf no ve | sustituir por la ruta absoluta del store |
+
+Un cuarto, ya en ejecución: el script de inferencia busca las voces junto a sí
+mismo (`dirname(__file__)`), no en el directorio de trabajo. Al vivir en el
+store no encontraba ninguna. Se parchea `voices_dir` en la derivación.
+
+Nota: el entorno resuelve **transformers 4.57.6**, no la 4.51.3 que pinea el
+extra `streamingtts` del repo original. Se probó y genera audio correctamente,
+pero es la diferencia a mirar primero si algo se rompe tras un `uv lock`.
+
+### Construir sin una máquina x86_64
+
+Si trabajas desde un Mac ARM, necesitas un x86_64-linux para construir. Dos
+detalles que muerden al instalar Nix en un LXC de Proxmox:
+
+- El **sandbox funciona** en contenedores no privilegiados; no hace falta
+  `sandbox = false`.
+- `channels.nixos.org` resuelve **solo a IPv6**. Si el contenedor no tiene ruta
+  IPv6, cualquier `nixpkgs#loquesea` falla con "Could not resolve host". Se
+  desactiva con `flake-registry = ` (vacío) en `/etc/nix/nix.conf`; este repo no
+  lo necesita porque tiene `flake.lock`.
 
 ## Licencias
 
