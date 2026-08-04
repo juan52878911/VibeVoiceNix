@@ -41,7 +41,7 @@ Segundos de cómputo por **cada 10 segundos de audio**. Cada bloque es un segund
 Piper · TTS            0,4 s   ▐
 whisper base · STT     2,0 s   ██
 whisper small · STT    6,7 s   ███████
-VibeVoice · TTS       48,0 s   ████████████████████████████████████████████████
+VibeVoice · TTS       39,2 s   ███████████████████████████████████████
 ```
 
 Esa última fila es toda la explicación de por qué el repositorio se llama VibeVoiceNix pero la producción
@@ -53,25 +53,54 @@ la sirve Piper.
 
 | | **Piper** | **VibeVoice-Realtime-0.5B** |
 |---|---|---|
-| RTF | **0,042** (voz ya en memoria) | **4,80** |
-| Cómputo por 9 s de audio | ~0,4 s | **44 s** |
+| RTF | **0,042** (voz ya en memoria) | **3,92** (8 núcleos) |
 | Pico de RAM | decenas de MB | **3,9 GB** |
-| Tamaño del modelo | 60–109 MB por voz | 1,9 GB en fp32 |
+| Tamaño del modelo | 61–109 MB por voz | 1,9 GB en fp32 |
 | Español | sí, cinco voces | experimental, dos voces |
 | Papel en el proyecto | **producción** | laboratorio |
 
-La diferencia es de **~100×**. No es un ajuste que se pueda cerrar afinando parámetros: son dos familias de
-modelos distintas. Piper es un modelo VITS pequeño que se ejecuta de una pasada sobre ONNX Runtime;
-VibeVoice es un modelo de difusión que hace decenas de pasos iterativos, y en CPU cada paso se paga entero.
+La diferencia es de **casi 100×**. No es un ajuste que se pueda cerrar afinando parámetros: son dos
+familias de modelos distintas. Piper es un modelo VITS pequeño que se ejecuta de una pasada sobre ONNX
+Runtime; VibeVoice es un modelo de difusión que hace decenas de pasos iterativos, y en CPU cada paso se
+paga entero.
 
-**La palanca que existe** es `cfgScale`. Con *classifier-free guidance* activo cada paso de difusión hace
-dos pasadas —una condicional y otra incondicional—, así que bajarlo de `1.5` a `1.0` casi duplica la
-velocidad a cambio de expresividad. Aun así la cuenta deja el RTF en torno a **2,4**: seguiría siendo el
-doble de lento que el tiempo real.
+**Por eso VibeVoice no es un servicio.** El módulo instala una orden que se lanza a mano, y una aserción
+exige que el sistema tenga swap declarada. Un servicio que escuchara peticiones competiría por la RAM con
+`voz-api` y empujaría la VM a swap justo cuando hay que responder.
 
-**Por eso VibeVoice no es un servicio.** El módulo instala una orden que se lanza a mano y avisa de que
-necesita ~4 GB libres. Un servicio que escuchara peticiones competiría por la RAM con `voz-api` y
-empujaría la VM a swap justo cuando hay que responder.
+### El único lever real fueron los núcleos
+
+Se probaron varias cosas para acelerarlo. **La única que movió la aguja fue dar más CPU:**
+
+| Núcleos | RTF |
+|---|---|
+| 4 | 4,80 |
+| 8 | **3,92** (−18%) |
+
+Por eso el Terraform pide **8 núcleos** por defecto. Medido dentro del entorno de Nix construido desde el
+store, el resultado es del mismo orden: **RTF 4,24**.
+
+### `cfgScale` no acelera: se midió
+
+Parecía el ajuste obvio —con *classifier-free guidance* cada paso hace una pasada condicional y otra
+incondicional, así que bajarlo debería saltarse la mitad del trabajo— y **resultó que no**:
+
+| `cfg_scale` | RTF | Audio generado |
+|---|---|---|
+| 1.5 | **3,92** | 10,93 s |
+| 1.3 | 4,02 | 11,87 s |
+| 1.0 | 4,20 | 17,07 s ← divaga |
+
+Baja la calidad y encima va **más lento**. El motivo está en `sample_speech_tokens`: concatena condicional
+e incondicional en un mismo batch **siempre**, sin ninguna rama que se salte la segunda. Se parcheó para
+saltársela con `cfg_scale == 1.0` y tampoco sirvió — **RTF 3,90**, dentro del ruido.
+
+La explicación es que con dimensión 896 y batch 2, **el cuello es el ancho de banda de memoria, no los
+FLOPs**: la segunda mitad del batch sale casi gratis, así que eliminarla no ahorra nada. Déjalo en `1.5`,
+que es donde da mejor calidad.
+
+Es el tipo de resultado que solo aparece midiendo: la explicación teórica era impecable y la realidad dijo
+que no.
 
 ### Sobre el español en VibeVoice
 
@@ -117,14 +146,22 @@ El servidor se mantiene **residente** en vez de arrancar un proceso por petició
 ## Por qué no hay GPU
 
 La máquina tiene una **Intel UHD 630** integrada, y la pregunta obvia es si descarga trabajo de la CPU. Se
-probó `whisper.cpp` con el backend **Vulkan** y el resultado fue:
+pasó al contenedor y funciona —OpenCL 3.0, Vulkan 1.3—, pero medido con `whisper.cpp`:
 
-> **2,5× MÁS LENTA que la CPU.**
+| | `base` | `small` |
+|---|---|---|
+| **CPU, 6 hilos** | **1,53 s** | **5,18 s** |
+| iGPU Vulkan | 7,65 s | 12,88 s |
 
-La causa está en las capacidades que reporta el propio dispositivo: `matrix cores: none`. Una iGPU de esa
-generación no tiene unidades de multiplicación de matrices, que es exactamente la operación que domina la
-inferencia. Sin ellas, el sobrecoste de mover los tensores a la GPU y traerlos de vuelta se come cualquier
-ganancia de paralelismo.
+> **La iGPU es 2,5× MÁS LENTA que la CPU.**
+
+La causa está en las capacidades que reporta el propio informe de `ggml`: `matrix cores: none`, `bf16: 0`.
+Una iGPU de esa generación no tiene unidades de multiplicación de matrices, que es exactamente la
+operación que domina la inferencia. Sin ellas, el sobrecoste de mover los tensores a la GPU y traerlos de
+vuelta se come cualquier ganancia de paralelismo.
+
+Y por PyTorch tampoco: **esa generación nunca tendrá soporte** —XPU e IPEX cubren Arc/Xe en adelante—, y en
+la máquina `torch.xpu.is_available()` devuelve `False`.
 
 Las consecuencias recorren todo el repositorio:
 
@@ -132,6 +169,7 @@ Las consecuencias recorren todo el repositorio:
 - `torch` se instala desde el índice `pytorch-cpu`. La rueda de CUDA pesa ~2,5 GB y no hay GPU NVIDIA en
   esta máquina.
 - La orden `vibevoice` fuerza `--device cpu`.
+- El Terraform no hace *passthrough* de GPU: no habría a quién pasársela.
 
 Con una GPU NVIDIA la conclusión sería otra, y VibeVoice podría dejar de ser un laboratorio. Con esta, no.
 
@@ -141,13 +179,13 @@ Con una GPU NVIDIA la conclusión sería otra, y VibeVoice podría dejar de ser 
 
 Cinco voces en español, mismo texto (~10 s de audio):
 
-| Voz | Región | Calidad | RTF | Notas |
+| Voz | Región | Calidad | RTF | Tamaño |
 |---|---|---|---|---|
-| `es_MX-ald-medium` | México | medium | **0,151** | la más rápida |
-| `es_MX-claude-high` | México | high | **0,152** | **la voz por defecto**: la más rápida de las `high` |
-| `es_ES-sharvard-medium` | España | medium | 0,177 | |
-| `es_ES-davefx-medium` | España | medium | 0,191 | |
-| `es_AR-daniela-high` | Argentina | high | 0,408 | 2,7× más lenta; 109 MB |
+| `es_MX-ald-medium` | México | medium | **0,151** | 61 MB |
+| `es_MX-claude-high` | México | high | **0,152** | 61 MB — **la voz por defecto** |
+| `es_ES-sharvard-medium` | España | medium | 0,177 | 74 MB |
+| `es_ES-davefx-medium` | España | medium | 0,191 | 61 MB |
+| `es_AR-daniela-high` | Argentina | high | 0,408 | 109 MB — 2,7× más lenta |
 
 Lo interesante es que **`claude-high` cuesta prácticamente lo mismo que una `medium`** (0,152 frente a
 0,151) mientras que `daniela-high` cuesta casi el triple. La calidad `high` no implica por sí sola un coste
@@ -174,8 +212,9 @@ El modelo de VibeVoice son 1,9 GB en fp32 y **en CPU no baja de ahí**: no hay c
 Por debajo de 6 GB de RAM el sistema se va a swap y el RTF, que ya era malo, se vuelve inservible.
 
 De ahí salen dos decisiones del repositorio: el **fichero de intercambio de 4 GB** que declara
-[`nix/disko.nix`](../nix/disko.nix) como red de seguridad, y el aviso que emite el módulo de VibeVoice
-cuando se activa junto a `voz-api`.
+[`nix/disko.nix`](../nix/disko.nix) como red de seguridad, y una **aserción** en el módulo de VibeVoice que
+se niega a construir el sistema si no hay `swapDevices` declarada. El Terraform, por su parte, pide 6 GB
+de RAM por defecto y valida que no bajes de 4 GB.
 
 ### Disco
 
@@ -204,9 +243,9 @@ El caso real: un agente recibe una nota de voz de 10 segundos, la entiende y con
                      STT      TTS
                      6,7 s    0,4 s   (+ lo que tarde el agente en pensar)
 
-  SI EL TTS FUERA    ███████▓▓█████████████████████████████████████████   55,5 s
+  SI EL TTS FUERA    ███████▓▓████████████████████████████████          46,7 s
   VIBEVOICE          STT      TTS · VibeVoice
-                     6,7 s    48 s
+                     6,7 s    39,2 s
 ```
 
 Con el stack tal como está, el usuario espera **menos de diez segundos** y la mayor parte es la
@@ -217,7 +256,7 @@ Otras referencias rápidas:
 
 - **Una nota de voz de 10 s sintetizada con Piper:** ~0,4 s. Menos de lo que tarda en llegar por la red.
 - **Transcribir un audio de un minuto:** ~40 s con `small`, ~12 s con `base`.
-- **Un párrafo de 30 s leído por VibeVoice:** ~2,5 minutos de cómputo.
+- **Un párrafo de 30 s leído por VibeVoice:** ~2 minutos de cómputo.
 
 ---
 
