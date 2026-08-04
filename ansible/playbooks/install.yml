@@ -1,0 +1,76 @@
+# Paso 2: convertir la VM en NixOS.
+#
+# nixos-anywhere hace kexec sobre el sistema arrancado, particiona con disko y
+# escribe el sistema que describe el flake. Es destructivo por diseno: lo que
+# hubiera en el disco desaparece.
+---
+- name: Instalar NixOS en la VM de voz
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    raiz_repo: "{{ playbook_dir }}/../.."
+    inventario: "{{ playbook_dir }}/../inventory/hosts.generated.yml"
+
+  tasks:
+    - name: Leer el inventario generado
+      ansible.builtin.include_vars:
+        file: "{{ inventario }}"
+        name: inv
+
+    - name: Sacar la IP
+      ansible.builtin.set_fact:
+        ip_voz: "{{ inv.hosts.voz.ansible_host }}"
+
+    - name: Confirmar que se va a formatear el disco
+      ansible.builtin.pause:
+        prompt: |
+
+          nixos-anywhere va a BORRAR el disco de la VM en {{ ip_voz }}
+          y reinstalarla desde el flake .#voz
+
+          Enter para seguir, Ctrl-C para abortar
+      when: confirmar | default(true) | bool
+
+    - name: Comprobar que el flake evalua antes de tocar la VM
+      ansible.builtin.command:
+        cmd: nix eval --raw .#nixosConfigurations.voz.config.system.build.toplevel.drvPath
+        chdir: "{{ raiz_repo }}"
+      register: evaluacion
+      changed_when: false
+
+    - name: Instalar NixOS con nixos-anywhere
+      ansible.builtin.command:
+        cmd: >-
+          nix run github:nix-community/nixos-anywhere --
+          --flake .#voz
+          --generate-hardware-config nixos-generate-config ./nix/hardware-generado.nix
+          root@{{ ip_voz }}
+        chdir: "{{ raiz_repo }}"
+      register: instalacion
+      changed_when: true
+
+    - name: Esperar a que NixOS arranque
+      ansible.builtin.wait_for:
+        host: "{{ ip_voz }}"
+        port: 22
+        timeout: 600
+        delay: 30
+
+    - name: Comprobar que la API de voz responde
+      ansible.builtin.uri:
+        url: "http://{{ ip_voz }}:8080/health"
+        return_content: true
+      register: salud
+      retries: 20
+      delay: 15
+      until: salud.status == 200
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg:
+          - "NixOS instalado en {{ ip_voz }}"
+          - "TTS: {{ salud.json.tts.motor }} — voces {{ salud.json.tts.voces | join(', ') }}"
+          - "STT: {{ salud.json.stt.motor }} — disponible: {{ salud.json.stt.disponible }}"
+          - "El token esta en la VM: ssh root@{{ ip_voz }} cat /var/lib/voz/token.env"

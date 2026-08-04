@@ -68,13 +68,14 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ vibevoice ];
 
-    # 1,9 GB de modelo mas el runtime: por debajo de 6 GB el sistema va a swap
-    # y el RTF, que ya es malo, se vuelve inservible.
-    warnings = lib.optional (config.systemd.services ? voz-api && cfg.enable)
-      ''
-        VibeVoice necesita ~4 GB de RAM libres durante la generacion. Si esta VM
-        tiene menos de 6 GB, lanzarlo mientras voz-api sirve peticiones puede
-        empujar el sistema a swap.
+    # 1,9 GB de modelo mas el runtime dan ~3,9 GB de pico. Sin swap, una
+    # generacion en una VM justa se lleva por delante al que pida memoria.
+    assertions = [{
+      assertion = config.swapDevices != [ ];
+      message = ''
+        services.vibevoice necesita ~4 GB de RAM durante la generacion y esta
+        configuracion no define swap. Anade swapDevices o desactiva vibevoice.
       '';
+    }];
   };
 }

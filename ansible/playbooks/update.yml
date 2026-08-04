@@ -1,0 +1,57 @@
+# Paso 3: aplicar cambios del flake a una VM ya instalada.
+#
+# Este es el playbook del dia a dia. Cambias algo en nix/, lanzas esto, y el
+# sistema converge. Si algo sale mal, `nixos-rebuild --rollback` en la VM
+# vuelve a la generacion anterior: eso es lo que da la inmutabilidad.
+---
+- name: Actualizar la VM de voz desde el flake
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    raiz_repo: "{{ playbook_dir }}/../.."
+    inventario: "{{ playbook_dir }}/../inventory/hosts.generated.yml"
+    modo: switch # switch | boot | test | dry-activate
+
+  tasks:
+    - name: Leer el inventario generado
+      ansible.builtin.include_vars:
+        file: "{{ inventario }}"
+        name: inv
+
+    - name: Sacar la IP
+      ansible.builtin.set_fact:
+        ip_voz: "{{ inv.hosts.voz.ansible_host }}"
+
+    - name: Comprobar que el flake evalua
+      ansible.builtin.command:
+        cmd: nix eval --raw .#nixosConfigurations.voz.config.system.build.toplevel.drvPath
+        chdir: "{{ raiz_repo }}"
+      register: evaluacion
+      changed_when: false
+
+    - name: Aplicar la configuracion
+      ansible.builtin.command:
+        cmd: >-
+          nixos-rebuild {{ modo }}
+          --flake .#voz
+          --target-host root@{{ ip_voz }}
+          --build-host root@{{ ip_voz }}
+        chdir: "{{ raiz_repo }}"
+      register: rebuild
+      changed_when: "'switching to configuration' in rebuild.stderr"
+
+    - name: Comprobar que la API sigue en pie
+      ansible.builtin.uri:
+        url: "http://{{ ip_voz }}:8080/health"
+        return_content: true
+      register: salud
+      retries: 10
+      delay: 10
+      until: salud.status == 200
+      when: modo in ['switch', 'boot']
+
+    - name: Resumen
+      ansible.builtin.debug:
+        msg: "Configuracion aplicada en {{ ip_voz }} (modo {{ modo }})"
