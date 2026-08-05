@@ -205,6 +205,7 @@ def cargar_modelo():
     )
     modelo.eval()
     soltar_encoder_acustico(modelo)
+    acelerar_convoluciones_depthwise(modelo)
     compartir_embeddings_muertos(modelo)
 
     if EN_GPU:
@@ -238,6 +239,78 @@ def cargar_modelo():
     # se recolectan Y se devuelven al sistema.
     devolver_memoria()
     return procesador, modelo
+
+
+class ConvDepthwiseRapida(torch.nn.Module):
+    """Depthwise Conv1d reescrita como suma de K desplazamientos.
+
+    PyTorch no trae kernel optimizado de convolucion depthwise cuando falta
+    oneDNN -- que es el caso en ARM y en cualquier maquina sin MKLDNN -- y cae
+    a la implementacion de referencia procesando GRUPO POR GRUPO. Con
+    groups=2048 eso son 2048 convoluciones diminutas donde deberia haber una.
+
+    Medido con el perfilador: aten::_slow_conv2d_forward se lleva el 75 % del
+    tiempo del decodificador, con 22.434 llamadas por cada decode.
+
+    Pero una depthwise no es mas que, para cada desplazamiento del kernel,
+    multiplicar por un escalar por canal y sumar. Vectorizado sobre todos los
+    canales a la vez:
+
+        Conv1d depthwise (torch)   36,85 ms
+        suma de 7 desplazamientos   0,35 ms      -> 106x
+
+    Y la salida es la MISMA: diferencia maxima 4,77e-07, que es el redondeo de
+    coma flotante al reordenar las sumas.
+
+    Solo se aplica a las depthwise puras y sin dilatacion (stride 1, padding 0,
+    groups == canales), que son las 26 del decodificador acustico. Cualquier
+    otra forma se deja intacta.
+    """
+
+    def __init__(self, conv: torch.nn.Conv1d):
+        super().__init__()
+        c, k = conv.out_channels, conv.kernel_size[0]
+        self.k = k
+        # (K,1,C,1): asi self.w[j] ya sale con la forma que necesita el
+        # broadcast, sin un view por cada paso del bucle.
+        w = conv.weight.detach().reshape(c, k).t().contiguous().view(k, 1, c, 1)
+        self.register_buffer("w", w)
+        self.tiene_sesgo = conv.bias is not None
+        if self.tiene_sesgo:
+            self.register_buffer("b", conv.bias.detach().reshape(1, c, 1).clone())
+
+    def forward(self, x):
+        largo = x.shape[2] - self.k + 1
+        salida = x[:, :, :largo] * self.w[0]
+        for j in range(1, self.k):
+            salida = salida + x[:, :, j:j + largo] * self.w[j]
+        return salida + self.b if self.tiene_sesgo else salida
+
+
+def acelerar_convoluciones_depthwise(modelo) -> int:
+    """Sustituye las depthwise del decodificador. Devuelve cuantas cambio."""
+    if os.environ.get("VIBEVOICE_SIN_DEPTHWISE_RAPIDA", "").strip() not in ("", "0"):
+        return 0
+    tok = getattr(getattr(modelo, "model", None), "acoustic_tokenizer", None)
+    dec = getattr(tok, "decoder", None)
+    if dec is None:
+        return 0
+    cambiadas = 0
+    for padre in dec.modules():
+        for nombre, hijo in list(padre.named_children()):
+            if (isinstance(hijo, torch.nn.Conv1d)
+                    and hijo.groups > 1
+                    and hijo.groups == hijo.in_channels == hijo.out_channels
+                    and hijo.stride[0] == 1
+                    and hijo.dilation[0] == 1
+                    and hijo.padding[0] == 0):
+                setattr(padre, nombre, ConvDepthwiseRapida(hijo))
+                cambiadas += 1
+    if cambiadas:
+        devolver_memoria()
+        print(f"[arranque] {cambiadas} convoluciones depthwise reescritas "
+              f"(medido 106x mas rapido cada una)", flush=True)
+    return cambiadas
 
 
 def soltar_encoder_acustico(modelo) -> None:
