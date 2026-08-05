@@ -60,7 +60,8 @@
     color:var(--suave);margin-left:.4rem}
   .pill.on{background:var(--senal-bg);color:var(--senal)}
   .pill.off{background:var(--borde);color:var(--suave)}
-  .pie{margin-top:1.5rem;font-size:.78rem;color:var(--suave)}
+  .nota{font-size:.83rem;color:var(--suave);margin:0 0 .9rem}
+  .pie{margin-top:1.5rem;font-size:.78rem;color:var(--suave);line-height:1.7}
   code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;
     background:var(--sup);padding:.1rem .3rem;border-radius:4px;border:1px solid var(--borde)}
 </style>
@@ -120,10 +121,43 @@
     <div class="est" id="e-stt"></div>
   </section>
 
+  <section>
+    <h2>Voz neuronal en streaming <span class="pill">VibeVoice</span></h2>
+    <p class="nota">
+      Suena más natural que Piper, pero genera unas dos veces más lento que el
+      tiempo real. Se escucha por trozos según se generan, así que empieza a
+      hablar mucho antes de terminar.
+    </p>
+    <div class="campo">
+      <label for="s-texto">Texto</label>
+      <textarea id="s-texto">Esto no es una voz pregrabada: se está generando mientras la escuchas.</textarea>
+    </div>
+    <div class="fila">
+      <div><label for="s-voz">Voz</label>
+        <select id="s-voz">
+          <option value="sp-Spk1_man">Hombre</option>
+          <option value="sp-Spk2_woman">Mujer</option>
+        </select></div>
+      <div><label for="s-cfg">Expresividad</label>
+        <select id="s-cfg">
+          <option value="1.0">Plana</option>
+          <option value="1.5" selected>Natural</option>
+          <option value="2.5">Marcada</option>
+        </select></div>
+    </div>
+    <div class="btns">
+      <button id="b-str" disabled>Generar y escuchar</button>
+      <button id="b-stop" class="sec" hidden>Detener</button>
+    </div>
+    <div class="met" id="m-str" hidden></div>
+    <div class="est" id="e-str"></div>
+  </section>
+
   <p class="pie">
     Piper responde en décimas de segundo (RTF ~0,04). whisper transcribe unas
-    dos veces más rápido que el tiempo real. Si el streaming aparece apagado,
-    es que <code>voz-stream</code> no está levantado — es opcional y pesado.
+    dos veces más rápido que el tiempo real. Si el streaming sale apagado,
+    levántalo aparte — es opcional y pesado:<br>
+    <code>docker compose --profile pesado up -d</code>
   </p>
 </div>
 
@@ -164,7 +198,13 @@ async function comprobar() {
     const r = await fetch(u, { signal: AbortSignal.timeout(2500) });
     const d = await r.json();
     pill("p-str", true, d.motor);
-  } catch { pill("p-str", false, "sin streaming"); }
+    $("b-str").disabled = false;
+    di("e-str", `RTF esperado ${d.rtf_esperado} · ${d.pasos} pasos`);
+  } catch {
+    pill("p-str", false, "sin streaming");
+    $("b-str").disabled = true;
+    di("e-str", "voz-stream no responde en el 8082.");
+  }
 }
 
 $("b-gen").addEventListener("click", async () => {
@@ -257,6 +297,91 @@ async function transcribir(fichero) {
     di("e-stt", "Listo.", "ok");
   } catch (e) { di("e-stt", "No se pudo transcribir: " + e.message, "err"); }
 }
+
+// --- Streaming de VibeVoice -------------------------------------------
+// Llega un WAV por trozos de ~133 ms. No sirve un <audio>: para oirlo
+// empezar antes de que termine hay que ir encolando los trozos en Web
+// Audio segun caen, que es justo la gracia de este motor.
+let aborto = null;
+
+$("b-str").addEventListener("click", async () => {
+  const texto = $("s-texto").value.trim();
+  if (!texto) return;
+  $("b-str").disabled = true; $("b-stop").hidden = false;
+  $("m-str").hidden = true; di("e-str", "Cargando el modelo…");
+
+  const ctx = new AudioContext();
+  aborto = new AbortController();
+  const t0 = performance.now();
+  let primero = 0, muestras = 0, ritmo = 24000, cabeza = 0, resto = new Uint8Array(0);
+
+  try {
+    const u = new URL(location.href); u.port = "8082"; u.pathname = "/tts/stream";
+    const r = await fetch(u, {
+      method: "POST", signal: aborto.signal,
+      headers: { "content-type": "application/json", ...cab() },
+      body: JSON.stringify({ texto, voz: $("s-voz").value,
+                             cfg_scale: parseFloat($("s-cfg").value) }),
+    });
+    if (!r.ok) throw new Error(r.status === 401 ? "token inválido" : `HTTP ${r.status}`);
+    ritmo = parseInt(r.headers.get("x-ritmo-hz")) || 24000;
+
+    const lector = r.body.getReader();
+    let cabeceraFuera = false;
+    while (true) {
+      const { done, value } = await lector.read();
+      if (done) break;
+
+      // Los trozos no respetan ni la cabecera ni los limites de muestra,
+      // asi que se guarda lo que sobra para el siguiente.
+      let datos = new Uint8Array(resto.length + value.length);
+      datos.set(resto); datos.set(value, resto.length);
+      if (!cabeceraFuera) {
+        if (datos.length < 44) { resto = datos; continue; }
+        datos = datos.slice(44); cabeceraFuera = true;  // cabecera WAV
+      }
+      const enteras = datos.length - (datos.length % 2);
+      resto = datos.slice(enteras);
+      if (!enteras) continue;
+
+      const pcm = new Int16Array(datos.buffer, datos.byteOffset, enteras / 2);
+      const f32 = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
+
+      if (!primero) {
+        primero = performance.now() - t0;
+        di("e-str", "Sonando mientras se genera…");
+        cabeza = ctx.currentTime + 0.15;  // colchon para el primer trozo
+      }
+      const buf = ctx.createBuffer(1, f32.length, ritmo);
+      buf.copyToChannel(f32, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buf; src.connect(ctx.destination);
+      // Si la generacion se retrasa, la cabeza queda en el pasado y el trozo
+      // sonaria tarde y solapado: se reancla al presente.
+      if (cabeza < ctx.currentTime) cabeza = ctx.currentTime;
+      src.start(cabeza); cabeza += buf.duration;
+      muestras += f32.length;
+
+      const seg = muestras / ritmo;
+      $("m-str").hidden = false;
+      $("m-str").innerHTML =
+        `primer sonido <b>${Math.round(primero)}ms</b>` +
+        ` · audio <b>${seg.toFixed(1)}s</b>` +
+        ` · RTF <b>${((performance.now() - t0) / 1000 / seg).toFixed(2)}</b>`;
+    }
+    di("e-str", muestras ? "Listo." : "No llegó audio.", muestras ? "ok" : "err");
+  } catch (e) {
+    if (e.name === "AbortError") di("e-str", "Detenido.");
+    else di("e-str", "No se pudo generar: " + e.message, "err");
+  } finally {
+    $("b-str").disabled = false; $("b-stop").hidden = true; aborto = null;
+    // Cierra tras lo ya encolado, o cortaria el final.
+    setTimeout(() => ctx.close(), Math.max(0, (cabeza - ctx.currentTime) * 1000) + 300);
+  }
+});
+
+$("b-stop").addEventListener("click", () => aborto && aborto.abort());
 
 comprobar();
 </script>
