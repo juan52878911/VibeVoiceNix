@@ -92,6 +92,21 @@
         });
 
       # ------------------------------------------------------------------
+      # Imagenes Docker, para usar el stack SIN tener Nix. Se construyen con
+      # Nix a partir de los mismos paquetes que la VM, asi que no hay una
+      # segunda definicion que pueda divergir.
+      #
+      #   nix build .#imagenes.voz-api && docker load < result
+      #
+      # Solo para linux-x86_64: las imagenes contienen binarios de esa
+      # arquitectura. Desde un Mac ARM se construyen con un constructor remoto
+      # o con `--system x86_64-linux` si hay emulacion configurada.
+      # ------------------------------------------------------------------
+      imagenes =
+        let pkgs = (nixpkgs.legacyPackages.${sistemaDestino}).extend overlayPropio;
+        in import ./nix/imagenes.nix { inherit pkgs; inherit (nixpkgs) lib; };
+
+      # ------------------------------------------------------------------
       # Entorno de trabajo: trae terraform, ansible y nixos-anywhere para no
       # tener que instalar nada en la maquina del que clone el repo.
       # ------------------------------------------------------------------

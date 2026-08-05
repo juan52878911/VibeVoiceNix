@@ -131,14 +131,24 @@
     </div>
   </div>
 
+  <div class="campo" style="margin-top:1rem">
+    <label for="modo">Reproducción</label>
+    <select id="modo">
+      <option value="auto" selected>Automática — espera lo justo para no cortarse</option>
+      <option value="ya">Cuanto antes — suena a los ~200 ms, puede entrecortarse</option>
+    </select>
+  </div>
+
   <div class="barra"><div id="progreso"></div></div>
-  <div class="estado" id="estado">Escribe algo y pulsa generar. El audio empieza a sonar antes de terminar de generarse.</div>
+  <div class="estado" id="estado">Escribe algo y pulsa generar.</div>
 
   <p class="pie">
-    La reproducción va por Web Audio: cada trozo se encola en cuanto llega, sin
-    esperar al final. Si el RTF pasa de 1 el audio se genera más despacio de lo
-    que se oye y notarás cortes — es esperado, no un fallo. Con
-    <code>services.vibevoice.openvino.enable</code> el RTF baja de 2,2 a 1,1.
+    Cada trozo se encola por Web Audio en cuanto llega, sin esperar al final.
+    <strong>Si el RTF pasa de 1</strong>, el audio se genera más despacio de lo
+    que se oye: en modo automático se espera un poco antes de empezar para que
+    no se corte, y en «cuanto antes» oyes el arranque enseguida a cambio de
+    tirones. Con <code>services.vibevoice.openvino.enable</code> el RTF baja de
+    2,2 a 1,1 y la espera casi desaparece.
   </p>
 </div>
 
@@ -167,6 +177,10 @@ $("ir").addEventListener("click", async () => {
 
   const ini = performance.now();
   let ttfa = null, muestras = 0, siguiente = 0, sobra = new Uint8Array(0), saltado = 0;
+  // En modo automático los trozos se acumulan aquí hasta que hay bastante
+  // colchón para reproducir de un tirón; en "ya" se sueltan según llegan.
+  const espera = [];
+  let arrancado = $("modo").value === "ya";
 
   try {
     const r = await fetch("/tts/stream", {
@@ -209,19 +223,43 @@ $("ir").addEventListener("click", async () => {
       const canal = trozo.getChannelData(0);
       for (let i = 0; i < pcm.length; i++) canal[i] = pcm[i] / 32768;
 
-      const fuente = ctx.createBufferSource();
-      fuente.buffer = trozo;
-      fuente.connect(ctx.destination);
-      // Encola cada trozo justo detrás del anterior: sin esto se solapan.
-      const cuando = Math.max(ctx.currentTime, siguiente);
-      fuente.start(cuando);
-      siguiente = cuando + trozo.duration;
-
       muestras += pcm.length;
+
+      if (!arrancado) {
+        // Con RTF>1 el audio llega mas despacio de lo que se consume. Para no
+        // cortarse hay que esperar a tener (RTF-1) x duracion ya generado. Se
+        // estima con el ritmo REAL observado, no con el anunciado, porque el
+        // ritmo real ya incluye la carga que tenga la maquina en ese momento.
+        espera.push(trozo);
+        const generado = muestras / RITMO;
+        const transcurrido = (performance.now() - ini) / 1000;
+        const rtfReal = transcurrido / generado;
+        const colchon = Math.max(0, (rtfReal - 1)) * generado;
+
+        if (rtfReal <= 1.05 || generado >= colchon + 0.4) {
+          arrancado = true;
+          pinta("Sonando…");
+        } else {
+          pinta(`Acumulando ${generado.toFixed(1)} s para que no se corte ` +
+                `(RTF ${rtfReal.toFixed(1)})…`);
+          $("progreso").style.width = Math.min(100, (muestras / RITMO) * 8) + "%";
+          continue;
+        }
+      }
+
+      for (const t of espera.length ? espera.splice(0) : [trozo]) {
+        const fuente = ctx.createBufferSource();
+        fuente.buffer = t;
+        fuente.connect(ctx.destination);
+        // Encola cada trozo justo detras del anterior: sin esto se solapan.
+        const cuando = Math.max(ctx.currentTime, siguiente);
+        fuente.start(cuando);
+        siguiente = cuando + t.duration;
+      }
+
       if (ttfa === null) {
         ttfa = performance.now() - ini;
         $("m-ttfa").textContent = Math.round(ttfa) + " ms";
-        pinta("Sonando mientras se genera…");
       }
       $("progreso").style.width = Math.min(100, (muestras / RITMO) * 8) + "%";
     }

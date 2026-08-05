@@ -1,0 +1,101 @@
+# Stack de voz en Docker, para usarlo sin tener Nix instalado.
+#
+# Las imágenes se construyen con Nix (ver ../nix/imagenes.nix) pero se usan sin
+# él. Quien reciba los .tar.gz solo necesita Docker:
+#
+#     docker load < voz-api.tar.gz
+#     docker load < voz-whisper.tar.gz
+#     docker load < voz-stream.tar.gz
+#     docker compose up -d
+#
+# Un contenedor por motor, no los tres juntos, por dos razones concretas:
+# cada uno tiene un perfil de memoria muy distinto (Piper ~100 MB frente a
+# VibeVoice ~2,5 GB), y así una síntesis pesada no bloquea las notas de voz
+# rápidas.
+
+name: voz
+
+services:
+  # --------------------------------------------------------------------
+  # Transcripción. Va primero porque voz-api depende de él.
+  # --------------------------------------------------------------------
+  whisper:
+    image: voz-whisper:latest
+    restart: unless-stopped
+    volumes:
+      # El modelo NO va dentro de la imagen: son 466 MB y ataría su versión a
+      # la del contenedor. Descárgalo una vez con ./bajar-modelo.sh
+      - ./modelos:/modelos:ro
+    # Solo accesible desde la red interna: quien entra de fuera pasa por
+    # voz-api, que es quien valida el token.
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8081' || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------------------
+  # Piper (TTS) + fachada HTTP. Es el camino rápido: RTF 0,042.
+  # --------------------------------------------------------------------
+  voz-api:
+    image: voz-api:latest
+    restart: unless-stopped
+    depends_on:
+      whisper:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      # Sin token la API queda abierta. Ponlo en un fichero .env al lado:
+      #     VOZ_TOKEN=una-cadena-larga-y-aleatoria
+      VOZ_TOKEN: "${VOZ_TOKEN:-}"
+      VOZ_WHISPER_URL: "http://whisper:8081"
+      # Sesga el vocabulario de whisper. Es el ajuste que MÁS se nota: sin él
+      # transcribe "WireGuard" como "We The War". Mete aquí tu jerga.
+      VOZ_PROMPT_STT: >-
+        Vocabulario tecnico: homelab, Proxmox, WireGuard, Docker, contenedor,
+        Caddy, systemd, OpenClaw, Piper, whisper, backup, deploy, NixOS.
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # --------------------------------------------------------------------
+  # VibeVoice con streaming. Opcional: arráncalo con
+  #     docker compose --profile pesado up -d
+  #
+  # Pide ~2,5 GB de RAM en régimen y hace un pico de ~4,6 GB al cargar
+  # (materializa el modelo en fp32 antes de cuantizarlo). Con menos de 6 GB
+  # libres en la máquina, el kernel lo matará.
+  # --------------------------------------------------------------------
+  voz-stream:
+    image: voz-stream:latest
+    restart: unless-stopped
+    profiles: ["pesado"]
+    ports:
+      - "8082:8082"
+    environment:
+      VOZ_TOKEN: "${VOZ_TOKEN:-}"
+      # Pasos de difusión. 6 es el punto dulce medido: bajar a 4 solo gana un
+      # 3% y sube a 20 cuesta un 26%.
+      VIBEVOICE_PASOS: "6"
+      VIBEVOICE_VOZ: "sp-Spk1_man"
+    deploy:
+      resources:
+        limits:
+          # Tope generoso a propósito: por debajo del pico de carga el
+          # contenedor muere a mitad de arrancar y sin mensaje claro.
+          memory: 5g
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8082' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      # Carga el modelo y hace una síntesis de calentamiento: ~2 minutos hasta
+      # aceptar la primera petición.
+      start_period: 180s
