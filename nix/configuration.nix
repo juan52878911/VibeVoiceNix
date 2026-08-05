@@ -161,6 +161,13 @@
     ffmpeg
     sox
     htop
+    # git es OBLIGATORIO, no una comodidad: uv2nix resuelve VibeVoice desde un
+    # repositorio git, asi que sin el la VM no puede construir su propio
+    # sistema. Con git aqui, esta maquina se reconstruye sola y no hace falta
+    # un host de construccion aparte -- que es de donde vino el fallo mas caro
+    # de este proyecto: desplegar durante horas desde una copia del repo
+    # atrasada tres commits.
+    git
   ];
 
   nix.settings = {
