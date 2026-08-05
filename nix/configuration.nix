@@ -116,7 +116,16 @@
 
   services.vibevoice = {
     enable = true;
-    hilos = 8;
+  };
+
+  services.voz-stream = {
+    enable = true;
+    puerto = 8082;
+    # Reusa el token de voz-api: una sola credencial para todo el stack.
+    ficheroToken = "/var/lib/voz/token.env";
+    # Sin abrir en la LAN: se llega por el tunel de WireGuard, que ya alcanza
+    # la VM desde fuera de casa sin exponer nada a internet ni a la red local.
+    abrirCortafuegos = false;
   };
 
   # El token no puede vivir en el store (es legible por todo el sistema). Se

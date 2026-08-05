@@ -118,6 +118,7 @@ rec {
   inferencia = runCommand "vibevoice-cli" { } ''
     mkdir -p "$out/bin"
     cp ${../../pkgs/vibevoice-cli/vibevoice_cli.py} "$out/bin/vibevoice-cli.py"
-    chmod +x "$out/bin/vibevoice-cli.py"
+    cp ${../../pkgs/vibevoice-cli/voz_stream.py} "$out/bin/voz-stream.py"
+    chmod +x "$out/bin/vibevoice-cli.py" "$out/bin/voz-stream.py"
   '';
 }
