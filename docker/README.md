@@ -47,7 +47,18 @@ hace una síntesis de calentamiento para no pagarla en tu primera llamada.
 
 ## Si vas a construir las imágenes
 
-Necesitas Nix con flakes, y que el destino sea `x86_64-linux`:
+Necesitas Nix con flakes **y una máquina `x86_64-linux`**. Las imágenes
+contienen binarios de esa arquitectura, así que desde un Mac ARM fallan con:
+
+```
+error: Cannot build '...-usuario-base.drv'
+       Required system: 'x86_64-linux'
+       Current system: 'aarch64-darwin'
+```
+
+No es un fallo del flake: es que el trabajo hay que hacerlo en x86_64.
+
+### Desde una máquina x86_64-linux
 
 ```bash
 nix build .#imagenes.voz-api     -o voz-api.tar.gz
@@ -55,11 +66,46 @@ nix build .#imagenes.whisper     -o voz-whisper.tar.gz
 nix build .#imagenes.voz-stream  -o voz-stream.tar.gz
 ```
 
+### Desde un Mac, usando otra máquina como constructor
+
+Nix puede delegar la compilación por SSH. Lo hace el **daemon**, que corre
+como `root`, así que la clave tiene que estar en el `root` del Mac — de ahí
+los `sudo`. Se configura una vez:
+
+```bash
+# 1. Deja que root del Mac entre en el constructor
+sudo mkdir -p /var/root/.ssh
+sudo cp ~/.ssh/TU_CLAVE /var/root/.ssh/id_constructor
+sudo chmod 600 /var/root/.ssh/id_constructor
+
+# 2. Declara el constructor
+sudo tee /etc/nix/machines >/dev/null <<'FIN'
+ssh-ng://root@IP_DEL_CONSTRUCTOR x86_64-linux /var/root/.ssh/id_constructor 4 1 big-parallel
+FIN
+
+# 3. Acepta su clave de host (tambien como root)
+sudo ssh -i /var/root/.ssh/id_constructor -o StrictHostKeyChecking=accept-new \
+     root@IP_DEL_CONSTRUCTOR true
+
+# 4. Activa la delegacion
+echo "builders-use-substitutes = true" | sudo tee -a /etc/nix/nix.conf
+sudo launchctl kickstart -k system/org.nixos.nix-daemon
+```
+
+Después, `nix build .#imagenes.voz-api` funciona desde el Mac: compila allí y
+trae el resultado.
+
+### O construir allí y copiar el fichero
+
+Si es algo puntual, no merece la pena configurar nada:
+
+```bash
+ssh CONSTRUCTOR 'cd /ruta/al/repo && nix build .#imagenes.voz-api -o /tmp/voz-api.tar.gz'
+scp CONSTRUCTOR:/tmp/voz-api.tar.gz .
+```
+
 No hay Dockerfile: las imágenes salen de los mismos paquetes que la VM NixOS,
 así que **no pueden divergir** de lo que corre en producción.
-
-Desde un Mac ARM hace falta un constructor remoto x86_64 — las imágenes
-contienen binarios de esa arquitectura.
 
 ## Qué esperar
 
