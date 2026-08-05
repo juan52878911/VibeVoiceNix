@@ -677,7 +677,21 @@ def a_pcm16(trozo: torch.Tensor) -> bytes:
 class PeticionTTS(BaseModel):
     texto: str = Field(..., min_length=1, max_length=8000)
     voz: str = VOZ_DEFECTO
-    cfg_scale: float = Field(1.5, gt=0.5, lt=5.0)
+    # 3.0 y no 1.5: MEDIDO con el banco de fidelidad (scripts/fidelidad.py),
+    # que cierra el circuito texto -> voz -> whisper -> texto sobre 6 frases
+    # x 3 repeticiones.
+    #
+    #   cfg 1,5   WER medio 13,6 %   peor 85,7 %   3/6 frases inestables
+    #   cfg 3,0   WER medio  3,6 %   peor 14,3 %   1/6
+    #
+    # El peor caso pasa de 85,7 % a 14,3 %. Y es GRATIS en tiempo: la difusion
+    # evalua la rama positiva y la negativa en un lote de 2 pase lo que pase
+    # (se midio que doblar el lote cuesta un 5 % mas, no el doble), asi que
+    # subir la guia no anade una sola pasada.
+    #
+    # Ademas 3.0 es el defecto del propio upstream en sample_speech_tokens:
+    # ibamos por debajo de lo que el modelo espera.
+    cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -157,7 +157,8 @@ def main():
     ap.add_argument("--url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
-    ap.add_argument("--cfg", type=float, default=1.5)
+    ap.add_argument("--cfg", type=float, default=3.0,
+                    help="guia CFG; 3.0 medido como el mas fiel")
     ap.add_argument("--salida", help="escribir a un WAV en vez de reproducir")
     ap.add_argument("--bufer", type=float, default=1.5,
                     help="segundos de audio a acumular antes de empezar a sonar "

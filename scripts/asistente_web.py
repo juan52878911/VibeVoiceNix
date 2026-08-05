@@ -281,7 +281,7 @@ class Puente(BaseHTTPRequestHandler):
                     continue
                 if "frase" not in visto:
                     visto.add("frase"); evento(hito="frase", s=s)
-                for pcm in sintetizar(dato, CFG["voz_url"], CFG["token"], CFG["voz"], 1.5):
+                for pcm in sintetizar(dato, CFG["voz_url"], CFG["token"], CFG["voz"], CFG["cfg"]):
                     marco(0, pcm)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -295,12 +295,14 @@ def main():
     ap.add_argument("--voz-url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
+    ap.add_argument("--cfg", type=float, default=3.0,
+                    help="guia CFG; 3.0 medido como el mas fiel")
     ap.add_argument("--arranque", type=int, default=15)
     ap.add_argument("--sistema", default="Responde en español, breve y natural, "
                                          "en frases cortas. Sin listas ni markdown.")
     a = ap.parse_args()
     CFG.update(modelo=a.modelo, ollama=a.ollama, voz_url=a.voz_url, token=a.token,
-               voz=a.voz, arranque=a.arranque, sistema=a.sistema)
+               voz=a.voz, arranque=a.arranque, sistema=a.sistema, cfg=a.cfg)
     print(f"asistente en http://127.0.0.1:{a.puerto}")
     print(f"  LLM : {a.ollama} ({a.modelo})")
     print(f"  voz : {a.voz_url}")

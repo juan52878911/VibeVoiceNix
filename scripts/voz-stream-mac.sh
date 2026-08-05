@@ -39,6 +39,8 @@ uv run python - "$preparado" <<'PY'
 import json, shutil, sys
 from pathlib import Path
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 modelo = Path(snapshot_download("microsoft/VibeVoice-Realtime-0.5B"))
 # El repo del modelo no trae tokenizador: el procesador cae a Qwen2.5-1.5B.
@@ -57,10 +59,32 @@ qwen = Path(snapshot_download("Qwen/Qwen2.5-1.5B",
 # "qwen", que es como decide el tipo de tokenizador.
 destino = Path(sys.argv[1])
 destino.mkdir(parents=True, exist_ok=True)
-for f in ("config.json", "model.safetensors"):
-    dst = destino / f
-    if not dst.exists():
-        shutil.copy2(modelo / f, dst)
+if not (destino / "config.json").exists():
+    shutil.copy2(modelo / "config.json", destino / "config.json")
+
+# Los pesos se copian PODADOS: fuera model.tts_language_model.embed_tokens
+# (260 MiB que nadie lee -- compartir_embeddings_muertos() en voz_stream.py
+# la sustituye al cargar por la tabla del language_model, de forma identica).
+# Si hay una copia anterior sin podar, se rehace desde la cache del hub.
+MUERTA = "model.tts_language_model.embed_tokens.weight"
+pesos = destino / "model.safetensors"
+hace_falta = True
+if pesos.exists():
+    with safe_open(str(pesos), framework="pt") as f:
+        hace_falta = MUERTA in f.keys()
+if hace_falta:
+    with safe_open(str(modelo / "model.safetensors"), framework="pt") as f:
+        claves = [k for k in f.keys() if k != MUERTA]
+        assert len(claves) == len(f.keys()) - 1, \
+            "la tabla muerta no esta en el checkpoint: revisar la poda"
+        tensores = {k: f.get_tensor(k) for k in claves}
+        meta = f.metadata() or {"format": "pt"}
+    # A un temporal y luego rename: si esto muere a medias no deja unos
+    # pesos corruptos con el nombre bueno.
+    tmp = pesos.with_name("model.safetensors.tmp")
+    save_file(tensores, str(tmp), metadata=meta)
+    tmp.replace(pesos)
+    print(f"pesos podados: {pesos.stat().st_size} bytes")
 
 cfg = json.loads((modelo / "preprocessor_config.json").read_text())
 cfg["language_model_pretrained_name"] = str(qwen)
@@ -71,6 +95,9 @@ PY
 # ------------------------------------------------------------------ voces --
 # Los .pt no van en el paquete de Python: el pyproject de VibeVoice empaqueta
 # el codigo, no demo/.
+#
+# Solo las sp-* (9,4 MB frente a 96): son las unicas en espanol y las que usa
+# todo el stack. Si quieres las 25, borra "$voces" y cambia el patron.
 if [[ ! -d "$voces" ]] || [[ -z "$(ls -A "$voces" 2>/dev/null)" ]]; then
   echo "==> voces"
   tmp="$(mktemp -d)"
@@ -80,7 +107,7 @@ if [[ ! -d "$voces" ]] || [[ -z "$(ls -A "$voces" 2>/dev/null)" ]]; then
   git -C "$tmp/vv" checkout --quiet 94da20d98b2fa7688e9cbfaf7692ddb4954f7600
   git -C "$tmp/vv" sparse-checkout set demo/voices/streaming_model
   mkdir -p "$voces"
-  cp "$tmp/vv"/demo/voices/streaming_model/*.pt "$voces/"
+  cp "$tmp/vv"/demo/voices/streaming_model/sp-*.pt "$voces/"
 fi
 
 # ---------------------------------------------------------------- arranque --

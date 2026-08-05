@@ -81,6 +81,8 @@ def main():
     ap.add_argument("--url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
+    ap.add_argument("--cfg", type=float, default=3.0,
+                    help="guia CFG; 3.0 medido como el mas fiel")
     ap.add_argument("--arranque", type=int, default=25,
                     help="caracteres minimos de la PRIMERA frase antes de hablar "
                          "(menos = responde antes, peor entonada)")
@@ -118,14 +120,14 @@ def main():
             for f in frases:
                 hitos.setdefault("primera_frase", time.time() - t0)
                 n_frases += 1
-                for t in sintetizar(f, a.url, a.token, a.voz, 1.5):
+                for t in sintetizar(f, a.url, a.token, a.voz, a.cfg):
                     audio.put(t)
         frases, _ = trocear(pendiente, forzar_final=True, primera=n_frases == 0,
                             minimo_primera=a.arranque)
         for f in frases:
             hitos.setdefault("primera_frase", time.time() - t0)
             n_frases += 1
-            for t in sintetizar(f, a.url, a.token, a.voz, 1.5):
+            for t in sintetizar(f, a.url, a.token, a.voz, a.cfg):
                 audio.put(t)
         hitos["frases"] = n_frases
         audio.put(None)

@@ -120,7 +120,7 @@ def diferencias(referencia: str, hipotesis: str) -> str:
     return " · ".join(partes) or "mismo vocabulario, distinto orden"
 
 
-def sintetizar_wav(texto, url, token, voz, ruta, cfg=1.5):
+def sintetizar_wav(texto, url, token, voz, ruta, cfg=3.0):
     pet = urllib.request.Request(
         f"{url}/tts/stream", method="POST",
         data=json.dumps({"texto": texto, "voz": voz, "cfg_scale": cfg}).encode(),
@@ -177,7 +177,7 @@ def main():
     ap.add_argument("--llm", action="store_true", help="que las frases las escriba un LLM")
     ap.add_argument("--modelo", default="qwen3:1.7b")
     ap.add_argument("--ollama", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
-    ap.add_argument("--cfg", type=float, default=1.5,
+    ap.add_argument("--cfg", type=float, default=3.0,
                     help="guia CFG: cuanto se ciñe la difusion a la condicion")
     ap.add_argument("--informe", help="escribir un informe markdown")
     ap.add_argument("--audios", default="/tmp/fidelidad", help="donde dejar los WAV")
