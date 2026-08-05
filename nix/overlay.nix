@@ -113,4 +113,12 @@ in
   # Voces de Piper y pesos de VibeVoice: descargas con hash fijo.
   vozPiperVoces = final.callPackage ./pkgs/piper-voices.nix { };
   vibevoicePesos = final.callPackage ./pkgs/vibevoice-weights.nix { };
+
+  # Scripts de conversion e inferencia con OpenVINO. Van sueltos en el store y
+  # se importan por PYTHONPATH, en vez de empaquetarse: dependen de importarse
+  # entre si por nombre de modulo (decoder_manual, qwen2_manual, motor).
+  vibevoiceOvCodigo = final.runCommand "vibevoice-ov-codigo" { } ''
+    mkdir -p "$out"
+    cp ${../pkgs/vibevoice-ov}/*.py "$out/"
+  '';
 }

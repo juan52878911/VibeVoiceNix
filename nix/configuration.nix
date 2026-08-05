@@ -116,6 +116,9 @@
 
   services.vibevoice = {
     enable = true;
+    # Motor OpenVINO: RTF 1,09 frente a 2,19 de PyTorch. La primera activacion
+    # genera los grafos (~15 min, pico de 4,6 GB de RAM); despues arranca solo.
+    openvino.enable = true;
   };
 
   services.voz-stream = {

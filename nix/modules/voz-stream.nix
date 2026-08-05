@@ -19,6 +19,7 @@
 let
   cfg = config.services.voz-stream;
   vv = config.services.vibevoice;
+  ov = config.services.vibevoice.openvino;
   pesos = pkgs.vibevoicePesos;
 in
 {
@@ -88,12 +89,18 @@ in
         # glibc crea una arena por hilo y no devuelve lo liberado; con 6 hilos
         # eso fragmenta cientos de MB en un servicio que ya va justo de RAM.
         MALLOC_ARENA_MAX = "2";
+        VIBEVOICE_MOTOR = if ov.enable then "openvino" else "torch";
       }
-      # El anclaje a nucleos acelera PyTorch un 3%, que es el motor de este
-      # servicio. OJO si algun dia se cambia a OpenVINO: ahi el MISMO ajuste
-      # lo ralentiza un 118% (medido: 89 ms/llamada sin anclaje, 195 con el),
-      # porque su planificador de hilos interpreta el binding de otra forma.
-      // lib.optionalAttrs vv.anclarNucleos {
+      // lib.optionalAttrs ov.enable {
+        VIBEVOICE_OV_CODIGO = "${pkgs.vibevoiceOvCodigo}";
+        VIBEVOICE_IR_LM = "${ov.directorioIR}/tts_lm_estado_${ov.precisionLM}.xml";
+        VIBEVOICE_IR_CABEZA = "${ov.directorioIR}/cabeza_${ov.precisionCabeza}.xml";
+        VIBEVOICE_IR_ACUSTICO = "${ov.directorioIR}/decoder_estado_int8.xml";
+      }
+      # El anclaje a nucleos acelera PyTorch un 3% pero RALENTIZA OpenVINO un
+      # 118% (medido: 89 ms/llamada sin anclaje, 195 con el). El mismo ajuste,
+      # efectos opuestos: se aplica solo cuando el motor es torch.
+      // lib.optionalAttrs (vv.anclarNucleos && !ov.enable) {
         OMP_PLACES = "cores";
         OMP_PROC_BIND = "close";
       };

@@ -57,9 +57,18 @@ VOCES_DIR = Path(os.environ["VIBEVOICE_VOCES"])
 PASOS = int(os.environ.get("VIBEVOICE_PASOS", "6"))
 VOZ_DEFECTO = os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man")
 TOKEN = os.environ.get("VOZ_TOKEN", "").strip()
+HILOS = int(os.environ.get("OMP_NUM_THREADS", "6"))
 
-RITMO = 24_000   # Hz de salida del modelo
-RTF_MEDIDO = 2.2  # se anuncia al cliente; ver nota de honestidad arriba
+# Motor de inferencia: "torch" (RTF 2,19) u "openvino" (RTF 1,09).
+MOTOR = os.environ.get("VIBEVOICE_MOTOR", "torch")
+OV_CODIGO = os.environ.get("VIBEVOICE_OV_CODIGO", "")
+IR_LM = os.environ.get("VIBEVOICE_IR_LM", "")
+IR_CABEZA = os.environ.get("VIBEVOICE_IR_CABEZA", "")
+IR_ACUSTICO = os.environ.get("VIBEVOICE_IR_ACUSTICO", "")
+
+RITMO = 24_000  # Hz de salida del modelo
+# Se anuncia al cliente en X-RTF-Esperado para que elija su politica de bufer.
+RTF_MEDIDO = 1.1 if MOTOR == "openvino" else 2.2
 
 _estado: dict = {}
 # Un candado: UNA generacion a la vez. El modelo ya satura los 6 nucleos, asi
@@ -99,7 +108,34 @@ def autorizar(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> N
 
 
 def cargar_modelo():
-    """Identico al CLI: fp32 -> int8 dinamico inplace."""
+    """Carga el modelo con el motor elegido.
+
+    openvino: RTF 1,09 · torch: RTF 2,19 (medido, mismo hardware y texto).
+    Si se pide openvino y los IR no estan, se avisa y se cae a torch en vez de
+    dejar el servicio muerto: mejor lento que no responder.
+    """
+    if MOTOR == "openvino":
+        faltan = [n for n in (IR_LM, IR_CABEZA, IR_ACUSTICO) if not Path(n).exists()]
+        if faltan:
+            print(
+                "[aviso] faltan IR de OpenVINO (%s); se usa torch"
+                % ", ".join(Path(f).name for f in faltan),
+                flush=True,
+            )
+        else:
+            import sys
+            sys.path.insert(0, OV_CODIGO)
+            from motor import cargar as cargar_ov
+            procesador, modelo = cargar_ov(
+                MODELO_DIR, HILOS, IR_LM, IR_CABEZA, IR_ACUSTICO
+            )
+            modelo.set_ddpm_inference_steps(PASOS)
+            devolver_memoria()
+            _estado["motor"] = "openvino"
+            return procesador, modelo
+
+    _estado["motor"] = "torch-int8"
+
     from vibevoice.modular.modeling_vibevoice_streaming_inference import (
         VibeVoiceStreamingForConditionalGenerationInference,
     )
@@ -253,7 +289,7 @@ class PeticionTTS(BaseModel):
 def health() -> dict:
     return {
         "estado": "ok",
-        "motor": "vibevoice-realtime-0.5b int8",
+        "motor": _estado.get("motor", MOTOR),
         "pasos": PASOS,
         "voz_defecto": VOZ_DEFECTO,
         "rtf_esperado": RTF_MEDIDO,

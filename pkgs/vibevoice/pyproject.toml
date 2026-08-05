@@ -11,6 +11,20 @@ dependencies = [
     # fallo es un ImportError en mitad de la carga.
     "protobuf",
     "sentencepiece",
+    # Motor alternativo de inferencia. Con el pipeline convertido a IR, el RTF
+    # baja de 2,19 a 1,09 en el mismo hardware: el decodificador acustico pasa
+    # de 165 a 66 ms por llamada porque el grafo compilado elimina el despacho
+    # de Python sobre decenas de convoluciones pequenas.
+    #
+    # Version FIJADA a la validada: la conversion depende de APIs concretas
+    # (apply_make_stateful_transformation, formas estaticas del estado) y la
+    # paridad numerica se comprobo contra esta. Subir de version obliga a
+    # repetir la verificacion, no solo a relanzar el lock.
+    "openvino==2025.4.1",
+    # Solo hace falta para CONVERTIR (compress_weights int8/int4); la
+    # inferencia no lo usa. Se incluye para que la conversion sea reproducible
+    # desde el mismo entorno.
+    "nncf==3.2.0",
 ]
 
 [build-system]
