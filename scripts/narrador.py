@@ -71,13 +71,14 @@ MINIMO_CARACTERES = 60
 MINIMO_PRIMERA = 60
 
 
-def trocear(texto: str, forzar_final: bool = False, primera: bool = False):
+def trocear(texto: str, forzar_final: bool = False, primera: bool = False,
+            minimo_primera: int = MINIMO_PRIMERA):
     """Devuelve (frases_listas, resto_pendiente)."""
     partes = [p for p in FIN_DE_FRASE.split(texto) if p is not None]
     frases, actual = [], ""
     for p in partes:
         actual += p
-        minimo = MINIMO_PRIMERA if (primera and not frases) else MINIMO_CARACTERES
+        minimo = minimo_primera if (primera and not frases) else MINIMO_CARACTERES
         if len(actual.strip()) >= minimo:
             frases.append(actual.strip())
             actual = ""
