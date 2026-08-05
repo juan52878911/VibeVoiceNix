@@ -36,6 +36,8 @@ Configuracion por entorno, igual que el resto del stack:
 
 import asyncio
 import copy
+import ctypes
+import gc
 import os
 import struct
 import time
@@ -70,6 +72,25 @@ class GeneracionCancelada(Exception):
     """Senal interna: el cliente se fue, aborta generate()."""
 
 
+def devolver_memoria() -> None:
+    """Libera lo suelto y DEVUELVE la memoria al sistema operativo.
+
+    gc.collect() por si solo no basta: glibc conserva en sus arenas lo que
+    Python libera, asi que el RSS no baja aunque los objetos hayan muerto.
+    Se midio: sin esto el servicio se quedaba en 4400 MB residentes tras el
+    calentamiento -de los ~2400 que realmente necesita- y dejaba la VM con
+    69 MB libres y el swap casi agotado.
+
+    malloc_trim(0) es de glibc; en otra libc simplemente no existe y no pasa
+    nada, de ahi el try.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def autorizar(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
     if not TOKEN:
         return
@@ -97,6 +118,9 @@ def cargar_modelo():
         modelo, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
     )
     modelo.set_ddpm_inference_steps(PASOS)
+    # Los pesos fp32 que acaban de ser sustituidos siguen ocupando hasta que
+    # se recolectan Y se devuelven al sistema.
+    devolver_memoria()
     return procesador, modelo
 
 
@@ -124,9 +148,22 @@ async def ciclo_vida(app: FastAPI):
     # Calentamiento: la primera generate() de un proceso paga asignaciones
     # unicas. Mejor pagarlas al arrancar que en la primera peticion real.
     _sintetizar("Hola.", VOZ_DEFECTO, 1.5, streamer=None)
-    print(f"[arranque] modelo listo en {time.perf_counter() - ini:.1f} s", flush=True)
+    devolver_memoria()
+    print(
+        f"[arranque] modelo listo en {time.perf_counter() - ini:.1f} s"
+        f" ({_rss_mb():.0f} MB residentes)",
+        flush=True,
+    )
     yield
     _estado.clear()
+
+
+def _rss_mb() -> float:
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
+    except (OSError, IndexError, ValueError):
+        return float("nan")
 
 
 app = FastAPI(title="VibeVoice streaming", version="1.0.0", lifespan=ciclo_vida)
@@ -249,6 +286,9 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
                 # dos generaciones bajo el candado.
                 streamer.cancelado = True
                 await tarea
+                # Cada sintesis deja cientos de MB de activaciones. Sin esto
+                # el RSS crece peticion a peticion hasta que el OOM decide.
+                devolver_memoria()
 
     return StreamingResponse(
         generador(),

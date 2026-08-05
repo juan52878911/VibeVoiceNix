@@ -85,6 +85,9 @@ in
         VOZ_STREAM_PUERTO = toString cfg.puerto;
         HF_HUB_OFFLINE = "1";
         OMP_NUM_THREADS = toString vv.hilos;
+        # glibc crea una arena por hilo y no devuelve lo liberado; con 6 hilos
+        # eso fragmenta cientos de MB en un servicio que ya va justo de RAM.
+        MALLOC_ARENA_MAX = "2";
       }
       # El anclaje a nucleos acelera PyTorch un 3%, que es el motor de este
       # servicio. OJO si algun dia se cambia a OpenVINO: ahi el MISMO ajuste
