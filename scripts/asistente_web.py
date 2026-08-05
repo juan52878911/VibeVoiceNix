@@ -280,7 +280,15 @@ class Puente(BaseHTTPRequestHandler):
             marco(1, json.dumps(kw).encode())
 
         sistema = CFG["sistema"] if pet.get("pensar") else CFG["sistema"] + " /no_think"
-        cola, pendiente, n_frases, dentro = queue.Queue(maxsize=64), "", 0, False
+        # DOS colas y no una. Con una sola, el bucle principal se queda 4 s
+        # bloqueado sintetizando un trozo y durante ese rato no lee nada, asi
+        # que los tokens que el LLM va escribiendo se acumulan y salen de
+        # golpe al terminar: en pantalla el texto dejaba de fluir despues del
+        # primer trozo. Separadas, los tokens se drenan ENTRE los fotogramas
+        # de audio y el redactado se ve siempre en vivo.
+        cola_texto = queue.Queue()          # tokens y estado: se drena siempre
+        cola_trozos = queue.Queue(maxsize=64)   # lo que hay que sintetizar
+        pendiente, n_frases, dentro = "", 0, False
 
         # El productor manda SIEMPRE el pendiente que queda tras extraer un
         # trozo, en vez de que la pagina intente descontarlo por su cuenta.
@@ -304,52 +312,67 @@ class Puente(BaseHTTPRequestHandler):
                     pendiente += limpiar(texto)
                     frases, pendiente = trocear(pendiente, primera=n_frases == 0,
                                                 minimo_primera=CFG["arranque"])
-                    cola.put(("token", time.time() - t0, texto, pendiente))
+                    cola_texto.put(("token", time.time() - t0, texto, pendiente))
                     for f in frases:
-                        cola.put(("frase", time.time() - t0, (n_frases, f), pendiente))
+                        cola_trozos.put(("frase", time.time() - t0, (n_frases, f), pendiente))
                         n_frases += 1
                 frases, pendiente = trocear(pendiente, forzar_final=True,
                                             primera=n_frases == 0,
                                             minimo_primera=CFG["arranque"])
                 for f in frases:
-                    cola.put(("frase", time.time() - t0, (n_frases, f), pendiente))
+                    cola_trozos.put(("frase", time.time() - t0, (n_frases, f), pendiente))
                     n_frases += 1
             except Exception as e:
-                cola.put(("error", 0, f"{type(e).__name__}: {e}", ""))
-            cola.put(None)
+                cola_trozos.put(("error", 0, f"{type(e).__name__}: {e}", ""))
+            cola_trozos.put(None)
 
         threading.Thread(target=productor, daemon=True).start()
         visto = set()
+
+        def drenar_texto():
+            """Saca los tokens pendientes sin bloquear. Se llama entre
+            fotogramas de audio para que el redactado no se congele mientras
+            se sintetiza."""
+            while True:
+                try:
+                    _, s_t, texto, pend = cola_texto.get_nowait()
+                except queue.Empty:
+                    return
+                if "token" not in visto:
+                    visto.add("token"); evento(tipo="hito", hito="token", s=s_t)
+                evento(tipo="token", texto=texto, pendiente=pend)
+
         try:
             while True:
-                item = cola.get()
+                # Esperar un trozo SIN dejar de atender los tokens.
+                item = None
+                while item is None:
+                    drenar_texto()
+                    try:
+                        item = cola_trozos.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    break
                 if item is None:
                     break
                 clase, s_t, dato, pend = item
                 if clase == "error":
                     evento(tipo="error", texto=dato)
                     break
-                if clase == "token":
-                    if "token" not in visto:
-                        visto.add("token"); evento(tipo="hito", hito="token", s=s_t)
-                    evento(tipo="token", texto=dato, pendiente=pend)
-                    continue
                 idx, frase = dato
                 if "frase" not in visto:
                     visto.add("frase"); evento(tipo="hito", hito="frase", s=s_t)
-                # 1) el trozo existe: ya esta segmentado
                 evento(tipo="trozo", id=idx, texto=frase, pendiente=pend)
-                # 2) entra en el sintetizador
                 evento(tipo="sintetizando", id=idx, s=time.time() - t0)
                 primero = True
                 for pcm in sintetizar(frase, CFG["voz_url"], CFG["token"], CFG["voz"], CFG["cfg"]):
                     if primero:
-                        # 3) ya suena: este es el instante que percibe el usuario
                         evento(tipo="sonando", id=idx, s=time.time() - t0)
                         primero = False
                     marco(0, pcm)
-                # 4) trozo terminado
+                    drenar_texto()      # <- lo que arregla el congelado
                 evento(tipo="hecho", id=idx, s=time.time() - t0)
+            drenar_texto()
         except (BrokenPipeError, ConnectionResetError):
             pass
 
