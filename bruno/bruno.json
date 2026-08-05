@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "name": "Voz del homelab",
+  "type": "collection",
+  "ignore": [
+    "node_modules",
+    ".git"
+  ]
+}

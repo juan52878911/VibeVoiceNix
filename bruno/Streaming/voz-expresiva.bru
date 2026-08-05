@@ -1,0 +1,73 @@
+meta {
+  name: VibeVoice en streaming
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{stream}}/tts/stream
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "texto": "Hola Juan. El despliegue terminó sin errores y los tres servicios están arriba.",
+    "voz": "sp-Spk1_man"
+  }
+}
+
+docs {
+  # Streaming con VibeVoice
+
+  Otro puerto (**8082**, no 8080) y otro motor. Voz mas expresiva que Piper, a
+  cambio de ser mucho mas lenta.
+
+  ## Bruno no es el cliente ideal para esto
+
+  Esta peticion devuelve **audio troceado**: los bytes van llegando mientras
+  se generan. Bruno espera a tenerlo todo y luego lo muestra, asi que **no
+  veras la ventaja** — que es empezar a oir a los 271 ms en vez de a los 23 s.
+
+  Sirve para comprobar que responde y para guardar el wav, pero para *ver* el
+  streaming usa:
+
+  - **La pagina de prueba**: `{{stream}}/` en el navegador
+  - **O la terminal**:
+
+    ```bash
+    curl -sN -X POST {{stream}}/tts/stream \
+      -H "Authorization: Bearer $TOKEN" \
+      -H 'content-type: application/json' \
+      -d '{"texto":"Hola desde el homelab"}' \
+      | ffplay -autoexit -nodisp -i -
+    ```
+
+    El `-N` es lo importante: desactiva el bufer de curl. Sin el, curl espera
+    a tenerlo todo y el streaming no se nota.
+
+  ## Voces
+
+  Solo dos en espanol, y Microsoft las marca como experimentales:
+
+  - `sp-Spk1_man` — masculina
+  - `sp-Spk0_woman` — femenina
+
+  ## Que esperar
+
+  | Motor | RTF | Como suena |
+  |---|---|---|
+  | PyTorch int8 | 2,2 | Arranca rapido y **se entrecorta** |
+  | OpenVINO | 1,09 | Arranca igual y **suena continuo** |
+
+  Mira `motor` en `{{stream}}/health` para saber cual esta activo. Si es
+  `torch-int8`, los cortes son esperados: el audio se genera mas despacio de
+  lo que se oye.
+
+  **Solo una sintesis a la vez**: hay un candado global porque el modelo ya
+  satura los seis nucleos. Si lanzas dos, la segunda espera turno.
+}

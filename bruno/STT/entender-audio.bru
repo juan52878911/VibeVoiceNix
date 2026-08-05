@@ -1,0 +1,63 @@
+meta {
+  name: Entender un audio
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{api}}/stt
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:multipart-form {
+  archivo: @file()
+  idioma: es
+}
+
+docs {
+  # Transcribir audio
+
+  **Antes de lanzarla:** pulsa en el campo `archivo` y elige un fichero de
+  audio. Vale casi cualquier formato — ogg, mp3, wav, m4a, opus — porque el
+  servicio lo normaliza con ffmpeg a 16 kHz mono antes de pasarlo a whisper.
+
+  Prueba rapida: guarda la respuesta de **Nota de voz (ogg)** y mandala aqui.
+
+  ## Respuesta
+
+  ```json
+  {
+    "texto": "Hola Juan. El backup de anoche terminó sin errores.",
+    "idioma": "es",
+    "duracion_s": 7.72,
+    "proceso_s": 3.99,
+    "rtf": 0.517
+  }
+  ```
+
+  RTF 0,52 = transcribe unas 2 veces mas rapido que el tiempo real.
+
+  ## El campo `prompt`, que es el que mas se nota
+
+  Se puede anadir un campo `prompt` para sesgar el vocabulario. El servicio ya
+  trae uno por defecto con jerga de homelab, y la diferencia es grande:
+
+  | | Resultado |
+  |---|---|
+  | Sin prompt | "Soy tu **omelab**. El túnel de **We The War** se cayó" |
+  | Con prompt | "Soy tu **homelab**. El túnel de **WireGuard** se cayó" |
+
+  Si tus audios llevan nombres propios o terminos raros, mandalos en `prompt`
+  separados por comas. Es el ajuste con mejor relacion esfuerzo/resultado de
+  toda la API.
+
+  ## Idiomas
+
+  `idioma: es` fuerza espanol. Con `auto` lo detecta, pero en audios cortos se
+  equivoca — si sabes que es espanol, dilo.
+}

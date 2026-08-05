@@ -1,0 +1,29 @@
+meta {
+  name: Voces disponibles
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{api}}/voces
+  body: none
+  auth: none
+}
+
+docs {
+  # Voces
+
+  Las que estan instaladas en esta VM. Se eligen en `services.voz-api.voces`
+  del flake; hay cinco disponibles y por defecto se instalan tres para no
+  gastar disco.
+
+  | Voz | Origen | RTF |
+  |---|---|---|
+  | `es_MX-claude-high` | Mexico | 0,152 |
+  | `es_MX-ald-medium` | Mexico | 0,151 |
+  | `es_ES-davefx-medium` | Espana | 0,191 |
+  | `es_ES-sharvard-medium` | Espana | 0,177 |
+  | `es_AR-daniela-high` | Argentina | 0,408 |
+
+  Las dos ultimas no vienen instaladas por defecto.
+}

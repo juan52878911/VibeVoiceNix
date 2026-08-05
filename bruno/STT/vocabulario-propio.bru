@@ -1,0 +1,46 @@
+meta {
+  name: Transcribir con vocabulario propio
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{api}}/stt
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:multipart-form {
+  archivo: @file()
+  idioma: es
+  prompt: Vocabulario: asccilabs, OpenClaw, Proxmox, WireGuard, Caddy, NixOS, Oracle, Portainer, Postgres, Multipass.
+}
+
+docs {
+  # Sesgar el vocabulario
+
+  Igual que la anterior, pero con `prompt` propio. Sustituye la lista por tus
+  terminos: nombres de proyectos, de maquinas, de personas.
+
+  ## Por que funciona
+
+  whisper acepta un texto inicial que condiciona su prediccion. No es una
+  lista de reemplazos ni un diccionario: le da contexto, asi que empuja hacia
+  esas palabras cuando el audio es ambiguo.
+
+  Por eso conviene escribirlo como una frase o una lista natural, no como
+  codigo.
+
+  ## Cuando usarlo
+
+  - Nombres propios que no existen en el diccionario del modelo
+  - Terminos en ingles dichos con acento espanol (**el caso que mas falla**)
+  - Siglas
+
+  Si tus audios son conversacion normal sin jerga, el prompt por defecto del
+  servicio ya sirve y no hace falta tocar nada.
+}

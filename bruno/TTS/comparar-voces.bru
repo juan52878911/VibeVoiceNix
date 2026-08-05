@@ -1,0 +1,44 @@
+meta {
+  name: Comparar voces
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{api}}/tts
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "texto": "El contenedor de Proxmox arrancó sin errores. ¿Quieres que lo despliegue ahora?",
+    "voz": "es_ES-davefx-medium",
+    "formato": "ogg"
+  }
+}
+
+docs {
+  # Comparar voces
+
+  Cambia `voz` y repite con el MISMO texto — es la unica forma de compararlas
+  de verdad.
+
+  Instaladas por defecto:
+
+  - `es_MX-claude-high` — Mexico, masculina. La de por defecto
+  - `es_MX-ald-medium` — Mexico, masculina
+  - `es_ES-davefx-medium` — Espana, masculina
+
+  El texto de ejemplo lleva `¿?` a proposito: la entonacion de pregunta es
+  donde mas se separan unas voces de otras.
+
+  ## Para oir la diferencia de verdad
+
+  Guarda cada respuesta con el nombre de la voz y escuchalas seguidas. Por
+  separado suenan todas bien; una detras de otra se nota cual encaja.
+}

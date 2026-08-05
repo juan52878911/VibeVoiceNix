@@ -1,0 +1,57 @@
+meta {
+  name: Nota de voz (ogg)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{api}}/tts
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "texto": "Hola Juan. El backup de anoche terminó sin errores y el túnel sigue en pie.",
+    "voz": "es_MX-claude-high",
+    "formato": "ogg"
+  }
+}
+
+docs {
+  # Nota de voz en ogg/opus
+
+  **El formato por defecto, y el que quieres casi siempre.** WhatsApp y
+  Telegram aceptan ogg/opus como nota de voz nativa; con mp3 aparece como
+  fichero adjunto.
+
+  Unos 4 KB por segundo de audio, contra ~48 KB en wav.
+
+  ## Guardar el audio
+
+  Bruno muestra binario como texto ilegible. Para oirlo, en el panel de
+  respuesta pulsa el icono de descarga (**Save Response**) y ponle
+  extension `.ogg`.
+
+  ## Cabeceras que devuelve
+
+  | Cabecera | Que dice |
+  |---|---|
+  | `X-Duracion-S` | Segundos de audio generado |
+  | `X-Proceso-S` | Segundos de computo |
+  | `X-RTF` | El cociente. Con Piper ronda **0,04** |
+  | `X-Voz` | Que voz se uso de verdad |
+
+  Un RTF de 0,04 significa que 10 s de voz cuestan 0,4 s de CPU.
+
+  ## Campos
+
+  - `texto` — obligatorio, hasta 8000 caracteres
+  - `voz` — si se omite, usa la de por defecto
+  - `formato` — `ogg`, `mp3` o `wav`
+  - `velocidad` — 1.0 es la nativa; **mas alto habla mas LENTO**
+}

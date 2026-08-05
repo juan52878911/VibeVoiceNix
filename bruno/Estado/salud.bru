@@ -1,0 +1,34 @@
+meta {
+  name: Salud del servicio
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{api}}/health
+  body: none
+  auth: none
+}
+
+docs {
+  # Salud
+
+  No pide token: sirve para comprobar que el servicio esta vivo antes de
+  pelearse con la autenticacion.
+
+  Devuelve que voces hay cargadas, si whisper responde, y si la API exige
+  token o esta abierta.
+
+  ```json
+  {
+    "estado": "ok",
+    "tts": { "motor": "piper", "voces": [...], "cargadas": [] },
+    "stt": { "motor": "whisper.cpp", "disponible": true },
+    "auth": "bearer"
+  }
+  ```
+
+  `cargadas` empieza vacio: las voces se cargan en memoria la primera vez que
+  se usan. Por eso la primera peticion a una voz tarda ~1 s mas que las
+  siguientes.
+}

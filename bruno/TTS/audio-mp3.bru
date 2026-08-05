@@ -1,0 +1,37 @@
+meta {
+  name: Audio en mp3
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{api}}/tts
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "texto": "Este audio va en eme pe tres, que lo abre cualquier reproductor.",
+    "voz": "es_MX-claude-high",
+    "formato": "mp3"
+  }
+}
+
+docs {
+  # mp3
+
+  Para cuando el destino no es una app de mensajeria: un reproductor
+  cualquiera, un navegador, o guardarlo en disco.
+
+  Pesa unas **3 veces mas que ogg/opus** a calidad equivalente. Si lo vas a
+  mandar por WhatsApp o Telegram, usa `ogg` — ademas de ocupar menos, aparece
+  como nota de voz en vez de como fichero adjunto.
+
+  Guardar la respuesta: icono de descarga en el panel de respuesta, extension
+  `.mp3`.
+}
