@@ -77,7 +77,11 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.voz-stream
     image: voz-stream:local
-    restart: unless-stopped
+    # NO "unless-stopped": si falta memoria, el contenedor muere SIEMPRE en el
+    # mismo punto y reintentar es un bucle infinito. Se midio: 39 reinicios en
+    # 10 minutos quemando CPU y disco, sin un solo mensaje de error. Con
+    # on-failure:3 se rinde y deja el fallo a la vista.
+    restart: on-failure:3
     profiles: ["pesado"]
     ports:
       - "8082:8082"
@@ -90,9 +94,15 @@ services:
     deploy:
       resources:
         limits:
-          # Generoso a propósito: por debajo del pico de carga el contenedor
-          # muere a mitad de arrancar y sin mensaje claro.
-          memory: 5g
+          # 6g y no 5g: con 5 se midió el pico llegando a 4,9 GiB y muriendo
+          # justo ahí, en silencio y con código de salida 0 — ni siquiera
+          # marca OOMKilled, así que parece un cierre limpio y no lo es.
+          #
+          # OJO EN MAC: este límite no crea memoria. Docker Desktop reparte lo
+          # que tenga asignado en Ajustes → Resources, que por defecto suele
+          # ser menos de 8 GB. Súbelo a 8 GB o este servicio no arrancará
+          # nunca, por mucho que aquí ponga 6g.
+          memory: 6g
     healthcheck:
       test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8082' || exit 1"]
       interval: 30s
@@ -126,7 +136,9 @@ services:
       args:
         TORCH_CUDA: "${TORCH_CUDA:-cu130}"
     image: voz-stream:gpu
-    restart: unless-stopped
+    # Mismo motivo que arriba: si no encuentra la GPU o falta VRAM, falla
+    # siempre igual y reintentar solo esconde el error.
+    restart: on-failure:3
     profiles: ["gpu"]
     ports:
       - "8082:8082"

@@ -3,36 +3,33 @@
 **No hace falta Nix.** Tres comandos:
 
 ```bash
-./bajar-modelo.sh                              # modelo de whisper, 466 MB
-echo "VOZ_TOKEN=$(openssl rand -hex 24)" > .env
+./bajar-modelo.sh
+cp env.example .env && sed -i '' "s/^VOZ_TOKEN=$/VOZ_TOKEN=$(openssl rand -hex 24)/" .env
 docker compose up -d --build
 ```
 
-La primera vez tarda unos minutos: compila whisper.cpp y descarga las voces.
-Después arranca en segundos.
+En Linux, ese `sed` va sin las comillas vacías: `sed -i "s/..."`.
 
-Se construye para **la arquitectura de tu máquina**, así que en un Mac ARM
-salen imágenes ARM y no hace falta constructor remoto ni nada parecido.
+La primera vez tarda unos minutos porque compila whisper.cpp y descarga las
+voces. Después arranca en segundos. Se construye para **la arquitectura de tu
+máquina**: en un Mac ARM salen imágenes ARM, sin emulación ni constructor
+remoto.
 
-## Dos formas de tener las imágenes
+Abre **`http://localhost:8080`**. Ahí está la consola: pega el token del
+`.env` en el campo de arriba y ya puedes generar voz, transcribir audio y
+grabar del micrófono.
 
-Este directorio ofrece **Dockerfiles normales** (lo de arriba) y el flake
-ofrece **imágenes generadas por Nix**. No es duplicación por accidente:
+## Los tres perfiles
 
-| | Dockerfile | Imagen de Nix |
-|---|---|---|
-| Requisitos | Solo Docker | Nix + máquina x86_64 |
-| Arquitectura | La de tu máquina | Solo `x86_64-linux` |
-| Reproducible | Las versiones sí (mismo `uv.lock`) | Bit a bit |
-| Para quién | **Cualquiera** | Producción |
+Elige según la máquina. Solo el primero arranca por defecto.
 
-Ambas fijan las dependencias con **el mismo `uv.lock`**, así que las versiones
-de Python no pueden divergir. Lo que cambia es la base del sistema.
+| Perfil | Comando | Qué levanta | Necesita |
+|---|---|---|---|
+| *(ninguno)* | `docker compose up -d` | Piper + whisper + consola | 1 GB |
+| `pesado` | `docker compose --profile pesado up -d` | + VibeVoice en CPU | **8 GB para Docker** |
+| `gpu` | `docker compose --profile gpu up -d --build` | + VibeVoice en NVIDIA | driver + toolkit |
 
-Si quieres las de Nix: `nix build .#imagenes.voz-api -o voz-api.tar.gz`, y
-luego `docker load < voz-api.tar.gz`.
-
-Ya responde en `http://localhost:8080`:
+### Por la API, sin consola
 
 ```bash
 TOKEN=$(grep VOZ_TOKEN .env | cut -d= -f2)
@@ -48,114 +45,136 @@ curl -X POST http://localhost:8080/stt \
   -H "Authorization: Bearer $TOKEN" -F archivo=@nota.ogg
 ```
 
-### Añadir VibeVoice (opcional, pesado)
+### El perfil `pesado` y la memoria
+
+Este es el que da problemas, así que léelo antes de lanzarlo.
+
+**El límite del compose no crea memoria.** Docker Desktop reparte lo que tenga
+asignado en *Ajustes → Resources*, y por defecto suele quedarse corto. Medido
+en un Mac con 5,8 GB asignados: el contenedor sube a **4,9 GiB y muere ahí**,
+en silencio, con código de salida 0 y sin marcar siquiera `OOMKilled`. Parece
+un cierre limpio y no lo es.
+
+Sube Docker Desktop a **8 GB** antes de usar este perfil. Para comprobar
+cuánto tiene ahora:
 
 ```bash
-docker compose --profile pesado up -d --build
+docker info --format '{{.MemTotal}}' | awk '{printf "%.1f GB\n", $1/1073741824}'
 ```
 
-Página de prueba en `http://localhost:8082/`.
-
-**Necesita ~6 GB de RAM libres.** Pide 2,5 GB en régimen pero hace un pico de
-4,6 GB al arrancar, porque carga el modelo en fp32 antes de cuantizarlo. Y
-tarda **unos 2 minutos** en aceptar la primera petición: carga el modelo y
-hace una síntesis de calentamiento para no pagarla en tu primera llamada.
-
-## Si vas a construir las imágenes
-
-Necesitas Nix con flakes **y una máquina `x86_64-linux`**. Las imágenes
-contienen binarios de esa arquitectura, así que desde un Mac ARM fallan con:
-
-```
-error: Cannot build '...-usuario-base.drv'
-       Required system: 'x86_64-linux'
-       Current system: 'aarch64-darwin'
-```
-
-No es un fallo del flake: es que el trabajo hay que hacerlo en x86_64.
-
-### Desde una máquina x86_64-linux
+Si aun así falla, el síntoma es un contenedor que reinicia una y otra vez sin
+llegar nunca a `Application startup complete`:
 
 ```bash
-nix build .#imagenes.voz-api     -o voz-api.tar.gz
-nix build .#imagenes.whisper     -o voz-whisper.tar.gz
-nix build .#imagenes.voz-stream  -o voz-stream.tar.gz
+docker inspect voz-voz-stream-1 --format 'salida={{.State.ExitCode}} reinicios={{.RestartCount}}'
+docker stats --no-stream voz-voz-stream-1     # ¿roza el límite?
 ```
 
-### Desde un Mac, usando otra máquina como constructor
+Se rinde tras 3 intentos a propósito: reintentar sin memoria es un bucle
+infinito que quema CPU y disco sin dar un solo mensaje útil.
 
-Nix puede delegar la compilación por SSH. Lo hace el **daemon**, que corre
-como `root`, así que la clave tiene que estar en el `root` del Mac — de ahí
-los `sudo`. Se configura una vez:
+Tarda **~2 minutos** en aceptar la primera petición: carga el modelo y hace
+una síntesis de calentamiento para no cobrártela a ti.
+
+### El perfil `gpu`
+
+Comprueba primero que Docker ve la tarjeta:
 
 ```bash
-# 1. Deja que root del Mac entre en el constructor
-sudo mkdir -p /var/root/.ssh
-sudo cp ~/.ssh/TU_CLAVE /var/root/.ssh/id_constructor
-sudo chmod 600 /var/root/.ssh/id_constructor
-
-# 2. Declara el constructor
-sudo tee /etc/nix/machines >/dev/null <<'FIN'
-ssh-ng://root@IP_DEL_CONSTRUCTOR x86_64-linux /var/root/.ssh/id_constructor 4 1 big-parallel
-FIN
-
-# 3. Acepta su clave de host (tambien como root)
-sudo ssh -i /var/root/.ssh/id_constructor -o StrictHostKeyChecking=accept-new \
-     root@IP_DEL_CONSTRUCTOR true
-
-# 4. Activa la delegacion
-echo "builders-use-substitutes = true" | sudo tee -a /etc/nix/nix.conf
-sudo launchctl kickstart -k system/org.nixos.nix-daemon
+docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi
 ```
 
-Después, `nix build .#imagenes.voz-api` funciona desde el Mac: compila allí y
-trae el resultado.
+Si eso responde, `docker compose --profile gpu up -d --build`. Usa el mismo
+Dockerfile y solo sustituye torch por la rueda de CUDA, porque la que fija el
+lock **no trae CUDA compilado** y `torch.cuda.is_available()` daría `False`
+por muy buena que fuera la GPU.
 
-### O construir allí y copiar el fichero
+En el anfitrión hacen falta el driver de NVIDIA y `nvidia-container-toolkit`.
 
-Si es algo puntual, no merece la pena configurar nada:
+## En un Mac, VibeVoice va mejor NATIVO
+
+Los contenedores de macOS corren dentro de una VM Linux que **no tiene acceso
+a Metal**. Desde Docker, `torch.backends.mps.is_available()` da `False` siempre.
+Así que en el Mac el perfil `pesado` funciona pero desperdicia la GPU:
 
 ```bash
-ssh CONSTRUCTOR 'cd /ruta/al/repo && nix build .#imagenes.voz-api -o /tmp/voz-api.tar.gz'
-scp CONSTRUCTOR:/tmp/voz-api.tar.gz .
+cd docker && docker compose up -d     # Piper + whisper + consola, en el 8080
+../scripts/voz-stream-mac.sh          # VibeVoice sobre Metal, en el 8082
 ```
 
-No hay Dockerfile: las imágenes salen de los mismos paquetes que la VM NixOS,
-así que **no pueden divergir** de lo que corre en producción.
+La consola del 8080 detecta el 8082 sola. Medido en el mismo Mac:
 
-## Qué esperar
+| | primer sonido | RTF |
+|---|---|---|
+| MPS (fp16) | 0,79 s | **1,39** |
+| CPU (int8) | 0,70 s | 2,96 |
 
-| | RAM | RTF | Para qué |
-|---|---|---|---|
-| `voz-api` (Piper) | ~150 MB | **0,042** | Notas de voz. 24x tiempo real |
-| `whisper` | ~600 MB | 0,671 | Entender audios |
-| `voz-stream` | ~2,5 GB | 2,18 | Voz expresiva. Lento |
+## Qué esperar de rendimiento
 
-Medido en un Intel i7-8700T de 6 núcleos. **Piper es el que querrás para casi
-todo**: responde en décimas de segundo. VibeVoice suena mejor pero tarda el
-doble de lo que dura el audio.
+Medido en la VM del homelab (i7-8700T, 6 núcleos):
 
-## Decisiones que te pueden extrañar
+| | RTF | Nota |
+|---|---|---|
+| Piper (TTS) | 0,12 | 8x más rápido que el tiempo real |
+| whisper (STT) | 0,53 | con audio largo; ver abajo |
+| VibeVoice + OpenVINO | 0,97 | más rápido que el tiempo real |
 
-**Tres contenedores y no uno.** Los perfiles de memoria son incomparables
-(150 MB frente a 2,5 GB) y así una síntesis pesada no bloquea las notas de voz
-rápidas.
+**El RTF de whisper engaña con audio corto.** Procesa en ventanas de 30
+segundos, así que un clip de 2 s cuesta casi lo mismo que uno de 30. Medido:
+~4,5 s de coste fijo por transcripción más ~0,41 s por segundo de audio. Con
+un clip de 2,5 s el RTF sale 2,24; con uno de 37 s, 0,53.
 
-**El modelo de whisper se monta, no va dentro.** Son 466 MB que atarían la
-versión del modelo a la del contenedor. La imagen de VibeVoice sí lleva el
-suyo dentro, porque sin él no arranca y son 1,9 GB que nadie querría montar a
-mano.
+## El micrófono necesita contexto seguro
 
-**`voz-stream` pesa ~4 GB y no hay forma de evitarlo**: 1,9 GB de pesos más
-~2 GB de PyTorch. Las capas están repartidas por tamaño, así que actualizar el
-código reenvía megas y no gigas.
+En `http://localhost:8080` funciona: `localhost` cuenta como seguro. Pero si
+abres la consola **por IP** (`http://192.168.2.54:8080`), el navegador no dará
+acceso al micrófono. Ahí harían falta HTTPS y un certificado.
+
+Todo lo demás —generar voz, subir un fichero para transcribir, el streaming—
+funciona igual por IP.
+
+## Dos formas de tener las imágenes
+
+Este directorio ofrece **Dockerfiles normales** y el flake ofrece **imágenes
+generadas por Nix**. No es duplicación por accidente:
+
+| | Dockerfile | Imagen de Nix |
+|---|---|---|
+| Requisitos | Solo Docker | Nix + máquina x86_64 |
+| Arquitectura | La de tu máquina | Solo `x86_64-linux` |
+| Reproducible | Las versiones sí (mismo `uv.lock`) | Bit a bit |
+| Para quién | **Cualquiera** | Producción |
+
+Ambas fijan las dependencias con **el mismo `uv.lock`**, así que las versiones
+de Python no pueden divergir. Lo que cambia es la base del sistema.
+
+Las de Nix: `nix build .#imagenes.voz-api -o voz-api.tar.gz` y luego
+`docker load < voz-api.tar.gz`.
+
+## Tamaños reales
+
+| Imagen | Tamaño |
+|---|---|
+| `voz-whisper` | 158 MB |
+| `voz-api` | 1,8 GB |
+| `voz-stream` | **9,8 GB** |
+
+La de VibeVoice es enorme y no hay forma de evitarlo: son 1,9 GB de pesos más
+torch con todas sus dependencias. Si solo quieres notas de voz, no la
+construyas — `voz-api` hace TTS a RTF 0,12 con 150 MB de RAM.
+
+## El modelo de whisper va aparte
+
+`./bajar-modelo.sh` lo baja a `modelos/` y el compose lo monta. No va dentro
+de la imagen: son 466 MB y ataría su versión a la del contenedor. Ese
+directorio está en `.gitignore`.
 
 ## Límites conocidos
 
-- **Sin GPU.** Todo va en CPU. Se probó una iGPU Intel y resultó 2,5x más
-  lenta; PyTorch tampoco soporta esa generación.
-- **El streaming se entrecorta si el RTF pasa de 1.** A RTF 2,2 el audio se
-  genera más despacio de lo que se oye. La página de prueba lo compensa
-  esperando un poco antes de empezar.
-- **Una síntesis a la vez** en `voz-stream`: hay un candado global porque el
-  modelo ya satura todos los núcleos.
+- **El `.env` nunca se sube.** Una vez se coló en un commit, acabó en un repo
+  público y hubo que rotar el token. Por eso el ejemplo se llama `env.example`
+  y el real está ignorado.
+- **Un servicio, un contenedor.** whisper corre aparte de `voz-api` en vez de
+  meter dos procesos en uno.
+- **Una síntesis a la vez** en VibeVoice: el modelo ya satura los núcleos, y
+  dos en paralelo solo harían ambas más lentas.
