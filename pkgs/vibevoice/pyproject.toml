@@ -45,16 +45,16 @@ torch = { index = "pytorch-cpu" }
 # La rueda de CUDA pesa ~2,5 GB y esta maquina no tiene GPU NVIDIA. Ademas se
 # midio que la iGPU Intel UHD 630 es 2,5x mas lenta que la CPU, asi que CPU a secas.
 #
-# PARA USAR UNA NVIDIA no basta con tener la tarjeta: esta rueda NO trae CUDA
-# compilado, asi que torch.cuda.is_available() da False siempre y voz-stream
-# se queda en CPU por mucha GPU que haya. Hay que cambiar la url de aqui abajo
-# por la de CUDA y regenerar el lock:
+# Este indice resuelve DOS ruedas distintas segun la plataforma, y por eso el
+# mismo lock vale para la VM y para el Mac:
+#   sys_platform == 'darwin'  -> torch 2.13.0      (trae MPS de serie)
+#   sys_platform != 'darwin'  -> torch 2.13.0+cpu  (solo CPU)
 #
-#     url = "https://download.pytorch.org/whl/cu124"
-#     uv lock --upgrade-package torch
-#
-# En Apple Silicon NO hace falta tocar nada: las ruedas de macOS ya traen MPS,
-# asi que 'auto' lo detecta solo.
+# LO QUE NO CUBRE ES CUDA: la rueda de Linux no lo trae compilado, asi que
+# torch.cuda.is_available() da False por mucha NVIDIA que haya. Para eso esta
+# la imagen de GPU (docker/compose.yaml, perfil "gpu"), que sustituye torch
+# por la rueda de cu130 -- verificado que tiene la MISMA version 2.13.0, asi
+# que no hay deriva. Aqui no se toca nada, o se rompe el build de Nix.
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true

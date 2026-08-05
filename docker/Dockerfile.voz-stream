@@ -21,6 +21,29 @@ WORKDIR /app
 COPY pkgs/vibevoice/pyproject.toml pkgs/vibevoice/uv.lock ./
 RUN uv sync --frozen --no-dev
 
+# ------------------------------------------------------------------ gpu --
+# El lock fija la rueda SIN CUDA, asi que con una NVIDIA delante
+# torch.cuda.is_available() seguiria dando False. Para la variante de GPU se
+# sustituye torch por la rueda de CUDA:
+#
+#     docker compose --profile gpu build
+#
+# cu130 a proposito: se comprobo que sirve torch 2.13.0, la MISMA version que
+# fija el lock, asi que cambia el backend y no la version. cu128 solo llega a
+# 2.11 y obligaria a bajar de version todo lo demas.
+#
+# No hace falta una imagen base de CUDA: la rueda se trae las librerias de
+# NVIDIA como dependencias. En el anfitrion solo hacen falta el driver y
+# nvidia-container-toolkit.
+ARG TORCH_CUDA=""
+RUN if [ -n "$TORCH_CUDA" ]; then \
+      echo "sustituyendo torch por la rueda de $TORCH_CUDA" \
+   && uv pip install --python /app/.venv \
+        --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" \
+        "torch==2.13.0" \
+   && uv run python -c "import torch; print('torch', torch.__version__)"; \
+    fi
+
 # --------------------------------------------------------------- modelo --
 # Va DENTRO de la imagen y no en un volumen: sin el no arranca, y son 1,9 GB
 # que nadie querria montar a mano. Con HF_HUB_OFFLINE=1 el contenedor no sale
@@ -57,6 +80,24 @@ COPY pkgs/vibevoice-cli/voz_stream.py pkgs/vibevoice-cli/prueba.html ./
 RUN MODELO=$(find /modelo -name "model.safetensors" -exec dirname {} \; | head -1) \
  && ln -s "$MODELO" /modelo-vibevoice \
  && echo "modelo en $MODELO"
+
+# El procesador pide el tokenizador al hub por su identificador
+# ("Qwen/Qwen2.5-1.5B"), y con HF_HUB_OFFLINE=1 la resolucion desde cache no
+# le devuelve vocab.json aunque el fichero este ahi:
+#
+#   TypeError: expected str, bytes or os.PathLike object, not NoneType
+#
+# Se apunta el campo a la ruta LOCAL, que es lo mismo que hace el paquete de
+# Nix. La ruta tiene que contener "qwen": es como el procesador decide el tipo
+# de tokenizador.
+RUN uv run python -c "\
+import json, glob; \
+qwen = glob.glob('/modelo/hub/models--Qwen--Qwen2.5-1.5B/snapshots/*')[0]; \
+ruta = '/modelo-vibevoice/preprocessor_config.json'; \
+cfg = json.load(open(ruta)); \
+cfg['language_model_pretrained_name'] = qwen; \
+json.dump(cfg, open(ruta, 'w'), indent=2); \
+print('tokenizador apuntado a', qwen)"
 
 ENV PATH="/app/.venv/bin:$PATH" \
     VIBEVOICE_MODELO=/modelo-vibevoice \

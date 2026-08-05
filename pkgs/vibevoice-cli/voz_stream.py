@@ -200,10 +200,30 @@ def cargar_modelo():
         modelo.to(DISPOSITIVO)
         _estado["motor"] = f"torch-fp16-{DISPOSITIVO}"
     else:
-        # inplace=True: sin el se duplica el modelo entero y hay OOM en 5 GB.
-        torch.ao.quantization.quantize_dynamic(
-            modelo, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
-        )
+        # En la rueda de macOS qnnpack esta disponible pero NADIE lo
+        # selecciona: el motor activo llega como "none" y quantize_dynamic
+        # aborta con
+        #
+        #   RuntimeError: Didn't find engine for operation
+        #   quantized::linear_prepack NoQEngine
+        #
+        # En Linux ya viene elegido, asi que esto no toca el camino medido.
+        if torch.backends.quantized.engine == "none":
+            reales = [m for m in torch.backends.quantized.supported_engines
+                      if m != "none"]
+            if reales:
+                torch.backends.quantized.engine = reales[0]
+                print(f"[arranque] motor de cuantizacion: {reales[0]}", flush=True)
+
+        if torch.backends.quantized.engine == "none":
+            # Sin motor no hay int8 posible; fp32 es mas lento pero arranca.
+            print("[aviso] sin motor de cuantizacion; se sigue en fp32", flush=True)
+            _estado["motor"] = "torch-fp32"
+        else:
+            # inplace=True: sin el se duplica el modelo entero y hay OOM en 5 GB.
+            torch.ao.quantization.quantize_dynamic(
+                modelo, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
+            )
 
     modelo.set_ddpm_inference_steps(PASOS)
     # Los pesos fp32 que acaban de ser sustituidos siguen ocupando hasta que
@@ -227,6 +247,16 @@ def a_dispositivo(obj):
         if obj.is_floating_point():
             return obj.to(device=DISPOSITIVO, dtype=TIPO)
         return obj.to(device=DISPOSITIVO)
+    # La cache de atencion (DynamicCache) no es dict, no es secuencia y NO
+    # tiene .to(). Sin tratarla aparte se quedaria entera en CPU y la primera
+    # capa aborta con "Passed CPU tensor to MPS op" -- o su equivalente en
+    # cuda. Se copia el objeto y se le ponen listas nuevas, para no tocar el
+    # prefijo pristino que esta cacheado.
+    if hasattr(obj, "key_cache") and hasattr(obj, "value_cache"):
+        copia = copy.copy(obj)
+        copia.key_cache = [a_dispositivo(t) for t in obj.key_cache]
+        copia.value_cache = [a_dispositivo(t) for t in obj.value_cache]
+        return copia
     if isinstance(obj, dict):
         # copy() y no dict(): el prefijo es un BaseModelOutputWithPast y
         # generate() accede a sus atributos, no lo trata como dict pelado.

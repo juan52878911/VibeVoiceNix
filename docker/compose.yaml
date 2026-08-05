@@ -101,3 +101,53 @@ services:
       # Carga el modelo y hace una síntesis de calentamiento: ~2 minutos hasta
       # aceptar la primera petición.
       start_period: 180s
+
+  # --------------------------------------------------------------------
+  # El mismo servicio, pero sobre una NVIDIA:
+  #     docker compose --profile gpu up -d --build
+  #
+  # Es el MISMO Dockerfile: lo único que cambia es que sustituye torch por la
+  # rueda de CUDA. El código detecta la tarjeta solo y pasa a fp16 sin
+  # cuantizar, porque el int8 dinámico solo existe para CPU.
+  #
+  # En el anfitrión hacen falta el driver de NVIDIA y nvidia-container-toolkit.
+  # Comprueba que Docker ve la tarjeta antes de nada:
+  #
+  #     docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi
+  #
+  # NO sirve en un Mac: los contenedores corren en una VM Linux que no tiene
+  # acceso a Metal, así que MPS es invisible desde Docker. Para el Mac, el
+  # servicio va nativo -- ver scripts/voz-stream-mac.sh.
+  # --------------------------------------------------------------------
+  voz-stream-gpu:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.voz-stream
+      args:
+        TORCH_CUDA: "${TORCH_CUDA:-cu130}"
+    image: voz-stream:gpu
+    restart: unless-stopped
+    profiles: ["gpu"]
+    ports:
+      - "8082:8082"
+    environment:
+      VOZ_TOKEN: "${VOZ_TOKEN:-}"
+      VIBEVOICE_PASOS: "6"
+      VIBEVOICE_VOZ: "sp-Spk1_man"
+      # "auto" ya elegiría cuda; se deja explícito para que un fallo de
+      # detección se note al arrancar en vez de degradar a CPU en silencio.
+      VIBEVOICE_DISPOSITIVO: "cuda"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8082' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      # Mucho menor que en CPU: en GPU no hay que cuantizar ni calentar tanto.
+      start_period: 90s

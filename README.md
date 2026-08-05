@@ -156,6 +156,50 @@ El token de la API se genera solo en el primer arranque y vive en
 `/var/lib/voz/token.env`, **fuera del store de Nix** — el store es legible por
 cualquier usuario del sistema.
 
+## Dónde puede correr
+
+El mismo código va en tres sitios, pero **no por el mismo camino**. El
+dispositivo se elige solo (`cuda` → `mps` → `cpu`), y se puede forzar con
+`VIBEVOICE_DISPOSITIVO`.
+
+| Dónde | Cómo | Dispositivo |
+|---|---|---|
+| VM Linux / servidor | NixOS, o `docker compose --profile pesado up -d` | `cpu` |
+| Mac con Apple Silicon | `./scripts/voz-stream-mac.sh` (**nativo**) | `mps` |
+| PC con NVIDIA | `docker compose --profile gpu up -d --build` | `cuda` |
+
+En CPU el modelo se cuantiza a int8; en GPU va en fp16 sin cuantizar, porque
+el int8 dinámico de PyTorch **solo está implementado para CPU**. Son dos
+caminos distintos, no un parámetro.
+
+### En el Mac tiene que ser nativo
+
+Los contenedores en macOS corren dentro de una VM Linux que **no tiene acceso
+a Metal**. Desde un contenedor, `torch.backends.mps.is_available()` siempre da
+`False`, se configure lo que se configure. Por eso VibeVoice va nativo en el
+Mac; el resto del stack sí funciona por Docker y se compila para ARM:
+
+```bash
+cd docker && docker compose up -d   # Piper + whisper en el 8080
+./scripts/voz-stream-mac.sh         # VibeVoice en el 8082
+```
+
+La consola del 8080 encuentra el 8082 sola.
+
+### Con una NVIDIA no basta con tener la tarjeta
+
+El lock fija la rueda de torch **sin CUDA compilado**, así que
+`torch.cuda.is_available()` daría `False` por muy buena que fuera la GPU. El
+perfil `gpu` usa el mismo Dockerfile pero sustituye torch por la rueda de
+`cu130` — misma versión 2.13.0, así que cambia el backend y no la versión.
+
+Hacen falta el driver de NVIDIA y `nvidia-container-toolkit` en el anfitrión.
+Compruébalo antes:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi
+```
+
 ## Ajustes que importan
 
 ```nix
