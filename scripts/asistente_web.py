@@ -148,10 +148,17 @@ $("ir").addEventListener("click",async()=>{
       }
       resto=d.subarray(i);
     }
-    di("listo.");
+    // Los datos acaban ANTES que el sonido: se genera mas rapido de lo que
+    // se escucha (RTF < 1), asi que al terminar la descarga aun queda cola
+    // encolada en Web Audio. Se avisa cuando de verdad se calla.
+    const restante=Math.max(0,(cabeza-ctx.currentTime)*1000);
+    di(restante>200?"terminando de hablar…":"listo.");
+    setTimeout(()=>{ di("listo."); $("ir").disabled=false; $("parar").hidden=true;
+                     ctx.close(); }, restante+250);
+    return;
   }catch(e){ di(e.name==="AbortError"?"parado.":"error: "+e.message,e.name!=="AbortError"); }
-  finally{ $("ir").disabled=false; $("parar").hidden=true;
-    setTimeout(()=>ctx.close(),Math.max(0,(cabeza-ctx.currentTime)*1000)+400); }
+  $("ir").disabled=false; $("parar").hidden=true;
+  try{ ctx.close(); }catch(_){}
 });
 $("parar").addEventListener("click",()=>aborto&&aborto.abort());
 </script></body></html>"""
@@ -194,6 +201,13 @@ class Puente(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "application/octet-stream")
         self.send_header("cache-control", "no-store")
+        # Connection: close es OBLIGATORIO aqui. Con HTTP/1.1 y sin
+        # Content-Length ni chunked, el navegador no tiene forma de saber que
+        # la respuesta acabo y se queda esperando datos que no llegan: la
+        # pagina se quedaba en "hablando..." para siempre. Cerrando la
+        # conexion, el fin de respuesta es el fin de conexion.
+        self.send_header("connection", "close")
+        self.close_connection = True
         self.end_headers()
 
         import time
