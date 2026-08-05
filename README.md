@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.svg" alt="VibeVoiceNix — voz local para el homelab" width="100%">
+</p>
+
 # VibeVoiceNix
 
 Stack de voz en español para un homelab, declarado por completo en NixOS y
@@ -7,13 +11,16 @@ Nace de montar el stack a mano en un contenedor Debian, medirlo, y pasarlo a
 algo inmutable y replicable. **Todos los números de este README están medidos**
 en un Intel i7-8700T (6 núcleos, AVX2, sin GPU).
 
+La documentación extendida —arquitectura, despliegue, referencia de la API y de
+las opciones, y las mediciones completas— está en [`docs/`](#documentación).
+
 ## Qué hace
 
 | Componente | Papel | RTF medido |
 |---|---|---|
 | **Piper** | TTS de producción | **0,042** (24x tiempo real) |
 | **whisper.cpp** | STT | **0,671** con el modelo `small` |
-| **VibeVoice-Realtime-0.5B** | Laboratorio de TTS | **4,80x** (44 s para 9 s de audio) |
+| **VibeVoice-Realtime-0.5B** | Laboratorio de TTS | **3,92x** con 8 núcleos (4,80x con 4) |
 
 La API expone `/tts` y `/stt` por HTTP para que un agente —OpenClaw, por
 ejemplo— pueda mandar y entender notas de voz. El TTS devuelve **ogg/opus** por
@@ -86,6 +93,8 @@ pkgs/
   vibevoice/                 workspace uv pesado (torch CPU + VibeVoice)
 terraform/                   la VM en Proxmox
 ansible/playbooks/           provision -> install -> update
+docs/                        documentacion extendida
+  banner.py                  genera banner.svg; el SVG es su salida
 ```
 
 ### Por qué Ansible no configura nada
@@ -238,6 +247,18 @@ detalles que muerden al instalar Nix en un LXC de Proxmox:
   IPv6, cualquier `nixpkgs#loquesea` falla con "Could not resolve host". Se
   desactiva con `flake-registry = ` (vacío) en `/etc/nix/nix.conf`; este repo no
   lo necesita porque tiene `flake.lock`.
+
+## Documentación
+
+Este README es el resumen. El detalle está en [`docs/`](docs/):
+
+| Documento | Qué contiene |
+|---|---|
+| [arquitectura.md](docs/arquitectura.md) | las capas del flake, el overlay `uv2nix`, los modelos como paquetes, el ciclo de vida de una petición y el endurecimiento de los servicios |
+| [despliegue.md](docs/despliegue.md) | el ciclo `provision → install → update` paso a paso, cómo actualizar, cómo volver atrás y los problemas frecuentes |
+| [api.md](docs/api.md) | referencia HTTP de `/tts`, `/stt`, `/voces` y `/health`, con ejemplos, cabeceras de métricas y tabla de errores |
+| [opciones.md](docs/opciones.md) | todas las opciones NixOS, sus aserciones, las variables de entorno y configuraciones de ejemplo |
+| [rendimiento.md](docs/rendimiento.md) | todas las mediciones: Piper contra VibeVoice, `small` contra `base`, la iGPU contra la CPU y qué sí movió la aguja |
 
 ## Licencias
 
