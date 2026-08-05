@@ -58,6 +58,14 @@ VOCES_DIR = Path(os.environ["VIBEVOICE_VOCES"])
 PASOS = int(os.environ.get("VIBEVOICE_PASOS", "6"))
 VOZ_DEFECTO = os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man")
 TOKEN = os.environ.get("VOZ_TOKEN", "").strip()
+if not TOKEN:
+    # Legitimo en una maquina aislada, pero tiene que VERSE: un .env mal
+    # generado deja el servicio abierto sin que nadie lo note.
+    print(
+        "[AVISO] VOZ_TOKEN vacio: el servicio queda ABIERTO a cualquiera "
+        "que alcance este puerto.",
+        flush=True,
+    )
 HILOS = int(os.environ.get("OMP_NUM_THREADS", "6"))
 
 # Motor de inferencia: "torch" (RTF 2,19) u "openvino" (RTF 1,09).

@@ -55,6 +55,16 @@ FORMATOS = {
 }
 MIMES = {"ogg": "audio/ogg", "mp3": "audio/mpeg", "wav": "audio/wav"}
 
+if not TOKEN:
+    # Un VOZ_TOKEN vacio no es un fallo -- es legitimo en una maquina
+    # aislada -- pero tiene que VERSE. Se ha dado el caso de un .env mal
+    # generado que dejo la API abierta sin que nadie lo notara.
+    print(
+        "[AVISO] VOZ_TOKEN vacio: la API queda ABIERTA a cualquiera que "
+        "alcance este puerto. Ponlo en el .env si no es lo que quieres.",
+        flush=True,
+    )
+
 app = FastAPI(title="API de voz del homelab", version="1.0.0")
 _voces: dict[str, PiperVoice] = {}
 _bearer = HTTPBearer(auto_error=False)

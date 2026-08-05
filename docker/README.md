@@ -4,11 +4,19 @@
 
 ```bash
 ./bajar-modelo.sh
-cp env.example .env && sed -i '' "s/^VOZ_TOKEN=$/VOZ_TOKEN=$(openssl rand -hex 24)/" .env
+sed "s/^VOZ_TOKEN=$/VOZ_TOKEN=$(openssl rand -hex 24)/" env.example > .env
 docker compose up -d --build
 ```
 
-En Linux, ese `sed` va sin las comillas vacías: `sed -i "s/..."`.
+Ese `sed` lee de `env.example` y escribe en `.env` en vez de editar en sitio,
+que es lo que lo hace portable: `sed -i` necesita un argumento vacío en macOS
+(`-i ''`) y ninguno en Linux, y equivocarse deja un `.env` con el token
+**vacío** — es decir, la API abierta a cualquiera. Comprueba siempre que quedó
+puesto:
+
+```bash
+grep VOZ_TOKEN .env
+```
 
 La primera vez tarda unos minutos porque compila whisper.cpp y descarga las
 voces. Después arranca en segundos. Se construye para **la arquitectura de tu
