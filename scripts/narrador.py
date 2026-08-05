@@ -57,35 +57,76 @@ import urllib.request
 import wave
 
 RITMO = 24_000
-# Cortar por puntuacion fuerte. Se exige un espacio o el final detras para no
-# partir en "3.14" ni en "S.L.".
-FIN_DE_FRASE = re.compile(r"(?<=[.!?…])[\s]+|(?<=[.!?…])$")
-# Una frase corta sale carisima en RTF (el coste fijo domina), asi que se
-# juntan hasta llegar a esto. Medido: por debajo de ~2 s de audio el RTF sube
-# de 0,8 a 1,7.
+
+# Fin de frase: puntuacion fuerte, admitiendo comillas o parentesis detras, y
+# seguida de espacio o del final. Ese "seguida de" evita partir "3.14" o "S.L."
+FIN_FRASE = re.compile(r"[.!?\u2026]+[\"'\u201d\u2019)\]]*(?=\s|$)")
+# Fin de clausula: sirve para empezar a hablar antes sin destrozar la prosodia.
+FIN_CLAUSULA = re.compile(r"[,;:\u2014\u2013][\"'\u201d\u2019)\]]*(?=\s)")
+
+# Debajo de ~2 s de audio el RTF se dispara (de 0,8 a 1,7): el coste fijo de
+# cada peticion domina. Por eso se JUNTAN frases cortas hasta llegar aqui.
 MINIMO_CARACTERES = 60
-# La PRIMERA frase se acepta mucho mas corta. Sale cara en RTF, pero es lo unico
-# que separa al usuario del silencio: esperar a juntar 60 caracteres mientras un
-# LLM escribe cuesta ~3 s de nada. Con 25 se empieza a hablar enseguida y el
-# bufer se recupera con las siguientes, que ya van largas.
-MINIMO_PRIMERA = 60
+# La primera se acepta mas corta: es lo unico que separa al usuario del
+# silencio. Sale cara, pero solo se paga una vez.
+MINIMO_PRIMERA = 25
+# Valvula de seguridad: si un LLM suelta un parrafo entero sin puntuacion
+# fuerte, no se puede esperar indefinidamente. Pasado esto se corta por
+# clausula, y si tampoco hay, por el ultimo espacio -- NUNCA a mitad de
+# palabra.
+MAXIMO_SIN_CORTE = 320
+
+
+def _punto_de_corte(texto: str, minimo: int, con_clausula: bool):
+    """Indice donde cortar respetando el lenguaje, o None si aun no toca.
+
+    El orden de preferencia importa y es lo que arregla el fallo que tenia
+    esto antes: cortaba al llegar a N caracteres, sin mirar si era una frase.
+    Producia trozos como 'El despliegue se' y 'realiza mediante ... depend',
+    partiendo palabras por la mitad. El sintetizador recibia texto sin sentido
+    y no podia entonar.
+
+      1. fin de FRASE  -> lo ideal: el modelo ve la frase entera y entona bien
+      2. fin de CLAUSULA -> aceptable, solo para arrancar antes o si la frase
+                            se hace larguisima
+      3. ultimo ESPACIO -> ultimo recurso, y aun asi respeta las palabras
+    """
+    for m in FIN_FRASE.finditer(texto):
+        if len(texto[:m.end()].strip()) >= minimo:
+            return m.end()
+    if con_clausula or len(texto) >= MAXIMO_SIN_CORTE:
+        for m in FIN_CLAUSULA.finditer(texto):
+            if len(texto[:m.end()].strip()) >= minimo:
+                return m.end()
+    if len(texto) >= MAXIMO_SIN_CORTE:
+        hueco = texto.rfind(" ", minimo)
+        if hueco > 0:
+            return hueco
+    return None
 
 
 def trocear(texto: str, forzar_final: bool = False, primera: bool = False,
             minimo_primera: int = MINIMO_PRIMERA):
-    """Devuelve (frases_listas, resto_pendiente)."""
-    partes = [p for p in FIN_DE_FRASE.split(texto) if p is not None]
-    frases, actual = [], ""
-    for p in partes:
-        actual += p
-        minimo = minimo_primera if (primera and not frases) else MINIMO_CARACTERES
-        if len(actual.strip()) >= minimo:
-            frases.append(actual.strip())
-            actual = ""
-    if forzar_final and actual.strip():
-        frases.append(actual.strip())
-        actual = ""
-    return frases, actual
+    """Devuelve (trozos_listos, resto_pendiente).
+
+    Solo saca trozos que terminan donde el lenguaje permite. Lo que no llega a
+    un limite valido se queda en el resto, esperando mas texto -- salvo
+    forzar_final, que es cuando el LLM ya termino y no va a llegar mas.
+    """
+    trozos, resto = [], texto
+    while True:
+        minimo = minimo_primera if (primera and not trozos) else MINIMO_CARACTERES
+        corte = _punto_de_corte(resto, minimo, con_clausula=(primera and not trozos))
+        if corte is None:
+            break
+        trozo = resto[:corte].strip()
+        resto = resto[corte:].lstrip()
+        if trozo:
+            trozos.append(trozo)
+    if forzar_final and resto.strip():
+        trozos.append(resto.strip())
+        resto = ""
+    return trozos, resto
 
 
 def sintetizar(frase, url, token, voz, cfg):
