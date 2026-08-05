@@ -6,8 +6,12 @@
 
 Hace de puente entre tres cosas que ya funcionan por separado:
 
-    navegador  ->  este puente  ->  Ollama        (el texto)
-                                ->  voz-stream    (la voz)
+    navegador  ->  este puente  ->  MiniMax u Ollama  (el texto)
+                                ->  voz-stream        (la voz)
+
+El proveedor se elige por el nombre del modelo: los 'MiniMax-*' van a la
+suscripcion (mas rapidos y mas capaces), el resto a Ollama en local. La
+credencial se reutiliza de opencode; no hay copia en el repo.
 
 POR QUE UN PUENTE Y NO LLAMAR DESDE EL NAVEGADOR
 Porque el navegador tendria que hacer dos cosas que no sabe hacer bien: trocear
@@ -33,9 +37,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from narrador import RITMO, sintetizar, trocear  # noqa: E402
-from asistente import ABRE_PENSAMIENTO, CIERRA_PENSAMIENTO, limpiar, preguntar_a_ollama  # noqa: E402
+from asistente import ABRE_PENSAMIENTO, CIERRA_PENSAMIENTO, limpiar, preguntar  # noqa: E402
 
 CFG = {}
+
+# Los que sirve la suscripcion de MiniMax. M3 primero: es el mas capaz y el
+# que se usa por defecto. Los "highspeed" responden antes a cambio de calidad.
+MINIMAX_MODELOS = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed",
+                   "MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
 
 PAGINA = """<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -113,7 +122,7 @@ lo que tarda el modelo de lenguaje de lo que tarda la voz.</p></header>
 const $=i=>document.getElementById(i);
 let ctx,aborto,cabeza=0;
 fetch("/modelos").then(r=>r.json()).then(m=>{
-  $("modelo").innerHTML=m.map(x=>`<option${x==="qwen3:1.7b"?" selected":""}>${x}</option>`).join("");
+  $("modelo").innerHTML=m.map((x,i)=>`<option${i===0?" selected":""}>${x}</option>`).join("");
 });
 function di(t,e){$("est").className="est"+(e?" err":"");$("est").textContent=t}
 
@@ -229,11 +238,16 @@ class Puente(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(cuerpo)
         elif self.path == "/modelos":
+            # Los de MiniMax van primero: son los rapidos. Detras, lo que haya
+            # en Ollama, que puede no estar arrancado y no debe romper la lista.
+            ms = list(MINIMAX_MODELOS)
             try:
                 d = json.load(urllib.request.urlopen(f"{CFG['ollama']}/api/tags", timeout=5))
-                ms = sorted(m["name"] for m in d.get("models", []))
+                ms += sorted(m["name"] for m in d.get("models", []))
             except Exception:
-                ms = [CFG["modelo"]]
+                pass
+            if CFG["modelo"] not in ms:
+                ms.insert(0, CFG["modelo"])
             cuerpo = json.dumps(ms).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
@@ -279,7 +293,12 @@ class Puente(BaseHTTPRequestHandler):
         def evento(**kw):
             marco(1, json.dumps(kw).encode())
 
-        sistema = CFG["sistema"] if pet.get("pensar") else CFG["sistema"] + " /no_think"
+        modelo = pet.get("modelo") or CFG["modelo"]
+        # "/no_think" es un truco de qwen bajo Ollama. MiniMax manda el
+        # razonamiento en bloques aparte, asi que ahi no pinta nada.
+        sistema = CFG["sistema"]
+        if not pet.get("pensar") and not modelo.lower().startswith("minimax"):
+            sistema += " /no_think"
         # DOS colas y no una. Con una sola, el bucle principal se queda 4 s
         # bloqueado sintetizando un trozo y durante ese rato no lee nada, asi
         # que los tokens que el LLM va escribiendo se acumulan y salen de
@@ -297,8 +316,7 @@ class Puente(BaseHTTPRequestHandler):
         def productor():
             nonlocal pendiente, n_frases, dentro
             try:
-                for trozo in preguntar_a_ollama(pet["texto"], pet.get("modelo") or CFG["modelo"],
-                                                CFG["ollama"], sistema):
+                for trozo in preguntar(pet["texto"], modelo, CFG["ollama"], sistema):
                     texto = ""
                     for parte in re.split(r"(<[^>]{0,20}>)", trozo):
                         if ABRE_PENSAMIENTO.fullmatch(parte or ""):
@@ -380,7 +398,8 @@ class Puente(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--puerto", type=int, default=8090)
-    ap.add_argument("--modelo", default=os.environ.get("OLLAMA_MODELO", "qwen3:1.7b"))
+    ap.add_argument("--modelo", default=os.environ.get("ASISTENTE_MODELO", "MiniMax-M3"),
+                    help="MiniMax-M3 (por defecto) o cualquier modelo de Ollama")
     ap.add_argument("--ollama", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
     ap.add_argument("--voz-url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
@@ -394,7 +413,8 @@ def main():
     CFG.update(modelo=a.modelo, ollama=a.ollama, voz_url=a.voz_url, token=a.token,
                voz=a.voz, arranque=a.arranque, sistema=a.sistema, cfg=a.cfg)
     print(f"asistente en http://127.0.0.1:{a.puerto}")
-    print(f"  LLM : {a.ollama} ({a.modelo})")
+    print(f"  LLM : {a.modelo}"
+          f"{'' if a.modelo.lower().startswith('minimax') else ' via ' + a.ollama}")
     print(f"  voz : {a.voz_url}")
     ThreadingHTTPServer(("127.0.0.1", a.puerto), Puente).serve_forever()
 
