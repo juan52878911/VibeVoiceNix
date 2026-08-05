@@ -204,6 +204,7 @@ def cargar_modelo():
         attn_implementation="sdpa",
     )
     modelo.eval()
+    soltar_encoder_acustico(modelo)
 
     if EN_GPU:
         modelo.to(DISPOSITIVO)
@@ -236,6 +237,47 @@ def cargar_modelo():
     # se recolectan Y se devuelven al sistema.
     devolver_memoria()
     return procesador, modelo
+
+
+def soltar_encoder_acustico(modelo) -> None:
+    """Tira el codificador acustico, que en texto->voz es peso muerto.
+
+    Son 1311 MB en fp32 -- MEDIDO -- y ademas no se cuantizan: quantize_dynamic
+    solo toca nn.Linear y el tokenizador acustico es casi todo convolucion, asi
+    que sobreviven enteros en memoria. Es la mayor partida residente de todo el
+    servicio.
+
+    Y no hacen falta, por dos razones independientes:
+
+      1. NO ESTAN EN EL CHECKPOINT. transformers lo avisa al cargar: "Some
+         weights ... are newly initialized: ['model.acoustic_tokenizer.
+         encoder...']". Son pesos ALEATORIOS. Si el camino de sintesis los
+         usara, el audio saldria a ruido.
+
+      2. NADIE LOS LLAMA. En modeling_vibevoice_streaming_inference.py la
+         unica referencia al tokenizador acustico es .decode() (linea 784).
+         El encoder solo haria falta para el camino inverso -- sacar el
+         prefijo de una voz a partir de un audio -- y aqui los prefijos ya
+         vienen precalculados en los .pt.
+
+    Verificado generando con el encoder eliminado: 2,40 s de audio, pico 0,464.
+    Identico a con el.
+
+    VIBEVOICE_CONSERVAR_ENCODER=1 lo deja en su sitio, por si algun dia se
+    quiere calcular prefijos de voz desde audio en este mismo proceso.
+    """
+    if os.environ.get("VIBEVOICE_CONSERVAR_ENCODER", "").strip() not in ("", "0"):
+        return
+    tok = getattr(getattr(modelo, "model", None), "acoustic_tokenizer", None)
+    enc = getattr(tok, "encoder", None)
+    if enc is None or isinstance(enc, torch.nn.Identity):
+        return
+    mb = (sum(p.numel() * p.element_size() for p in enc.parameters())
+          + sum(b.numel() * b.element_size() for b in enc.buffers())) / 1048576
+    # Identity y no del: hay codigo que consulta el atributo aunque no lo use.
+    tok.encoder = torch.nn.Identity()
+    devolver_memoria()
+    print(f"[arranque] codificador acustico liberado ({mb:.0f} MB)", flush=True)
 
 
 def elegir_motor_cuantizacion() -> str | None:
