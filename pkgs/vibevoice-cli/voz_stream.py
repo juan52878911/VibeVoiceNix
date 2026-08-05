@@ -45,6 +45,7 @@ import struct
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -621,9 +622,12 @@ class StreamerCancelable:
         return self.interno.get_stream(0)
 
 
-def _sintetizar(texto, voz, cfg_scale, streamer):
+def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None):
     """Cuerpo sincrono de la sintesis; corre en un hilo del executor."""
     procesador = _estado["procesador"]
+    # Antes de generar, no despues: el ruido se sortea dentro de generate().
+    if semilla is not None:
+        torch.manual_seed(semilla)
     base = prefijo_voz(voz)
     # deepcopy DOBLE: ni el procesador ni generate() tocan el pristino.
     entradas = procesador.process_input_with_cached_prompt(
@@ -693,6 +697,21 @@ class PeticionTTS(BaseModel):
     # ibamos por debajo de lo que el modelo espera.
     cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
 
+    # MISMO TEXTO, AUDIO DISTINTO CADA VEZ
+    # sample_speech_tokens() arranca cada latente con torch.randn() sin
+    # semilla, una vez por fotograma acustico. `do_sample=False` no lo toca:
+    # eso solo fija que token elige el modelo de lenguaje, no el ruido del
+    # que parte la difusion. Medido pidiendo la misma frase cuatro veces:
+    # duraciones 3,47 / 3,20 / 3,20 / 3,47 s y correlacion entre pasadas de
+    # 0,019 -- es decir, audio sin ningun parecido forma a forma.
+    #
+    # Casi siempre suena bien, pero de vez en cuando el sorteo cae mal y sale
+    # un clip que ni whisper entiende. Con semilla fija eso deja de ser una
+    # loteria: la misma peticion da exactamente el mismo audio.
+    semilla: Optional[int] = Field(None, ge=0, lt=2**31,
+                                   description="fija el ruido de la difusion; "
+                                               "misma semilla = mismo audio")
+
 
 @app.get("/", response_class=HTMLResponse)
 def pagina_prueba() -> HTMLResponse:
@@ -735,6 +754,7 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
                 None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
+                pet.semilla,
             )
             try:
                 yield cabecera_wav_flujo()
