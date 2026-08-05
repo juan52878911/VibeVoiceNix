@@ -44,6 +44,17 @@ torch = { index = "pytorch-cpu" }
 [[tool.uv.index]]
 # La rueda de CUDA pesa ~2,5 GB y esta maquina no tiene GPU NVIDIA. Ademas se
 # midio que la iGPU Intel UHD 630 es 2,5x mas lenta que la CPU, asi que CPU a secas.
+#
+# PARA USAR UNA NVIDIA no basta con tener la tarjeta: esta rueda NO trae CUDA
+# compilado, asi que torch.cuda.is_available() da False siempre y voz-stream
+# se queda en CPU por mucha GPU que haya. Hay que cambiar la url de aqui abajo
+# por la de CUDA y regenerar el lock:
+#
+#     url = "https://download.pytorch.org/whl/cu124"
+#     uv lock --upgrade-package torch
+#
+# En Apple Silicon NO hace falta tocar nada: las ruedas de macOS ya traen MPS,
+# asi que 'auto' lo detecta solo.
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true

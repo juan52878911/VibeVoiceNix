@@ -28,6 +28,23 @@ let
     echo "root:x:0:0:root:/root:/bin/sh" >> "$out/etc/passwd"
   '';
 
+  # Un /tmp de verdad, escribible. No puede salir de `contents`: todo lo que
+  # viene del store de Nix es de solo lectura, asi que un /tmp de ahi no vale
+  # para nada. extraCommands escribe en la capa de la imagen, que si lo es.
+  #
+  # Sin esto el contenedor NO ARRANCA. Python resuelve su directorio temporal
+  # al importar, y torch lo pide nada mas cargar:
+  #
+  #   FileNotFoundError: No usable temporary directory found in
+  #   ['/tmp', '/var/tmp', '/usr/tmp']
+  #
+  # En la VM NixOS no se nota porque systemd le da su propio /tmp privado a
+  # cada servicio; el fallo solo sale por Docker.
+  crearTmp = ''
+    mkdir -p tmp
+    chmod 1777 tmp
+  '';
+
   pesos = pkgs.vibevoicePesos;
 in
 {
@@ -38,6 +55,9 @@ in
   voz-api = pkgs.dockerTools.buildLayeredImage {
     name = "voz-api";
     tag = "latest";
+    # /stt normaliza el audio en un TemporaryDirectory: sin /tmp da un 500 en
+    # cada transcripcion, aunque el servicio arranque tan campante.
+    extraCommands = crearTmp;
 
     contents = [
       pkgs.voz-api
@@ -106,6 +126,7 @@ in
     # Mas capas de lo normal a proposito: con el modelo de 1,9 GB y torch de
     # 2 GB, el reparto por tamano evita reenviarlo todo en cada cambio.
     maxLayers = 120;
+    extraCommands = crearTmp;
 
     contents = [
       pkgs.vibevoice-env

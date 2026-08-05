@@ -62,13 +62,48 @@ HILOS = int(os.environ.get("OMP_NUM_THREADS", "6"))
 
 # Motor de inferencia: "torch" (RTF 2,19) u "openvino" (RTF 1,09).
 MOTOR = os.environ.get("VIBEVOICE_MOTOR", "torch")
+# "auto" (por defecto), "cpu", "cuda" o "mps". Ver elegir_dispositivo().
+DISPOSITIVO_PEDIDO = os.environ.get("VIBEVOICE_DISPOSITIVO", "auto").strip().lower()
 OV_CODIGO = os.environ.get("VIBEVOICE_OV_CODIGO", "")
 IR_LM = os.environ.get("VIBEVOICE_IR_LM", "")
 IR_CABEZA = os.environ.get("VIBEVOICE_IR_CABEZA", "")
 IR_ACUSTICO = os.environ.get("VIBEVOICE_IR_ACUSTICO", "")
 
+
+def elegir_dispositivo() -> str:
+    """Donde corre el modelo. Por defecto, la mejor opcion que haya.
+
+    Aviso para este homelab en concreto: aqui la unica GPU es una Intel UHD
+    630, que torch NI SIQUIERA VE -- no hay backend para ella. Se midio ademas
+    con whisper por Vulkan que resulta 2,5 veces MAS LENTA que la CPU, asi que
+    tampoco compensaria. En esta maquina 'auto' siempre da cpu, y esta bien.
+
+    Esto sirve para llevarse el servicio a una maquina con NVIDIA, o a un Mac
+    con Apple Silicon, sin tocar nada.
+    """
+    if DISPOSITIVO_PEDIDO != "auto":
+        return DISPOSITIVO_PEDIDO
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+DISPOSITIVO = elegir_dispositivo()
+EN_GPU = DISPOSITIVO != "cpu"
+# fp16 en GPU: la mitad de memoria y el doble de rendimiento donde hay tensor
+# cores. En CPU no aporta nada -- ahi lo que gana es int8 dinamico, que a su
+# vez SOLO esta implementado para CPU. De ahi que sean dos caminos y no un
+# parametro.
+TIPO = torch.float16 if EN_GPU else torch.float32
+
 RITMO = 24_000  # Hz de salida del modelo
 # Se anuncia al cliente en X-RTF-Esperado para que elija su politica de bufer.
+# En GPU no hay medida propia: se deja la de CPU, que sobreestima. Equivocarse
+# por arriba solo hace que el cliente reserve mas bufer del necesario; por
+# abajo le cortaria el audio a mitad.
 RTF_MEDIDO = 1.1 if MOTOR == "openvino" else 2.2
 
 _estado: dict = {}
@@ -99,6 +134,13 @@ def devolver_memoria() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except (OSError, AttributeError):
         pass
+    # En GPU la VRAM la retiene el asignador de torch, al que gc.collect() no
+    # llega. Sin vaciarla, el pico de una sintesis se acumula con el de la
+    # siguiente hasta el out-of-memory, que en GPU no perdona.
+    if EN_GPU:
+        cache = getattr(getattr(torch, DISPOSITIVO, None), "empty_cache", None)
+        if cache is not None:
+            cache()
 
 
 def autorizar(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
@@ -145,20 +187,56 @@ def cargar_modelo():
     )
 
     procesador = VibeVoiceStreamingProcessor.from_pretrained(MODELO_DIR)
+    # Se carga a CPU en ambos casos y luego se mueve. Cargar directo a la GPU
+    # con device_map exige accelerate y da problemas en mps; el copiado extra
+    # de ~1 GB solo cuesta un momento al arrancar, una vez.
     modelo = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
-        MODELO_DIR, dtype=torch.float32, device_map="cpu",
+        MODELO_DIR, dtype=TIPO, device_map="cpu",
         attn_implementation="sdpa",
     )
     modelo.eval()
-    # inplace=True: sin el se duplica el modelo entero y hay OOM en 5 GB.
-    torch.ao.quantization.quantize_dynamic(
-        modelo, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
-    )
+
+    if EN_GPU:
+        modelo.to(DISPOSITIVO)
+        _estado["motor"] = f"torch-fp16-{DISPOSITIVO}"
+    else:
+        # inplace=True: sin el se duplica el modelo entero y hay OOM en 5 GB.
+        torch.ao.quantization.quantize_dynamic(
+            modelo, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
+        )
+
     modelo.set_ddpm_inference_steps(PASOS)
     # Los pesos fp32 que acaban de ser sustituidos siguen ocupando hasta que
     # se recolectan Y se devuelven al sistema.
     devolver_memoria()
     return procesador, modelo
+
+
+def a_dispositivo(obj):
+    """Lleva a la GPU una estructura anidada de tensores, ajustando el tipo.
+
+    Hace falta porque las voces (.pt) se guardaron en fp32 y desde CPU: en GPU
+    el modelo va en fp16 y el primer matmul aborta si los tipos no coinciden.
+    Los tensores enteros (mascaras, indices) se mueven pero NO se convierten:
+    volverlos fp16 los corrompe.
+
+    En CPU no se llama siquiera, asi que ese camino queda exactamente como
+    estaba medido.
+    """
+    if torch.is_tensor(obj):
+        if obj.is_floating_point():
+            return obj.to(device=DISPOSITIVO, dtype=TIPO)
+        return obj.to(device=DISPOSITIVO)
+    if isinstance(obj, dict):
+        # copy() y no dict(): el prefijo es un BaseModelOutputWithPast y
+        # generate() accede a sus atributos, no lo trata como dict pelado.
+        copia = copy.copy(obj)
+        for clave, valor in obj.items():
+            copia[clave] = a_dispositivo(valor)
+        return copia
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(a_dispositivo(v) for v in obj)
+    return obj
 
 
 def prefijo_voz(nombre: str):
@@ -171,9 +249,10 @@ def prefijo_voz(nombre: str):
             raise HTTPException(404, f"voz '{nombre}' no existe; hay: {disponibles}")
         # weights_only=False: el .pt guarda un BaseModelOutputWithPast, subclase
         # de OrderedDict, y viene del repo oficial de Microsoft.
-        _estado["prefijos"][nombre] = torch.load(
-            ruta, map_location="cpu", weights_only=False
-        )
+        prefijo = torch.load(ruta, map_location="cpu", weights_only=False)
+        if EN_GPU:
+            prefijo = a_dispositivo(prefijo)
+        _estado["prefijos"][nombre] = prefijo
     return _estado["prefijos"][nombre]
 
 
@@ -255,6 +334,8 @@ def _sintetizar(texto, voz, cfg_scale, streamer):
         text=texto, cached_prompt=copy.deepcopy(base),
         padding=True, return_tensors="pt", return_attention_mask=True,
     )
+    if EN_GPU:
+        entradas = a_dispositivo(entradas)
     try:
         with torch.no_grad():
             _estado["modelo"].generate(
@@ -318,6 +399,7 @@ def health() -> dict:
     return {
         "estado": "ok",
         "motor": _estado.get("motor", MOTOR),
+        "dispositivo": DISPOSITIVO,
         "pasos": PASOS,
         "voz_defecto": VOZ_DEFECTO,
         "rtf_esperado": RTF_MEDIDO,
