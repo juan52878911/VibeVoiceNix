@@ -61,7 +61,11 @@ let
       done
 
       echo "[ov] IR listos en $destino"
-      ls -la "$destino"/*.xml 2>/dev/null | awk '{print "  ", $9}'
+      # Un bucle sobre el glob y no `ls`: writeShellApplication pasa shellcheck
+      # y SC2012 lo rechaza.
+      for ir in "$destino"/*.xml; do
+        [ -e "$ir" ] && echo "   $(basename "$ir")"
+      done
     '';
   };
 in
