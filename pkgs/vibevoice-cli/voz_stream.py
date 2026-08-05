@@ -206,6 +206,7 @@ def cargar_modelo():
     modelo.eval()
     soltar_encoder_acustico(modelo)
     acelerar_convoluciones_depthwise(modelo)
+    cebar_decoder_acustico(modelo)
     compartir_embeddings_muertos(modelo)
 
     if EN_GPU:
@@ -239,6 +240,43 @@ def cargar_modelo():
     # se recolectan Y se devuelven al sistema.
     devolver_memoria()
     return procesador, modelo
+
+
+def cebar_decoder_acustico(modelo) -> None:
+    """Mete un fotograma de silencio antes de cada sintesis.
+
+    El decodificador es causal y en streaming: sus convoluciones necesitan
+    contexto por la izquierda. En la primera llamada no lo tienen, y el audio
+    arranca con un salto en vez de desde el silencio -- un chasquido audible
+    antes de la primera silaba. Medido en la primera muestra del audio:
+
+        sin cebar   -0,017969      <- el salto
+        1 fotograma -0,000002
+        3 fotogramas +0,000000
+
+    Con uno basta y cuesta 34 ms, que se pagan una vez por sintesis y no por
+    fotograma. No es un problema del sesgo de las convoluciones: se comprobo
+    que decodificar un latente NULO en frio da silencio exacto (rms 0,0000).
+
+    Se detecta la primera llamada porque la cache llega vacia; generate() crea
+    una nueva en cada sintesis, asi que no hace falta avisar desde fuera.
+    """
+    tok = getattr(getattr(modelo, "model", None), "acoustic_tokenizer", None)
+    if tok is None or getattr(tok, "_cebado", False):
+        return
+    decodificar = tok.decode
+
+    def decode_cebado(latents, cache=None, sample_indices=None, use_cache=False, **kw):
+        if use_cache and cache is not None and not getattr(cache, "cache", True):
+            decodificar(torch.zeros_like(latents), cache=cache,
+                        sample_indices=sample_indices, use_cache=True, **kw)
+        return decodificar(latents, cache=cache, sample_indices=sample_indices,
+                           use_cache=use_cache, **kw)
+
+    tok.decode = decode_cebado
+    tok._cebado = True
+    print("[arranque] decoder cebado con silencio (quita el chasquido inicial)",
+          flush=True)
 
 
 class ConvDepthwiseRapida(torch.nn.Module):
