@@ -62,8 +62,21 @@ select{background:var(--f);color:var(--t);border:1px solid var(--b);
 .h{background:var(--f);border:1px solid var(--b);border-radius:7px;padding:.7rem .85rem}
 .h .n{font:600 1.35rem/1 ui-monospace,monospace;color:var(--a);font-variant-numeric:tabular-nums}
 .h .e{font-size:.72rem;color:var(--s);text-transform:uppercase;letter-spacing:.08em;margin-top:.35rem}
-.resp{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--b);color:var(--s);
- font-size:.94rem;white-space:pre-wrap;min-height:1.5rem}
+.resp{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--b);
+ font-size:.98rem;line-height:1.9;min-height:2rem}
+/* Los cuatro estados por los que pasa cada trozo. El color no decora: dice
+   en que fase del proceso esta ese texto ahora mismo. */
+.t{border-radius:4px;padding:.1rem .25rem;transition:background .25s,color .25s}
+.t.pend{color:#6b7280}                                   /* el LLM aun escribe */
+.t.seg{background:#2b3550;color:#a9c3f5}                  /* segmentado, en cola */
+.t.sint{background:#4a3a1a;color:#f0c274;
+        animation:latir 1.1s ease-in-out infinite}        /* sintetizando */
+.t.son{background:#1f4033;color:#7fd6a8}                  /* sonando */
+.t.fin{color:#cfd4dc}                                     /* dicho */
+@keyframes latir{0%,100%{opacity:1}50%{opacity:.55}}
+@media (prefers-reduced-motion:reduce){.t.sint{animation:none}}
+.ley{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.8rem;font-size:.74rem;color:var(--s)}
+.ley i{font-style:normal;padding:.1rem .35rem;border-radius:3px}
 .est{margin-top:.75rem;font-size:.88rem;color:var(--s)}
 .est.err{color:#e0725f}
 </style></head><body><main>
@@ -88,6 +101,12 @@ lo que tarda el modelo de lenguaje de lo que tarda la voz.</p></header>
     <div class="h"><div class="n" id="h4">—</div><div class="e">solo la voz</div></div>
   </div>
   <div class="resp" id="texto"></div>
+  <div class="ley">
+    <span><i class="t pend">escribiendo</i> el LLM aún redacta</span>
+    <span><i class="t seg">segmentado</i> trozo cerrado, en cola</span>
+    <span><i class="t sint">sintetizando</i> generando voz</span>
+    <span><i class="t son">sonando</i> ya se oye</span>
+  </div>
   <div class="est" id="est"></div>
 </div>
 </main><script>
@@ -98,11 +117,32 @@ fetch("/modelos").then(r=>r.json()).then(m=>{
 });
 function di(t,e){$("est").className="est"+(e?" err":"");$("est").textContent=t}
 
+let trozos=[], pendiente="";
+// Se repinta entero en vez de ir parcheando nodos: son unas pocas decenas de
+// spans y asi el DOM no puede desincronizarse del estado real.
+function pintar(){
+  const c=$("texto"); c.textContent="";
+  for(const t of trozos){
+    const e=document.createElement("span");
+    e.className="t "+t.estado; e.dataset.id=t.id; e.textContent=t.texto+" ";
+    c.appendChild(e);
+  }
+  if(pendiente){
+    const e=document.createElement("span");
+    e.className="t pend"; e.textContent=pendiente;
+    c.appendChild(e);
+  }
+}
+function marca(id,estado){
+  const t=trozos.find(x=>x.id===id);
+  if(t){ t.estado=estado; pintar(); }
+}
+
 $("ir").addEventListener("click",async()=>{
   const q=$("q").value.trim(); if(!q) return;
   $("ir").disabled=true; $("parar").hidden=false;
   ["h1","h2","h3","h4"].forEach(i=>$(i).textContent="—");
-  $("texto").textContent=""; di("preguntando…");
+  trozos=[]; pendiente=""; pintar(); di("preguntando…");
   ctx=new AudioContext(); cabeza=0; aborto=new AbortController();
   const t0=performance.now(); let resto=new Uint8Array(0), primero=0, hitos={};
   try{
@@ -124,11 +164,21 @@ $("ir").addEventListener("click",async()=>{
         const carga=d.subarray(i+5,i+5+largo); i+=5+largo;
         if(tipo===1){
           const ev=JSON.parse(new TextDecoder().decode(carga));
-          if(ev.hito){ hitos[ev.hito]=ev.s;
-            if(ev.hito==="token") $("h1").textContent=ev.s.toFixed(2)+"s";
-            if(ev.hito==="frase") $("h2").textContent=ev.s.toFixed(2)+"s"; }
-          if(ev.texto) $("texto").textContent+=ev.texto;
-          if(ev.error) di(ev.error,true);
+          switch(ev.tipo){
+            case "hito":
+              if(ev.hito==="token") $("h1").textContent=ev.s.toFixed(2)+"s";
+              if(ev.hito==="frase"){ hitos.frase=ev.s; $("h2").textContent=ev.s.toFixed(2)+"s"; }
+              break;
+            case "token":   // el LLM escribio: solo cambia lo pendiente
+              pendiente=ev.pendiente; pintar(); break;
+            case "trozo":   // se cerro un trozo: pasa a tener entidad propia
+              trozos.push({id:ev.id,texto:ev.texto,estado:"seg"});
+              pendiente=ev.pendiente; pintar(); break;
+            case "sintetizando": marca(ev.id,"sint"); break;
+            case "sonando":     marca(ev.id,"son");  break;
+            case "hecho":       marca(ev.id,"fin");  break;
+            case "error":       di(ev.texto,true);   break;
+          }
           continue;
         }
         const pares=carga.length-(carga.length%2);
@@ -232,6 +282,10 @@ class Puente(BaseHTTPRequestHandler):
         sistema = CFG["sistema"] if pet.get("pensar") else CFG["sistema"] + " /no_think"
         cola, pendiente, n_frases, dentro = queue.Queue(maxsize=64), "", 0, False
 
+        # El productor manda SIEMPRE el pendiente que queda tras extraer un
+        # trozo, en vez de que la pagina intente descontarlo por su cuenta.
+        # Restar longitudes se desalinea en cuanto hay un espacio de mas, y el
+        # texto se corrompe en pantalla. Aqui la fuente de verdad es una sola.
         def productor():
             nonlocal pendiente, n_frases, dentro
             try:
@@ -247,20 +301,21 @@ class Puente(BaseHTTPRequestHandler):
                             texto += parte or ""
                     if not texto:
                         continue
-                    cola.put(("token", time.time() - t0, texto))
                     pendiente += limpiar(texto)
                     frases, pendiente = trocear(pendiente, primera=n_frases == 0,
                                                 minimo_primera=CFG["arranque"])
+                    cola.put(("token", time.time() - t0, texto, pendiente))
                     for f in frases:
+                        cola.put(("frase", time.time() - t0, (n_frases, f), pendiente))
                         n_frases += 1
-                        cola.put(("frase", time.time() - t0, f))
-                frases, _ = trocear(pendiente, forzar_final=True, primera=n_frases == 0,
-                                    minimo_primera=CFG["arranque"])
+                frases, pendiente = trocear(pendiente, forzar_final=True,
+                                            primera=n_frases == 0,
+                                            minimo_primera=CFG["arranque"])
                 for f in frases:
+                    cola.put(("frase", time.time() - t0, (n_frases, f), pendiente))
                     n_frases += 1
-                    cola.put(("frase", time.time() - t0, f))
             except Exception as e:
-                cola.put(("error", 0, f"{type(e).__name__}: {e}"))
+                cola.put(("error", 0, f"{type(e).__name__}: {e}", ""))
             cola.put(None)
 
         threading.Thread(target=productor, daemon=True).start()
@@ -270,19 +325,31 @@ class Puente(BaseHTTPRequestHandler):
                 item = cola.get()
                 if item is None:
                     break
-                clase, s, dato = item
+                clase, s_t, dato, pend = item
                 if clase == "error":
-                    evento(error=dato)
+                    evento(tipo="error", texto=dato)
                     break
                 if clase == "token":
                     if "token" not in visto:
-                        visto.add("token"); evento(hito="token", s=s)
-                    evento(texto=dato)
+                        visto.add("token"); evento(tipo="hito", hito="token", s=s_t)
+                    evento(tipo="token", texto=dato, pendiente=pend)
                     continue
+                idx, frase = dato
                 if "frase" not in visto:
-                    visto.add("frase"); evento(hito="frase", s=s)
-                for pcm in sintetizar(dato, CFG["voz_url"], CFG["token"], CFG["voz"], CFG["cfg"]):
+                    visto.add("frase"); evento(tipo="hito", hito="frase", s=s_t)
+                # 1) el trozo existe: ya esta segmentado
+                evento(tipo="trozo", id=idx, texto=frase, pendiente=pend)
+                # 2) entra en el sintetizador
+                evento(tipo="sintetizando", id=idx, s=time.time() - t0)
+                primero = True
+                for pcm in sintetizar(frase, CFG["voz_url"], CFG["token"], CFG["voz"], CFG["cfg"]):
+                    if primero:
+                        # 3) ya suena: este es el instante que percibe el usuario
+                        evento(tipo="sonando", id=idx, s=time.time() - t0)
+                        primero = False
                     marco(0, pcm)
+                # 4) trozo terminado
+                evento(tipo="hecho", id=idx, s=time.time() - t0)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
