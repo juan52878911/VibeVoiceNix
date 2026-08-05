@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voz del homelab — prueba de streaming</title>
+<style>
+  :root {
+    --fondo: #f2f3f5; --superficie: #fff; --borde: #d8dbe0;
+    --tinta: #191c22; --suave: #5c636e; --senal: #b3761c;
+    --senal-suave: #f6ecd9; --bien: #2f6f4f; --mal: #a3372f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fondo: #121419; --superficie: #1b1e25; --borde: #2c313a;
+      --tinta: #e8eaee; --suave: #969ca8; --senal: #e0a542;
+      --senal-suave: #2a2318; --bien: #6fbf95; --mal: #e08b82;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.75rem 1.15rem 4rem;
+    background: var(--fondo); color: var(--tinta);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5; -webkit-text-size-adjust: 100%;
+  }
+  .caja { max-width: 34rem; margin: 0 auto; }
+  .eyebrow {
+    font-size: .68rem; letter-spacing: .13em; text-transform: uppercase;
+    color: var(--senal); font-weight: 650; margin: 0 0 .4rem;
+  }
+  h1 { font-size: 1.5rem; letter-spacing: -.02em; margin: 0 0 1.5rem; }
+  label {
+    display: block; font-size: .72rem; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--suave); font-weight: 650;
+    margin: 0 0 .35rem;
+  }
+  textarea, input, select {
+    width: 100%; padding: .6rem .7rem; border-radius: 7px;
+    border: 1px solid var(--borde); background: var(--superficie);
+    color: var(--tinta); font-family: inherit; font-size: .95rem;
+  }
+  textarea { resize: vertical; min-height: 5.5rem; line-height: 1.45; }
+  input:focus-visible, textarea:focus-visible, select:focus-visible,
+  button:focus-visible {
+    outline: 2px solid var(--senal); outline-offset: 2px;
+  }
+  .fila { display: flex; gap: .75rem; margin-bottom: 1rem; }
+  .fila > div { flex: 1; }
+  .campo { margin-bottom: 1rem; }
+  button {
+    width: 100%; padding: .8rem; border: 0; border-radius: 7px;
+    background: var(--senal); color: #fff; font: inherit; font-weight: 650;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .medidas {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem;
+    margin: 1.5rem 0 0;
+  }
+  .medida {
+    background: var(--superficie); border: 1px solid var(--borde);
+    border-radius: 8px; padding: .7rem .5rem; text-align: center;
+  }
+  .medida.destacada { border-color: var(--senal); background: var(--senal-suave); }
+  .valor {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums; font-size: 1.45rem;
+    font-weight: 600; letter-spacing: -.03em; display: block; line-height: 1.1;
+  }
+  .medida.destacada .valor { color: var(--senal); }
+  .nombre {
+    font-size: .62rem; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--suave); font-weight: 650;
+  }
+  .estado {
+    margin-top: 1rem; padding: .7rem .8rem; border-radius: 7px;
+    background: var(--superficie); border: 1px solid var(--borde);
+    font-size: .85rem; color: var(--suave); min-height: 2.6rem;
+  }
+  .estado.error { border-color: var(--mal); color: var(--mal); }
+  .estado.ok { border-color: var(--bien); color: var(--bien); }
+  .barra { height: 4px; background: var(--borde); border-radius: 99px; margin-top: .8rem; overflow: hidden; }
+  .barra > div { height: 100%; width: 0; background: var(--senal); transition: width .15s linear; }
+  .pie { margin-top: 1.75rem; font-size: .78rem; color: var(--suave); }
+  .pie code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .9em; background: var(--superficie);
+    padding: .1rem .3rem; border-radius: 4px; border: 1px solid var(--borde);
+  }
+</style>
+</head>
+<body>
+<div class="caja">
+  <p class="eyebrow">VibeVoice · homelab</p>
+  <h1>Prueba de streaming</h1>
+
+  <div class="campo">
+    <label for="texto">Texto</label>
+    <textarea id="texto">Hola Juan. El backup de anoche terminó sin errores y el túnel sigue en pie. ¿Quieres que despliegue los cambios ahora?</textarea>
+  </div>
+
+  <div class="fila">
+    <div>
+      <label for="voz">Voz</label>
+      <select id="voz">
+        <option value="sp-Spk1_man">sp-Spk1_man</option>
+        <option value="sp-Spk0_woman">sp-Spk0_woman</option>
+      </select>
+    </div>
+    <div>
+      <label for="token">Token</label>
+      <input id="token" type="password" placeholder="bearer" autocomplete="off">
+    </div>
+  </div>
+
+  <button id="ir">Generar y reproducir</button>
+
+  <div class="medidas">
+    <div class="medida destacada">
+      <span class="valor" id="m-ttfa">—</span>
+      <span class="nombre">1.º sonido</span>
+    </div>
+    <div class="medida">
+      <span class="valor" id="m-total">—</span>
+      <span class="nombre">total</span>
+    </div>
+    <div class="medida">
+      <span class="valor" id="m-rtf">—</span>
+      <span class="nombre">RTF</span>
+    </div>
+  </div>
+
+  <div class="barra"><div id="progreso"></div></div>
+  <div class="estado" id="estado">Escribe algo y pulsa generar. El audio empieza a sonar antes de terminar de generarse.</div>
+
+  <p class="pie">
+    La reproducción va por Web Audio: cada trozo se encola en cuanto llega, sin
+    esperar al final. Si el RTF pasa de 1 el audio se genera más despacio de lo
+    que se oye y notarás cortes — es esperado, no un fallo. Con
+    <code>services.vibevoice.openvino.enable</code> el RTF baja de 2,2 a 1,1.
+  </p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const RITMO = 24000;          // Hz que emite el modelo
+const CABECERA = 44;          // bytes de cabecera RIFF que hay que saltarse
+
+$("token").value = localStorage.getItem("voz.token") || "";
+$("token").addEventListener("change", e => localStorage.setItem("voz.token", e.target.value));
+
+function pinta(msg, clase = "") { const e = $("estado"); e.textContent = msg; e.className = "estado " + clase; }
+
+$("ir").addEventListener("click", async () => {
+  const texto = $("texto").value.trim();
+  if (!texto) return pinta("Falta el texto.", "error");
+
+  $("ir").disabled = true;
+  ["m-ttfa", "m-total", "m-rtf"].forEach(i => $(i).textContent = "—");
+  $("progreso").style.width = "0";
+  pinta("Conectando…");
+
+  // Un AudioContext por reproducción: en móvil solo arranca dentro de un gesto.
+  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RITMO });
+  await ctx.resume();
+
+  const ini = performance.now();
+  let ttfa = null, muestras = 0, siguiente = 0, sobra = new Uint8Array(0), saltado = 0;
+
+  try {
+    const r = await fetch("/tts/stream", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...($("token").value ? { authorization: "Bearer " + $("token").value } : {}),
+      },
+      body: JSON.stringify({ texto, voz: $("voz").value }),
+    });
+
+    if (!r.ok) {
+      const detalle = r.status === 401 ? "token inválido o ausente" : await r.text();
+      throw new Error(`HTTP ${r.status} — ${String(detalle).slice(0, 120)}`);
+    }
+
+    const rtfEsperado = parseFloat(r.headers.get("x-rtf-esperado") || "0");
+    const lector = r.body.getReader();
+
+    while (true) {
+      const { done, value } = await lector.read();
+      if (done) break;
+
+      // Junta lo que sobró del trozo anterior: las muestras son de 2 bytes y
+      // un trozo puede partir una por la mitad.
+      let buf = new Uint8Array(sobra.length + value.length);
+      buf.set(sobra); buf.set(value, sobra.length);
+
+      if (saltado < CABECERA) {                 // salta la cabecera RIFF
+        const quitar = Math.min(CABECERA - saltado, buf.length);
+        buf = buf.slice(quitar); saltado += quitar;
+      }
+
+      const enteras = buf.length - (buf.length % 2);
+      sobra = buf.slice(enteras);
+      if (enteras === 0) continue;
+
+      const pcm = new Int16Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + enteras));
+      const trozo = ctx.createBuffer(1, pcm.length, RITMO);
+      const canal = trozo.getChannelData(0);
+      for (let i = 0; i < pcm.length; i++) canal[i] = pcm[i] / 32768;
+
+      const fuente = ctx.createBufferSource();
+      fuente.buffer = trozo;
+      fuente.connect(ctx.destination);
+      // Encola cada trozo justo detrás del anterior: sin esto se solapan.
+      const cuando = Math.max(ctx.currentTime, siguiente);
+      fuente.start(cuando);
+      siguiente = cuando + trozo.duration;
+
+      muestras += pcm.length;
+      if (ttfa === null) {
+        ttfa = performance.now() - ini;
+        $("m-ttfa").textContent = Math.round(ttfa) + " ms";
+        pinta("Sonando mientras se genera…");
+      }
+      $("progreso").style.width = Math.min(100, (muestras / RITMO) * 8) + "%";
+    }
+
+    const total = (performance.now() - ini) / 1000;
+    const dur = muestras / RITMO;
+    $("m-total").textContent = total.toFixed(1) + " s";
+    $("m-rtf").textContent = dur ? (total / dur).toFixed(2) : "—";
+    $("progreso").style.width = "100%";
+    pinta(`Listo: ${dur.toFixed(1)} s de audio en ${total.toFixed(1)} s.` +
+          (rtfEsperado ? ` El servidor anunciaba RTF ${rtfEsperado}.` : ""), "ok");
+  } catch (e) {
+    pinta("No se pudo generar: " + e.message, "error");
+  } finally {
+    $("ir").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

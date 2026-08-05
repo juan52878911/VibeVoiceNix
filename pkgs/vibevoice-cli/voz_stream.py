@@ -48,7 +48,7 @@ import numpy as np
 import torch
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -283,6 +283,20 @@ class PeticionTTS(BaseModel):
     texto: str = Field(..., min_length=1, max_length=8000)
     voz: str = VOZ_DEFECTO
     cfg_scale: float = Field(1.5, gt=0.5, lt=5.0)
+
+
+@app.get("/", response_class=HTMLResponse)
+def pagina_prueba() -> HTMLResponse:
+    """Pagina de prueba, servida por el PROPIO servicio.
+
+    Tiene que salir de aqui y no de un sitio externo: el navegador bloquearia
+    la peticion por CORS, y ademas asi funciona desde el movil a traves del
+    tunel sin configurar nada.
+    """
+    ruta = Path(__file__).with_name("prueba.html")
+    if not ruta.exists():
+        raise HTTPException(404, "pagina de prueba no incluida en esta version")
+    return HTMLResponse(ruta.read_text(encoding="utf-8"))
 
 
 @app.get("/health")

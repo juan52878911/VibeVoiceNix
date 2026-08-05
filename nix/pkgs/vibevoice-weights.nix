@@ -119,6 +119,10 @@ rec {
     mkdir -p "$out/bin"
     cp ${../../pkgs/vibevoice-cli/vibevoice_cli.py} "$out/bin/vibevoice-cli.py"
     cp ${../../pkgs/vibevoice-cli/voz_stream.py} "$out/bin/voz-stream.py"
+    # La pagina de prueba va JUNTO al servidor: la sirve el propio servicio en
+    # "/" porque desde otro origen el navegador la bloquearia por CORS.
+    # voz_stream.py la busca con Path(__file__).with_name(...).
+    cp ${../../pkgs/vibevoice-cli/prueba.html} "$out/bin/prueba.html"
     chmod +x "$out/bin/vibevoice-cli.py" "$out/bin/voz-stream.py"
   '';
 }
