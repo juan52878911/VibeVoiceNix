@@ -40,6 +40,7 @@ import ctypes
 import gc
 import os
 import platform
+import sys
 import struct
 import time
 from contextlib import asynccontextmanager
@@ -175,7 +176,6 @@ def cargar_modelo():
                 flush=True,
             )
         else:
-            import sys
             sys.path.insert(0, OV_CODIGO)
             from motor import cargar as cargar_ov
             procesador, modelo = cargar_ov(
@@ -341,10 +341,25 @@ async def ciclo_vida(app: FastAPI):
 
 
 def _rss_mb() -> float:
+    """Memoria residente en MB, o nan si no hay forma de saberlo.
+
+    /proc/self/statm es lo preciso, pero es de Linux: en macOS no existe /proc
+    y el mensaje de arranque salia con un feo "nan MB residentes".
+
+    El repliegue es getrusage, con dos salvedades que conviene tener presentes
+    al comparar numeros entre maquinas: da el PICO y no el valor actual, y
+    ru_maxrss viene en KB en Linux pero en BYTES en macOS.
+    """
     try:
         with open("/proc/self/statm") as f:
             return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
     except (OSError, IndexError, ValueError):
+        pass
+    try:
+        import resource
+        pico = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return pico / 1048576 if sys.platform == "darwin" else pico / 1024
+    except Exception:
         return float("nan")
 
 
