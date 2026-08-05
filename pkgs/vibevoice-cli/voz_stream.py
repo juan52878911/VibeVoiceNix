@@ -205,6 +205,7 @@ def cargar_modelo():
     )
     modelo.eval()
     soltar_encoder_acustico(modelo)
+    compartir_embeddings_muertos(modelo)
 
     if EN_GPU:
         modelo.to(DISPOSITIVO)
@@ -278,6 +279,43 @@ def soltar_encoder_acustico(modelo) -> None:
     tok.encoder = torch.nn.Identity()
     devolver_memoria()
     print(f"[arranque] codificador acustico liberado ({mb:.0f} MB)", flush=True)
+
+
+def compartir_embeddings_muertos(modelo) -> None:
+    """Deja de tener DOS tablas de embeddings cuando solo se usa una.
+
+    tts_language_model trae su propia embed_tokens de 151936x896 -- 136 M
+    parametros -- que NO SE USA NUNCA. No es deduccion mia, lo dice el codigo
+    de Microsoft en modeling_vibevoice_streaming.py:
+
+        # We only need the Transformer layers here. Note that embed_tokens
+        # in tts_language_model is unused
+
+    forward_tts_lm siempre recibe inputs_embeds ya calculados, y el unico
+    lookup que hay usa el embedding del OTRO modelo de lenguaje.
+
+    Duele mas de lo que parece porque quantize_dynamic solo toca nn.Linear:
+    los embeddings sobreviven en fp32 enteros. Son ~520 MB de tabla muerta.
+
+    Se APUNTA a la del otro modelo en vez de borrarla: misma forma y mismo
+    vocabulario, asi que si algun camino la consultara daria exactamente lo
+    mismo que el lookup bueno. Borrarla dejaria un None que explota raro.
+    """
+    m = getattr(modelo, "model", None)
+    lm = getattr(m, "language_model", None)
+    tts = getattr(m, "tts_language_model", None)
+    if lm is None or tts is None:
+        return
+    buena = getattr(lm, "embed_tokens", None)
+    muerta = getattr(tts, "embed_tokens", None)
+    if buena is None or muerta is None or muerta is buena:
+        return
+    if buena.weight.shape != muerta.weight.shape:
+        return  # otra variante del modelo: no tocar nada
+    mb = muerta.weight.numel() * muerta.weight.element_size() / 1048576
+    tts.embed_tokens = buena
+    devolver_memoria()
+    print(f"[arranque] tabla de embeddings duplicada liberada ({mb:.0f} MB)", flush=True)
 
 
 def elegir_motor_cuantizacion() -> str | None:
@@ -489,6 +527,10 @@ def _sintetizar(texto, voz, cfg_scale, streamer):
                 tokenizer=procesador.tokenizer,
                 generation_config={"do_sample": False},
                 verbose=False,
+                # El streamer ya entrega cada trozo segun sale; sin esto
+                # generate() ADEMAS acumula la sintesis entera y la concatena
+                # al final, para devolver algo que aqui se ignora.
+                return_speech=False,
                 all_prefilled_outputs=copy.deepcopy(base),
                 audio_streamer=streamer,
             )
