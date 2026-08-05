@@ -13,19 +13,23 @@ sale y esto lo va diciendo, sin silencios raros en medio.
     # dejarlo en un fichero en vez de reproducirlo
     python scripts/narrador.py --salida respuesta.wav "..."
 
-ESTADO: HAY HUECOS EN LAS FRONTERAS DE FRASE
-Medido: ~0,5 s de silencio en cada cambio de frase (1,0 s en total con 3
-frases dictadas de golpe; 1,6 s si el texto llega poco a poco). Se oye, aunque
-no rompe la comprension.
+DE DONDE SALEN LOS HUECOS, Y COMO SE TAPAN
+El primer fotograma de CUALQUIER locucion cuesta ~355 ms dentro de generate().
+No es sobrecarga de la peticion -- se midio: el deepcopy del prefijo son 1,3 ms
+y procesar la entrada 1,6 ms. Y no se puede paralelizar: una sola generacion ya
+satura la CPU, y el servicio tiene un candado por eso mismo. (Se intento con un
+pool de dos hilos: salio peor, ver el comentario de productor().)
 
-La causa esta en el SERVICIO, no aqui: voz_stream.py tiene un candado y hace
-UNA generacion a la vez, asi que pedir la frase siguiente por adelantado no
-adelanta nada -- se queda encolada. Se intento con un pool de dos hilos y
-salio peor (ver el comentario de productor()).
+Lo que si funciona es acumular audio antes de empezar a sonar, para que cada
+frase nueva arranque mientras aun queda cola de la anterior. Medido con la
+maquina CARGADA, que es el caso dificil:
 
-El arreglo de verdad es de servidor: o una cola que prepare la siguiente
-mientras termina la actual, o un endpoint que acepte texto en streaming. Hasta
-entonces, esto es lo mejor que se puede hacer desde el cliente.
+    bufer 0,6 s   1 de 2 pasadas con cortes
+    bufer 1,5 s   limpio          <- por defecto
+    bufer 2,5 s   limpio, pero 1 s mas de espera para nada
+
+Con la maquina en reposo sobra con 0. El defecto de 1,5 s esta elegido para
+que aguante cuando algo mas compite por la CPU.
 
 POR QUE NO BASTA CON PEDIR FRASE A FRASE
 El servicio genera a RTF ~0,90: un segundo de audio cuesta 0,9 s de computo.
@@ -113,6 +117,9 @@ def main():
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
     ap.add_argument("--cfg", type=float, default=1.5)
     ap.add_argument("--salida", help="escribir a un WAV en vez de reproducir")
+    ap.add_argument("--bufer", type=float, default=1.5,
+                    help="segundos de audio a acumular antes de empezar a sonar "
+                         "(0 = empezar cuanto antes, a riesgo de huecos)")
     ap.add_argument("--silencio", action="store_true", help="sin informe de tiempos")
     a = ap.parse_args()
 
@@ -176,16 +183,25 @@ def main():
     # tarde y los siguientes vienen detras, el silencio se oye UNA vez, no una
     # por trozo. (Sumar por trozo daba mas silencio que audio total, que era la
     # pista de que la cuenta estaba mal.)
-    reloj = None            # instante en que tocaria empezar el trozo actual
+    # El primer fotograma de CUALQUIER locucion cuesta ~355 ms dentro de
+    # generate() -- medido, y no es sobrecarga de la peticion: el deepcopy del
+    # prefijo son 1,3 ms y procesar la entrada 1,6 ms. No se puede paralelizar
+    # porque una sola generacion ya satura la CPU.
+    #
+    # Lo que SI se puede es taparlo: acumulando un poco de audio antes de
+    # empezar a sonar, cada frase nueva arranca mientras aun queda cola de la
+    # anterior. Se paga una vez, al principio.
+    reloj = None
+    espera_inicial = a.bufer
     while True:
         trozo = audio.get()
         if trozo is None:
             break
         llegada = time.time() - t_inicio
         if reloj is None:
-            informe["inicio_audio"] = llegada
-            reloj = llegada
-        elif llegada > reloj + 0.02:      # el bufer se vacio
+            informe["inicio_audio"] = llegada + espera_inicial
+            reloj = informe["inicio_audio"]
+        elif llegada > reloj + 0.02:      # el bufer se vacio: eso es un corte
             informe["esperas"] += 1
             informe["espera_total"] += llegada - reloj
             reloj = llegada
