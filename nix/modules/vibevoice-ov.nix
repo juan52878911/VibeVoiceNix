@@ -87,11 +87,19 @@ in
     };
 
     precisionLM = lib.mkOption {
-      type = lib.types.enum [ "int4a" "int8a" "fp16" ];
-      default = "int4a";
+      type = lib.types.enum [ "int4" "int8" "fp16" ];
+      default = "int4";
       description = ''
-        Compresion del backbone TTS. `int4a` es la mas rapida y la validada;
-        `int8a` cuesta ~0,13 de RTF y es el plan B si el int4 sonara raro.
+        Compresion del backbone TTS. `int4` es la mas rapida y la validada;
+        `int8` cuesta ~0,13 de RTF y es el plan B si el int4 sonara raro.
+
+        Estos nombres tienen que casar EXACTAMENTE con los ficheros que
+        escribe convertir_lm_estado.py, porque voz-stream.nix compone la ruta
+        con ellos: tts_lm_estado_<precision>.xml. Antes decian "int4a"/"int8a"
+        y no existia ningun fichero asi -- el conversor comprime en modo
+        simetrico y los llama int4/int8 a secas. Resultado: voz-stream no
+        encontraba el grafo y caia a torch en silencio, con el aviso
+        "faltan IR de OpenVINO" como unica pista.
       '';
     };
 

@@ -52,8 +52,22 @@ gc.collect()
 
 import nncf
 core = ov.Core()
-for modo, gs, ruta in [(nncf.CompressWeightsMode.INT8_ASYM, None, LD + "/decoder_estado_int8.xml"),
-                       (nncf.CompressWeightsMode.INT4_ASYM, 128, LD + "/decoder_estado_int4.xml")]:
+# Solo int8. NO se genera int4, y no es un olvido:
+#
+#  1. Es IMPOSIBLE con este grafo. El decodificador tiene capas de 32 y 64
+#     canales, y agruparlas de 128 en 128 aborta la conversion entera:
+#       nncf.errors.InvalidGroupSizeError: Failed to apply group-wise
+#       quantization with group size value 128.
+#     Bajar el grupo a 32 lo salvaria, como se hizo en convertir_cabeza.py
+#     con 64, pero no merece la pena por lo siguiente.
+#
+#  2. No lo usa NADIE. voz-stream.nix fija VIBEVOICE_IR_ACUSTICO al int8;
+#     no hay opcion que apunte al int4. Eran ~2 minutos y varios GB de E/S
+#     para un fichero muerto que ademas tumbaba el servicio.
+#
+# Si algun dia se quiere int4 aqui, hay que anadir la opcion en el modulo Y
+# usar group_size=32.
+for modo, gs, ruta in [(nncf.CompressWeightsMode.INT8_ASYM, None, LD + "/decoder_estado_int8.xml")]:
     mm = core.read_model(LD + "/decoder_estado_fp16.xml")
     kw = dict(mode=modo)
     if gs:
