@@ -327,9 +327,30 @@ async def ciclo_vida(app: FastAPI):
     _estado["prefijos"] = {}
     ini = time.perf_counter()
     _estado["procesador"], _estado["modelo"] = cargar_modelo()
+
     # Calentamiento: la primera generate() de un proceso paga asignaciones
     # unicas. Mejor pagarlas al arrancar que en la primera peticion real.
-    _sintetizar("Hola.", VOZ_DEFECTO, 1.5, streamer=None)
+    #
+    # Va en try porque es una OPTIMIZACION, no un requisito, y es el punto
+    # que MAS memoria pide de todo el arranque: al modelo ya cargado se le
+    # suman las activaciones de una sintesis entera. En una maquina justa
+    # (Docker Desktop en un Mac, por ejemplo) se muere justo aqui, tras
+    # haber cargado bien, y sin calentamiento el servicio funciona
+    # perfectamente: solo paga ese coste en la primera peticion real.
+    #
+    # VIBEVOICE_SIN_CALENTAMIENTO=1 lo salta sin intentarlo siquiera.
+    if os.environ.get("VIBEVOICE_SIN_CALENTAMIENTO", "").strip() not in ("", "0"):
+        print("[arranque] calentamiento omitido por configuracion", flush=True)
+    else:
+        try:
+            _sintetizar("Hola.", VOZ_DEFECTO, 1.5, streamer=None)
+        except Exception as e:
+            print(
+                f"[aviso] fallo el calentamiento ({type(e).__name__}: {e}). "
+                f"El servicio arranca igual; la primera peticion sera mas "
+                f"lenta. Si se repite, prueba VIBEVOICE_SIN_CALENTAMIENTO=1.",
+                flush=True,
+            )
     devolver_memoria()
     print(
         f"[arranque] modelo listo en {time.perf_counter() - ini:.1f} s"

@@ -91,18 +91,30 @@ services:
       # cuesta un 26%.
       VIBEVOICE_PASOS: "6"
       VIBEVOICE_VOZ: "sp-Spk1_man"
+      # Si el contenedor muere DESPUES de cargar el modelo, mientras genera
+      # el audio de calentamiento, es que no le llega la memoria: a los
+      # ~2,5 GB del modelo se le suman las activaciones de una sintesis
+      # entera. Pasa tipicamente en Docker Desktop sobre un Mac.
+      #
+      # Poner a 1 lo salta. El servicio funciona igual; solo paga ese coste
+      # en la primera peticion real, que sera mas lenta.
+      VIBEVOICE_SIN_CALENTAMIENTO: "${VIBEVOICE_SIN_CALENTAMIENTO:-0}"
     deploy:
       resources:
         limits:
-          # 6g y no 5g: con 5 se midió el pico llegando a 4,9 GiB y muriendo
-          # justo ahí, en silencio y con código de salida 0 — ni siquiera
-          # marca OOMKilled, así que parece un cierre limpio y no lo es.
+          # 7g, y cada subida está medida. Con 5g moría cargando el modelo
+          # (pico 4,9 GiB); con 6g cargaba pero moría GENERANDO, clavado en
+          # 6,0/6,0 GiB. El pico transitorio de una síntesis está entre 6 y 7:
+          # con 7g completa y luego se asienta en 3,6 GiB.
+          #
+          # Lo traicionero es cómo muere: código de salida 0 y OOMKilled a
+          # false. Parece un cierre limpio y es el sistema matándolo.
           #
           # OJO EN MAC: este límite no crea memoria. Docker Desktop reparte lo
-          # que tenga asignado en Ajustes → Resources, que por defecto suele
-          # ser menos de 8 GB. Súbelo a 8 GB o este servicio no arrancará
-          # nunca, por mucho que aquí ponga 6g.
-          memory: 6g
+          # que tenga asignado en Ajustes → Resources. Para este perfil MÁS
+          # whisper y voz-api hacen falta ~10 GB ahí; si no, arranca pero
+          # muere en la primera petición.
+          memory: 7g
     healthcheck:
       test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8082' || exit 1"]
       interval: 30s
