@@ -27,7 +27,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from piper import PiperVoice, SynthesisConfig
 from pydantic import BaseModel, Field
@@ -110,6 +110,20 @@ class PeticionTTS(BaseModel):
     formato: str = "ogg"
     # >1 habla mas lento, <1 mas rapido. 1.0 = velocidad nativa de la voz.
     velocidad: float = Field(1.0, gt=0.3, lt=3.0)
+
+
+@app.get("/", response_class=HTMLResponse)
+def consola() -> HTMLResponse:
+    """Consola de pruebas, servida por el PROPIO servicio.
+
+    Tiene que salir de aqui: desde otro origen el navegador bloquearia las
+    llamadas por CORS. Ademas asi la ve cualquiera que levante voz-api, sin
+    depender del servicio pesado de streaming.
+    """
+    ruta = Path(__file__).with_name("consola.html")
+    if not ruta.exists():
+        raise HTTPException(404, "consola no incluida en esta version")
+    return HTMLResponse(ruta.read_text(encoding="utf-8"))
 
 
 @app.get("/health")

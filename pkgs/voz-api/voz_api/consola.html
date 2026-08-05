@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consola de voz</title>
+<style>
+  :root {
+    --fondo:#f2f3f5; --sup:#fff; --borde:#d8dbe0; --tinta:#191c22;
+    --suave:#5c636e; --senal:#b3761c; --senal-bg:#f6ecd9;
+    --bien:#2f6f4f; --mal:#a3372f;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --fondo:#121419; --sup:#1b1e25; --borde:#2c313a; --tinta:#e8eaee;
+      --suave:#969ca8; --senal:#e0a542; --senal-bg:#2a2318;
+      --bien:#6fbf95; --mal:#e08b82; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:1.75rem 1.15rem 4rem;background:var(--fondo);color:var(--tinta);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.5;
+    -webkit-text-size-adjust:100%}
+  .caja{max-width:38rem;margin:0 auto}
+  .eyebrow{font-size:.68rem;letter-spacing:.13em;text-transform:uppercase;
+    color:var(--senal);font-weight:650;margin:0 0 .4rem}
+  h1{font-size:1.55rem;letter-spacing:-.02em;margin:0 0 .4rem}
+  .sub{color:var(--suave);margin:0 0 1.5rem;font-size:.92rem}
+  h2{font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:var(--suave);
+    font-weight:650;margin:0 0 .7rem}
+  section{background:var(--sup);border:1px solid var(--borde);border-radius:10px;
+    padding:1.1rem;margin-bottom:1rem}
+  label{display:block;font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--suave);font-weight:650;margin:0 0 .3rem}
+  textarea,input,select{width:100%;padding:.55rem .65rem;border-radius:7px;
+    border:1px solid var(--borde);background:var(--fondo);color:var(--tinta);
+    font-family:inherit;font-size:.92rem}
+  textarea{resize:vertical;min-height:4.5rem;line-height:1.45}
+  input:focus-visible,textarea:focus-visible,select:focus-visible,button:focus-visible{
+    outline:2px solid var(--senal);outline-offset:2px}
+  .fila{display:flex;gap:.6rem;margin-bottom:.8rem;flex-wrap:wrap}
+  .fila>div{flex:1;min-width:7rem}
+  .campo{margin-bottom:.8rem}
+  button{padding:.6rem 1rem;border:0;border-radius:7px;background:var(--senal);
+    color:#fff;font:inherit;font-weight:650;cursor:pointer}
+  button.sec{background:var(--borde);color:var(--tinta)}
+  button.rec{background:var(--mal)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .btns{display:flex;gap:.5rem;flex-wrap:wrap}
+  audio{width:100%;margin-top:.8rem;height:38px}
+  .met{display:flex;gap:1.1rem;flex-wrap:wrap;margin-top:.8rem;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-variant-numeric:tabular-nums;font-size:.82rem;color:var(--suave)}
+  .met b{color:var(--tinta);font-weight:600}
+  .est{margin-top:.8rem;font-size:.85rem;color:var(--suave);min-height:1.3rem}
+  .est.err{color:var(--mal)} .est.ok{color:var(--bien)}
+  .salida{margin-top:.8rem;padding:.7rem .8rem;background:var(--fondo);
+    border:1px solid var(--borde);border-radius:7px;font-size:.95rem;
+    white-space:pre-wrap;min-height:2.5rem}
+  .pill{display:inline-block;font-size:.66rem;letter-spacing:.06em;text-transform:uppercase;
+    font-weight:650;padding:.15rem .45rem;border-radius:4px;background:var(--borde);
+    color:var(--suave);margin-left:.4rem}
+  .pill.on{background:var(--senal-bg);color:var(--senal)}
+  .pill.off{background:var(--borde);color:var(--suave)}
+  .pie{margin-top:1.5rem;font-size:.78rem;color:var(--suave)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;
+    background:var(--sup);padding:.1rem .3rem;border-radius:4px;border:1px solid var(--borde)}
+</style>
+</head>
+<body>
+<div class="caja">
+  <p class="eyebrow">Homelab · voz en español</p>
+  <h1>Consola de pruebas</h1>
+  <p class="sub">Genera voz, transcribe audio y comprueba que todo responde.</p>
+
+  <section>
+    <h2>Estado <span id="p-tts" class="pill">tts</span><span id="p-stt" class="pill">stt</span><span id="p-str" class="pill">streaming</span></h2>
+    <div class="campo">
+      <label for="token">Token</label>
+      <input id="token" type="password" placeholder="bearer" autocomplete="off">
+    </div>
+    <div class="est" id="e-estado">Comprobando…</div>
+  </section>
+
+  <section>
+    <h2>Generar voz</h2>
+    <div class="campo">
+      <label for="texto">Texto</label>
+      <textarea id="texto">Hola Juan. El backup de anoche terminó sin errores y el túnel sigue en pie.</textarea>
+    </div>
+    <div class="fila">
+      <div><label for="voz">Voz</label><select id="voz"></select></div>
+      <div><label for="fmt">Formato</label>
+        <select id="fmt"><option>ogg</option><option>mp3</option><option>wav</option></select></div>
+      <div><label for="vel">Velocidad</label>
+        <select id="vel">
+          <option value="0.9">Rápida</option>
+          <option value="1.0" selected>Normal</option>
+          <option value="1.2">Lenta</option>
+        </select></div>
+    </div>
+    <div class="btns">
+      <button id="b-gen">Generar</button>
+      <button id="b-desc" class="sec" disabled>Descargar</button>
+      <button id="b-trans" class="sec" disabled>Transcribir esto</button>
+    </div>
+    <audio id="a-tts" controls hidden></audio>
+    <div class="met" id="m-tts" hidden></div>
+    <div class="est" id="e-tts"></div>
+  </section>
+
+  <section>
+    <h2>Entender audio</h2>
+    <div class="btns">
+      <button id="b-rec">Grabar del micrófono</button>
+      <button id="b-sub" class="sec">Subir fichero</button>
+      <input id="f-audio" type="file" accept="audio/*" hidden>
+    </div>
+    <audio id="a-stt" controls hidden></audio>
+    <div class="salida" id="s-stt">La transcripción aparecerá aquí.</div>
+    <div class="met" id="m-stt" hidden></div>
+    <div class="est" id="e-stt"></div>
+  </section>
+
+  <p class="pie">
+    Piper responde en décimas de segundo (RTF ~0,04). whisper transcribe unas
+    dos veces más rápido que el tiempo real. Si el streaming aparece apagado,
+    es que <code>voz-stream</code> no está levantado — es opcional y pesado.
+  </p>
+</div>
+
+<script>
+const $ = i => document.getElementById(i);
+let ultimoAudio = null, grabador = null, trozos = [];
+
+$("token").value = localStorage.getItem("voz.token") || "";
+$("token").addEventListener("change", e => {
+  localStorage.setItem("voz.token", e.target.value); comprobar();
+});
+
+const cab = () => $("token").value
+  ? { authorization: "Bearer " + $("token").value } : {};
+
+function di(id, msg, clase = "") { const e = $(id); e.textContent = msg; e.className = "est " + clase; }
+function pill(id, on, txt) {
+  const e = $(id); e.className = "pill " + (on ? "on" : "off"); e.textContent = txt;
+}
+
+async function comprobar() {
+  try {
+    const r = await fetch("/health");
+    const d = await r.json();
+    pill("p-tts", true, d.tts.motor);
+    pill("p-stt", d.stt.disponible, d.stt.disponible ? "whisper" : "stt caído");
+    $("voz").innerHTML = d.tts.voces
+      .map(v => `<option${v === d.tts.por_defecto ? " selected" : ""}>${v}</option>`).join("");
+    di("e-estado", `${d.tts.voces.length} voces · auth ${d.auth}`, "ok");
+  } catch (e) {
+    di("e-estado", "La API no responde: " + e.message, "err");
+    pill("p-tts", false, "sin tts");
+  }
+  // El streaming vive en otro puerto y es opcional; se comprueba aparte para
+  // que su ausencia no ensucie el estado del resto.
+  try {
+    const u = new URL(location.href); u.port = "8082"; u.pathname = "/health";
+    const r = await fetch(u, { signal: AbortSignal.timeout(2500) });
+    const d = await r.json();
+    pill("p-str", true, d.motor);
+  } catch { pill("p-str", false, "sin streaming"); }
+}
+
+$("b-gen").addEventListener("click", async () => {
+  const texto = $("texto").value.trim();
+  if (!texto) return di("e-tts", "Falta el texto.", "err");
+  $("b-gen").disabled = true; di("e-tts", "Generando…");
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/tts", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...cab() },
+      body: JSON.stringify({
+        texto, voz: $("voz").value, formato: $("fmt").value,
+        velocidad: parseFloat($("vel").value),
+      }),
+    });
+    if (!r.ok) throw new Error(r.status === 401 ? "token inválido" : `HTTP ${r.status}`);
+    const blob = await r.blob();
+    ultimoAudio = { blob, ext: $("fmt").value };
+    $("a-tts").src = URL.createObjectURL(blob); $("a-tts").hidden = false;
+    $("b-desc").disabled = false; $("b-trans").disabled = false;
+    const red = Math.round(performance.now() - t0);
+    $("m-tts").hidden = false;
+    $("m-tts").innerHTML =
+      `audio <b>${r.headers.get("x-duracion-s")}s</b>` +
+      ` · cómputo <b>${r.headers.get("x-proceso-s")}s</b>` +
+      ` · RTF <b>${r.headers.get("x-rtf")}</b>` +
+      ` · ida y vuelta <b>${red}ms</b>` +
+      ` · ${(blob.size / 1024).toFixed(0)}KB`;
+    di("e-tts", "Listo.", "ok");
+  } catch (e) { di("e-tts", "No se pudo generar: " + e.message, "err"); }
+  finally { $("b-gen").disabled = false; }
+});
+
+$("b-desc").addEventListener("click", () => {
+  if (!ultimoAudio) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(ultimoAudio.blob);
+  a.download = `voz.${ultimoAudio.ext}`; a.click();
+});
+
+// Cierra el circulo: genera y transcribe lo generado. Si el texto vuelve
+// igual, las dos direcciones funcionan.
+$("b-trans").addEventListener("click", () => {
+  if (ultimoAudio) transcribir(new File([ultimoAudio.blob], `voz.${ultimoAudio.ext}`));
+});
+
+$("b-sub").addEventListener("click", () => $("f-audio").click());
+$("f-audio").addEventListener("change", e => {
+  if (e.target.files[0]) transcribir(e.target.files[0]);
+});
+
+$("b-rec").addEventListener("click", async () => {
+  if (grabador && grabador.state === "recording") { grabador.stop(); return; }
+  try {
+    const flujo = await navigator.mediaDevices.getUserMedia({ audio: true });
+    grabador = new MediaRecorder(flujo); trozos = [];
+    grabador.ondataavailable = e => trozos.push(e.data);
+    grabador.onstop = () => {
+      flujo.getTracks().forEach(t => t.stop());
+      $("b-rec").textContent = "Grabar del micrófono"; $("b-rec").className = "";
+      const blob = new Blob(trozos, { type: grabador.mimeType });
+      $("a-stt").src = URL.createObjectURL(blob); $("a-stt").hidden = false;
+      // ffmpeg normaliza en el servidor, asi que da igual el formato que
+      // decida el navegador (webm en Chrome, mp4 en Safari).
+      transcribir(new File([blob], "grabacion.webm"));
+    };
+    grabador.start();
+    $("b-rec").textContent = "Detener"; $("b-rec").className = "rec";
+    di("e-stt", "Grabando… habla y pulsa detener.");
+  } catch (e) {
+    di("e-stt", "No hay acceso al micrófono: " + e.message, "err");
+  }
+});
+
+async function transcribir(fichero) {
+  di("e-stt", "Transcribiendo…"); $("m-stt").hidden = true;
+  const fd = new FormData();
+  fd.append("archivo", fichero); fd.append("idioma", "es");
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/stt", { method: "POST", headers: cab(), body: fd });
+    if (!r.ok) throw new Error(r.status === 401 ? "token inválido" : `HTTP ${r.status}`);
+    const d = await r.json();
+    $("s-stt").textContent = d.texto || "(no se entendió nada)";
+    $("m-stt").hidden = false;
+    $("m-stt").innerHTML =
+      `audio <b>${d.duracion_s}s</b> · cómputo <b>${d.proceso_s}s</b>` +
+      ` · RTF <b>${d.rtf}</b> · ida y vuelta <b>${Math.round(performance.now() - t0)}ms</b>`;
+    di("e-stt", "Listo.", "ok");
+  } catch (e) { di("e-stt", "No se pudo transcribir: " + e.message, "err"); }
+}
+
+comprobar();
+</script>
+</body>
+</html>

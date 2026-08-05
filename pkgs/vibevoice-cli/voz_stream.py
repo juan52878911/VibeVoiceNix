@@ -48,6 +48,7 @@ import numpy as np
 import torch
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -203,6 +204,19 @@ def _rss_mb() -> float:
 
 
 app = FastAPI(title="VibeVoice streaming", version="1.0.0", lifespan=ciclo_vida)
+
+# La consola de voz-api vive en otro puerto, asi que sus llamadas aqui son
+# de otro origen y el navegador las bloquearia. Se permite cualquier origen
+# porque el servicio ya exige bearer token y no usa cookies: sin
+# allow_credentials, un origen ajeno no puede robar sesion ninguna.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("VOZ_CORS", "*").split(","),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["authorization", "content-type"],
+    expose_headers=["X-RTF-Esperado", "X-Ritmo-Hz"],
+)
 
 
 class StreamerCancelable:
