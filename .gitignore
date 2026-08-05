@@ -20,6 +20,19 @@ ansible/inventory/hosts.generated.yml
 secrets/
 *.age
 *.key
+# .env lleva VOZ_TOKEN. Se colo en un commit y acabo en un repo PUBLICO; el
+# token hubo que rotarlo. Que no vuelva a pasar.
+.env
+*.env
+!*.env.example
+
+# Modelos y artefactos de build: son DERIVADOS, se regeneran con un comando.
+# El de whisper son 465 MB y GitHub rechaza cualquier fichero de mas de 100.
+docker/modelos/
+*.tar.gz
+*.safetensors
+*.gguf
+*.ggml
 
 # Python
 __pycache__/
