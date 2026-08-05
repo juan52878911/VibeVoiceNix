@@ -39,6 +39,7 @@ import copy
 import ctypes
 import gc
 import os
+import platform
 import struct
 import time
 from contextlib import asynccontextmanager
@@ -208,36 +209,63 @@ def cargar_modelo():
         modelo.to(DISPOSITIVO)
         _estado["motor"] = f"torch-fp16-{DISPOSITIVO}"
     else:
-        # En la rueda de macOS qnnpack esta disponible pero NADIE lo
-        # selecciona: el motor activo llega como "none" y quantize_dynamic
-        # aborta con
+        motor_q = elegir_motor_cuantizacion()
+        if motor_q:
+            torch.backends.quantized.engine = motor_q
+        # inplace=True: sin el se duplica el modelo entero y hay OOM en 5 GB.
         #
-        #   RuntimeError: Didn't find engine for operation
-        #   quantized::linear_prepack NoQEngine
-        #
-        # En Linux ya viene elegido, asi que esto no toca el camino medido.
-        if torch.backends.quantized.engine == "none":
-            reales = [m for m in torch.backends.quantized.supported_engines
-                      if m != "none"]
-            if reales:
-                torch.backends.quantized.engine = reales[0]
-                print(f"[arranque] motor de cuantizacion: {reales[0]}", flush=True)
-
-        if torch.backends.quantized.engine == "none":
-            # Sin motor no hay int8 posible; fp32 es mas lento pero arranca.
-            print("[aviso] sin motor de cuantizacion; se sigue en fp32", flush=True)
-            _estado["motor"] = "torch-fp32"
-        else:
-            # inplace=True: sin el se duplica el modelo entero y hay OOM en 5 GB.
+        # En try: la cuantizacion es una OPTIMIZACION, no un requisito. Si el
+        # backend no traga, es mejor arrancar en fp32 -- mas lento pero vivo --
+        # que morir en el arranque. Se midio que sin esto el contenedor entraba
+        # en bucle de reinicio sin llegar nunca a servir.
+        try:
             torch.ao.quantization.quantize_dynamic(
                 modelo, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
             )
+        except RuntimeError as e:
+            print(
+                f"[aviso] no se pudo cuantizar a int8 con motor "
+                f"'{torch.backends.quantized.engine}': {e}. Se sigue en fp32, "
+                f"que va mas lento pero funciona.",
+                flush=True,
+            )
+            _estado["motor"] = "torch-fp32"
 
     modelo.set_ddpm_inference_steps(PASOS)
     # Los pesos fp32 que acaban de ser sustituidos siguen ocupando hasta que
     # se recolectan Y se devuelven al sistema.
     devolver_memoria()
     return procesador, modelo
+
+
+def elegir_motor_cuantizacion() -> str | None:
+    """Motor de int8 valido PARA ESTA CPU, o None si no hay ninguno.
+
+    NO vale coger el primero de supported_engines. La lista llega con qnnpack
+    delante incluso en x86, y qnnpack es el backend de ARM: usarlo en un
+    Intel o AMD aborta al empaquetar la primera capa con
+
+        RuntimeError: unknown architecure
+
+    (la errata es de PyTorch, no mia). Y no avisa antes: falla en el momento
+    de convertir, con el modelo ya cargado.
+
+    En macOS pasa lo contrario y por eso hace falta elegir: qnnpack esta
+    disponible pero el motor activo llega como "none", y entonces revienta con
+    "Didn't find engine ... NoQEngine".
+    """
+    disponibles = [m for m in torch.backends.quantized.supported_engines
+                   if m != "none"]
+    if not disponibles:
+        return None
+    if platform.machine().lower() in ("x86_64", "amd64", "i386", "i686"):
+        preferencia = ["x86", "fbgemm", "onednn", "qnnpack"]
+    else:
+        preferencia = ["qnnpack", "onednn", "x86", "fbgemm"]
+    for motor in preferencia:
+        if motor in disponibles:
+            return motor
+    return disponibles[0]
 
 
 def a_dispositivo(obj):
