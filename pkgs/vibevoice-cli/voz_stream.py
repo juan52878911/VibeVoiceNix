@@ -462,8 +462,11 @@ def elegir_motor_cuantizacion() -> str | None:
 def a_dispositivo(obj):
     """Lleva a la GPU una estructura anidada de tensores, ajustando el tipo.
 
-    Hace falta porque las voces (.pt) se guardaron en fp32 y desde CPU: en GPU
-    el modelo va en fp16 y el primer matmul aborta si los tipos no coinciden.
+    Hace falta porque las voces (.pt) se guardaron en bfloat16 y desde CPU: en
+    GPU el modelo va en fp16 y el primer matmul aborta si los tipos no
+    coinciden. (Aqui ponia fp32; se comprobo cargando un .pt y son bf16. El
+    codigo hacia lo correcto igualmente, porque convierte a TIPO sea cual sea
+    el de origen, pero la justificacion escrita estaba mal.)
     Los tensores enteros (mascaras, indices) se mueven pero NO se convierten:
     volverlos fp16 los corrompe.
 
