@@ -1,0 +1,23 @@
+# Finales de linea SIEMPRE LF, tambien al clonar en Windows.
+#
+# Sin esto, Git con core.autocrlf=true (el valor por defecto en Windows)
+# convierte a CRLF al hacer checkout, y los scripts que Nix ejecuta revientan
+# con el clasico:
+#
+#     line 1: $'\r': command not found
+#
+# Le pasa a los .nix (llevan scripts de shell dentro), a los .sh, y a
+# cualquier cosa que acabe ejecutandose. Como este repo se construye en Linux
+# venga de donde venga, lo mas simple es forzar LF en todo el texto.
+* text=auto eol=lf
+
+# Binarios: que Git no los toque.
+*.png binary
+*.jpg binary
+*.wav binary
+*.mp3 binary
+*.ogg binary
+*.onnx binary
+*.pt binary
+*.bin binary
+*.tar.gz binary
