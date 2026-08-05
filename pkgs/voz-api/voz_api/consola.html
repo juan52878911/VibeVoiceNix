@@ -191,19 +191,35 @@ async function comprobar() {
     di("e-estado", "La API no responde: " + e.message, "err");
     pill("p-tts", false, "sin tts");
   }
-  // El streaming vive en otro puerto y es opcional; se comprueba aparte para
-  // que su ausencia no ensucie el estado del resto.
+  comprobarStream();
+}
+
+// El streaming vive en otro puerto y es opcional, asi que se comprueba aparte
+// para que su ausencia no ensucie el estado del resto. Y se REINTENTA: tarda
+// unos 2 minutos en cargar el modelo, y obligar a recargar la pagina a ciegas
+// mientras tanto es una mala forma de esperar.
+let reintentoStream = null;
+
+async function comprobarStream() {
   try {
     const u = new URL(location.href); u.port = "8082"; u.pathname = "/health";
     const r = await fetch(u, { signal: AbortSignal.timeout(2500) });
     const d = await r.json();
     pill("p-str", true, d.motor);
     $("b-str").disabled = false;
-    di("e-str", `RTF esperado ${d.rtf_esperado} · ${d.pasos} pasos`);
+    di("e-str", `${d.motor} en ${d.dispositivo} · RTF esperado ${d.rtf_esperado}`, "ok");
+    if (reintentoStream) { clearInterval(reintentoStream); reintentoStream = null; }
   } catch {
     pill("p-str", false, "sin streaming");
     $("b-str").disabled = true;
-    di("e-str", "voz-stream no responde en el 8082.");
+    // Decir solo que no responde no ayuda: lo normal es que ni se haya
+    // levantado, porque es un servicio aparte que no arranca por defecto.
+    $("e-str").className = "est";
+    $("e-str").innerHTML =
+      "No hay nada escuchando en el 8082. Es opcional y no arranca solo:" +
+      "<br><code>docker compose --profile pesado up -d</code><br>" +
+      "Tarda ~2 minutos en cargar el modelo. Esta página lo detecta sola.";
+    if (!reintentoStream) reintentoStream = setInterval(comprobarStream, 10000);
   }
 }
 
