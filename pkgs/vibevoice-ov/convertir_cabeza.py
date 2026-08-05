@@ -15,6 +15,7 @@ Fases (todas caben de sobra en RAM porque el modulo es pequeno):
   5. Benchmark: torch fp32, torch int8 dinamico, OV fp32, OV int8, OV int4.
 """
 import json
+import os
 import time
 
 import numpy as np
