@@ -1,0 +1,72 @@
+# whisper.cpp como servidor de transcripcion.
+#
+# Se compila desde fuente en vez de usar una imagen ajena: son ~2 minutos y
+# asi se compila para la arquitectura de la maquina, con sus extensiones
+# vectoriales. En un Mac ARM aprovecha NEON; en x86, AVX2.
+
+FROM debian:trixie-slim AS constructor
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential cmake git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Version fijada: whisper.cpp cambia rapido y una version distinta puede
+# cambiar el formato del modelo o los argumentos del servidor.
+ARG WHISPER_VERSION=v1.8.7
+RUN git clone --depth 1 --branch "$WHISPER_VERSION" \
+      https://github.com/ggml-org/whisper.cpp /src
+
+WORKDIR /src
+# Sin GPU: se midio que una iGPU Intel resulta 2,5x MAS LENTA que la CPU en
+# esta carga. Aqui se compila solo el backend de CPU.
+#
+# En ARM hay que pedir fp16 explicitamente, o los intrinsecos de whisper.cpp
+# fallan con:
+#
+#   error: inlining failed in call to 'always_inline' 'vfmaq_f16':
+#          target specific option mismatch
+#
+# armv8.2-a+fp16 es la linea base razonable: la cumplen Apple Silicon, los
+# Graviton de AWS y cualquier ARM de servidor moderno.
+#
+# La base es trixie y no Debian 12 por esto mismo: con su GCC 12 no compilaba
+# ni pasandole estos flags, porque ggml sobrescribe los suyos por objetivo.
+# GCC 14 los admite de serie.
+RUN set -eu; \
+    FLAGS=""; \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+      FLAGS="-DCMAKE_C_FLAGS=-march=armv8.2-a+fp16 -DCMAKE_CXX_FLAGS=-march=armv8.2-a+fp16"; \
+      echo "ARM detectado: compilando con fp16"; \
+    fi; \
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_BUILD_TESTS=OFF $FLAGS; \
+    cmake --build build --config Release -j"$(nproc)"
+
+# ---------------------------------------------------------------------------
+FROM debian:trixie-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=constructor /src/build/bin/whisper-server /usr/local/bin/
+COPY --from=constructor /src/build/src/libwhisper.so* /usr/local/lib/
+COPY --from=constructor /src/build/ggml/src/libggml*.so* /usr/local/lib/
+RUN ldconfig
+
+RUN useradd --system --uid 1000 --create-home voz
+USER voz
+
+# El modelo NO va dentro: son 466 MB y ataria su version a la del contenedor.
+# Se monta en /modelos; bajalo con ./bajar-modelo.sh
+VOLUME /modelos
+EXPOSE 8081
+
+# 6 hilos: medido como el optimo. Mas empeora, porque la carga esta limitada
+# por ancho de banda de memoria y no por computo.
+CMD ["whisper-server", \
+     "--model", "/modelos/ggml-small.bin", \
+     "--language", "es", \
+     "--threads", "6", \
+     "--host", "0.0.0.0", \
+     "--port", "8081"]

@@ -1,0 +1,80 @@
+# VibeVoice con respuesta en streaming.
+#
+# PESADA: ~4 GB de imagen y ~2,5 GB de RAM en regimen, con un pico de 4,6 GB
+# al arrancar. No es evitable -- son 1,9 GB de pesos mas ~2 GB de PyTorch.
+#
+# Si solo quieres notas de voz, usa voz-api: RTF 0,04 frente a 2,2, y 150 MB
+# de RAM frente a 2.500.
+
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# ---------------------------------------------------------------- deps --
+# git hace falta aqui: el lock resuelve VibeVoice desde un repositorio, no
+# desde PyPI, y fijado a un commit concreto.
+WORKDIR /app
+COPY pkgs/vibevoice/pyproject.toml pkgs/vibevoice/uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# --------------------------------------------------------------- modelo --
+# Va DENTRO de la imagen y no en un volumen: sin el no arranca, y son 1,9 GB
+# que nadie querria montar a mano. Con HF_HUB_OFFLINE=1 el contenedor no sale
+# a la red en ningun momento.
+ENV HF_HOME=/modelo
+RUN uv run python -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('microsoft/VibeVoice-Realtime-0.5B'); \
+print('modelo descargado')"
+
+# El repo del modelo NO trae tokenizador: el procesador cae a Qwen2.5-1.5B y
+# se lo baja en tiempo de ejecucion. Se trae ahora para poder ir sin red.
+RUN uv run python -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('Qwen/Qwen2.5-1.5B', allow_patterns=['tokenizer*','vocab.json','merges.txt']); \
+print('tokenizador descargado')"
+
+# ---------------------------------------------------------------- voces --
+# Las voces (.pt) tampoco vienen en el paquete de Python: el pyproject de
+# VibeVoice solo empaqueta el codigo, no demo/.
+ARG VIBEVOICE_COMMIT=94da20d98b2fa7688e9cbfaf7692ddb4954f7600
+RUN git clone --filter=blob:none --sparse https://github.com/microsoft/VibeVoice.git /tmp/vv \
+ && cd /tmp/vv \
+ && git checkout "$VIBEVOICE_COMMIT" \
+ && git sparse-checkout set demo/voices/streaming_model \
+ && mkdir -p /voces \
+ && cp demo/voices/streaming_model/*.pt /voces/ \
+ && rm -rf /tmp/vv
+
+# --------------------------------------------------------------- codigo --
+COPY pkgs/vibevoice-cli/voz_stream.py pkgs/vibevoice-cli/prueba.html ./
+
+# Deja la ruta del modelo fija: snapshot_download la esconde tras un hash.
+RUN MODELO=$(find /modelo -name "model.safetensors" -exec dirname {} \; | head -1) \
+ && ln -s "$MODELO" /modelo-vibevoice \
+ && echo "modelo en $MODELO"
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    VIBEVOICE_MODELO=/modelo-vibevoice \
+    VIBEVOICE_VOCES=/voces \
+    VIBEVOICE_PASOS=6 \
+    VIBEVOICE_VOZ=sp-Spk1_man \
+    VOZ_STREAM_HOST=0.0.0.0 \
+    VOZ_STREAM_PUERTO=8082 \
+    HF_HUB_OFFLINE=1 \
+    PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=6 \
+    OMP_PLACES=cores \
+    OMP_PROC_BIND=close \
+    MALLOC_ARENA_MAX=2
+
+RUN useradd --system --uid 1000 --create-home voz \
+ && chown -R voz:voz /app /voces
+USER voz
+
+EXPOSE 8082
+CMD ["python", "voz_stream.py"]

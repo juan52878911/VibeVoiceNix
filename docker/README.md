@@ -1,19 +1,36 @@
 # Usar el stack de voz con Docker
 
-Para quien **no tiene Nix**. Las imágenes se construyen con Nix, pero usarlas
-solo requiere Docker.
-
-## Si te han pasado las imágenes
+**No hace falta Nix.** Tres comandos:
 
 ```bash
-docker load < voz-api.tar.gz
-docker load < voz-whisper.tar.gz
-
-./bajar-modelo.sh                    # el modelo de whisper, 466 MB
+./bajar-modelo.sh                              # modelo de whisper, 466 MB
 echo "VOZ_TOKEN=$(openssl rand -hex 24)" > .env
-
-docker compose up -d
+docker compose up -d --build
 ```
+
+La primera vez tarda unos minutos: compila whisper.cpp y descarga las voces.
+Después arranca en segundos.
+
+Se construye para **la arquitectura de tu máquina**, así que en un Mac ARM
+salen imágenes ARM y no hace falta constructor remoto ni nada parecido.
+
+## Dos formas de tener las imágenes
+
+Este directorio ofrece **Dockerfiles normales** (lo de arriba) y el flake
+ofrece **imágenes generadas por Nix**. No es duplicación por accidente:
+
+| | Dockerfile | Imagen de Nix |
+|---|---|---|
+| Requisitos | Solo Docker | Nix + máquina x86_64 |
+| Arquitectura | La de tu máquina | Solo `x86_64-linux` |
+| Reproducible | Las versiones sí (mismo `uv.lock`) | Bit a bit |
+| Para quién | **Cualquiera** | Producción |
+
+Ambas fijan las dependencias con **el mismo `uv.lock`**, así que las versiones
+de Python no pueden divergir. Lo que cambia es la base del sistema.
+
+Si quieres las de Nix: `nix build .#imagenes.voz-api -o voz-api.tar.gz`, y
+luego `docker load < voz-api.tar.gz`.
 
 Ya responde en `http://localhost:8080`:
 
@@ -34,8 +51,7 @@ curl -X POST http://localhost:8080/stt \
 ### Añadir VibeVoice (opcional, pesado)
 
 ```bash
-docker load < voz-stream.tar.gz
-docker compose --profile pesado up -d
+docker compose --profile pesado up -d --build
 ```
 
 Página de prueba en `http://localhost:8082/`.

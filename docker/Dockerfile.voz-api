@@ -1,0 +1,66 @@
+# Piper (TTS) + fachada HTTP. Es el camino rapido: RTF 0,042.
+#
+# No necesita Nix: `docker compose up --build` y funciona. Compila para la
+# arquitectura de la maquina donde se lanza, asi que en un Mac ARM sale una
+# imagen ARM sin constructor remoto.
+#
+# Las VERSIONES salen del mismo uv.lock que usa el flake de NixOS. Es lo que
+# evita que esta imagen y la VM de produccion se separen: comparten el fichero
+# que fija cada dependencia.
+
+FROM python:3.12-slim AS base
+
+# ffmpeg convierte a ogg/opus y normaliza el audio de entrada a 16 kHz mono.
+# curl solo hace falta al construir, pero limpiar apt en la misma capa pesa
+# menos que una capa extra.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# ---------------------------------------------------------------- deps --
+# El lock primero y el codigo despues: cambiar una linea de Python no
+# reinstala las dependencias.
+WORKDIR /app
+COPY pkgs/voz-api/pyproject.toml pkgs/voz-api/uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev
+
+# ---------------------------------------------------------------- voces --
+# Las tres voces por defecto, con su hash verificado: si Hugging Face sirviera
+# otra cosa, el build falla en vez de meter algo distinto en silencio.
+ARG VOCES="es_MX-claude-high es_MX-ald-medium es_ES-davefx-medium"
+COPY docker/voces.txt /tmp/voces.txt
+RUN set -eu; \
+    mkdir -p /voces; \
+    for v in $VOCES; do \
+      ruta=$(grep "^$v " /tmp/voces.txt | cut -d' ' -f2); \
+      sha=$(grep "^$v " /tmp/voces.txt | cut -d' ' -f3); \
+      base="https://huggingface.co/rhasspy/piper-voices/resolve/main"; \
+      echo "bajando $v ..."; \
+      curl -fsSL "$base/$ruta/$v.onnx"      -o "/voces/$v.onnx"; \
+      curl -fsSL "$base/$ruta/$v.onnx.json" -o "/voces/$v.onnx.json"; \
+      echo "$sha  /voces/$v.onnx" | sha256sum -c - >/dev/null; \
+    done; \
+    rm /tmp/voces.txt
+
+# --------------------------------------------------------------- codigo --
+COPY pkgs/voz-api/voz_api ./voz_api
+RUN uv sync --frozen --no-dev
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    VOZ_VOICES_DIR=/voces \
+    VOZ_DEFECTO=es_MX-claude-high \
+    VOZ_FFMPEG=/usr/bin/ffmpeg \
+    VOZ_HOST=0.0.0.0 \
+    VOZ_PORT=8080 \
+    PYTHONUNBUFFERED=1
+
+# Sin privilegios: en un contenedor root no aporta nada y molesta con los
+# volumenes del anfitrion.
+RUN useradd --system --uid 1000 --create-home voz \
+ && chown -R voz:voz /voces
+USER voz
+
+EXPOSE 8080
+CMD ["python", "-m", "voz_api"]

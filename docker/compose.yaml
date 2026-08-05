@@ -1,17 +1,14 @@
-# Stack de voz en Docker, para usarlo sin tener Nix instalado.
+# Stack de voz en Docker. Un comando y funciona:
 #
-# Las imágenes se construyen con Nix (ver ../nix/imagenes.nix) pero se usan sin
-# él. Quien reciba los .tar.gz solo necesita Docker:
+#     ./bajar-modelo.sh
+#     echo "VOZ_TOKEN=$(openssl rand -hex 24)" > .env
+#     docker compose up -d --build
 #
-#     docker load < voz-api.tar.gz
-#     docker load < voz-whisper.tar.gz
-#     docker load < voz-stream.tar.gz
-#     docker compose up -d
+# No hace falta Nix. Se construye para la arquitectura de esta máquina, así
+# que en un Mac ARM salen imágenes ARM sin constructor remoto.
 #
-# Un contenedor por motor, no los tres juntos, por dos razones concretas:
-# cada uno tiene un perfil de memoria muy distinto (Piper ~100 MB frente a
-# VibeVoice ~2,5 GB), y así una síntesis pesada no bloquea las notas de voz
-# rápidas.
+# El contexto de construcción es la RAÍZ del repo (`context: ..`), no esta
+# carpeta: los Dockerfile necesitan los uv.lock y el código de `pkgs/`.
 
 name: voz
 
@@ -20,14 +17,15 @@ services:
   # Transcripción. Va primero porque voz-api depende de él.
   # --------------------------------------------------------------------
   whisper:
-    image: voz-whisper:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.whisper
+    image: voz-whisper:local
     restart: unless-stopped
     volumes:
-      # El modelo NO va dentro de la imagen: son 466 MB y ataría su versión a
-      # la del contenedor. Descárgalo una vez con ./bajar-modelo.sh
+      # El modelo no va dentro de la imagen: 466 MB que atarían su versión a
+      # la del contenedor. Bájalo una vez con ./bajar-modelo.sh
       - ./modelos:/modelos:ro
-    # Solo accesible desde la red interna: quien entra de fuera pasa por
-    # voz-api, que es quien valida el token.
     expose:
       - "8081"
     healthcheck:
@@ -38,10 +36,13 @@ services:
       start_period: 30s
 
   # --------------------------------------------------------------------
-  # Piper (TTS) + fachada HTTP. Es el camino rápido: RTF 0,042.
+  # Piper (TTS) + fachada HTTP. El camino rápido: RTF 0,042.
   # --------------------------------------------------------------------
   voz-api:
-    image: voz-api:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.voz-api
+    image: voz-api:local
     restart: unless-stopped
     depends_on:
       whisper:
@@ -49,8 +50,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Sin token la API queda abierta. Ponlo en un fichero .env al lado:
-      #     VOZ_TOKEN=una-cadena-larga-y-aleatoria
+      # Sin token la API queda ABIERTA a quien alcance el puerto.
       VOZ_TOKEN: "${VOZ_TOKEN:-}"
       VOZ_WHISPER_URL: "http://whisper:8081"
       # Sesga el vocabulario de whisper. Es el ajuste que MÁS se nota: sin él
@@ -66,30 +66,32 @@ services:
       start_period: 20s
 
   # --------------------------------------------------------------------
-  # VibeVoice con streaming. Opcional: arráncalo con
-  #     docker compose --profile pesado up -d
+  # VibeVoice con streaming. NO arranca por defecto:
+  #     docker compose --profile pesado up -d --build
   #
-  # Pide ~2,5 GB de RAM en régimen y hace un pico de ~4,6 GB al cargar
-  # (materializa el modelo en fp32 antes de cuantizarlo). Con menos de 6 GB
-  # libres en la máquina, el kernel lo matará.
+  # Construirla descarga ~2,5 GB de modelo y tarda un rato. Necesita ~6 GB de
+  # RAM libres: pide 2,5 en régimen pero hace un pico de 4,6 al cargar.
   # --------------------------------------------------------------------
   voz-stream:
-    image: voz-stream:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.voz-stream
+    image: voz-stream:local
     restart: unless-stopped
     profiles: ["pesado"]
     ports:
       - "8082:8082"
     environment:
       VOZ_TOKEN: "${VOZ_TOKEN:-}"
-      # Pasos de difusión. 6 es el punto dulce medido: bajar a 4 solo gana un
-      # 3% y sube a 20 cuesta un 26%.
+      # 6 pasos es el punto dulce medido: bajar a 4 gana un 3% y subir a 20
+      # cuesta un 26%.
       VIBEVOICE_PASOS: "6"
       VIBEVOICE_VOZ: "sp-Spk1_man"
     deploy:
       resources:
         limits:
-          # Tope generoso a propósito: por debajo del pico de carga el
-          # contenedor muere a mitad de arrancar y sin mensaje claro.
+          # Generoso a propósito: por debajo del pico de carga el contenedor
+          # muere a mitad de arrancar y sin mensaje claro.
           memory: 5g
     healthcheck:
       test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8082' || exit 1"]

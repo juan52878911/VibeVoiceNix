@@ -1,0 +1,14 @@
+# Voces de Piper: nombre, ruta en el repo de Hugging Face, sha256 del .onnx.
+#
+# Los hashes se midieron sobre los ficheros reales. El Dockerfile los verifica
+# al descargar: si sirvieran otra cosa, el build falla en vez de meter algo
+# distinto en silencio.
+#
+# RTF medido en un i7-8700T con el mismo texto (menor es mejor):
+#   es_MX-claude-high 0,152 · es_MX-ald-medium 0,151 · es_ES-sharvard 0,177
+#   es_ES-davefx 0,191 · es_AR-daniela 0,408
+es_MX-claude-high es/es_MX/claude/high 3ef40a71ea63852cd8ab7e6fa7d2ecdcfa67a0b47c9c48e3f10e02ee02083ea0
+es_MX-ald-medium es/es_MX/ald/medium 019b3803293c93e34a206dd2e53a3889209a514e786fd7144f7b70196c579b63
+es_ES-davefx-medium es/es_ES/davefx/medium 6658b03b1a6c316ee4c265a9896abc1393353c2d9e1bca7d66c2c442e222a917
+es_ES-sharvard-medium es/es_ES/sharvard/medium 40febfb1679c69a4505ff311dc136e121e3419a13a290ef264fdf43ddedd0fb1
+es_AR-daniela-high es/es_AR/daniela/high 7ceb1fc0dab349418c5b54a639ae9ee595212d7c9ea422220d8419163d5cc985
