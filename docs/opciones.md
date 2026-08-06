@@ -7,6 +7,9 @@ servicios. Los valores por defecto son los que se usan en la máquina del proyec
 - [`services.voz-api.*`](#servicesvoz-api)
 - [`services.homelab-whisper.*`](#serviceshomelab-whisper)
 - [`services.vibevoice.*`](#servicesvibevoice)
+- [`services.voz-stream.*`](#servicesvoz-stream)
+- [`services.vibevoice-ov.*`](#servicesvibevoice-ov)
+- [`homelab.tunel.*`](#homelabtunel)
 - [Voces de Piper disponibles](#voces-de-piper-disponibles)
 - [Aserciones y avisos](#aserciones-y-avisos)
 - [Variables de entorno](#variables-de-entorno)
@@ -124,8 +127,20 @@ Módulo: [`nix/modules/vibevoice.nix`](../nix/modules/vibevoice.nix).
 | Opción | Tipo | Por defecto | Qué hace |
 |---|---|---|---|
 | `enable` | `bool` | `false` | Instala la orden `vibevoice` en el sistema. |
-| `hilos` | `int` | `8` | Hilos de OpenMP para la inferencia en CPU. |
+| `hilos` | `int` | `6` | Hilos de OpenMP. **Más no es mejor**: 12 hilos van un 24 % peor. |
+| `anclarNucleos` | `bool` | `true` | `OMP_PLACES=cores`. ⚠️ **Invertir si el motor pasa a OpenVINO.** |
+| `cuantizar` | `bool` | `true` | int8 dinámico: casi 2× más rápido. |
+| `pasosDifusion` | `int` | `6` | Pasos del *scheduler*. 4 solo mejora un 3 %. |
+| `vozDefecto` | `str` | `"sp-Spk1_man"` | Hablante. Las españolas son `sp-Spk1_man` y `sp-Spk0_woman`. |
 | `cfgScale` | `float` | `1.5` | Escala del *classifier-free guidance*. **Calidad, no velocidad.** |
+
+**`hilos` y `anclarNucleos` son la pareja delicada.** Medido: 2 hilos RTF 4,19 · 6 anclados **4,04** ·
+8 hilos 4,31 · 12 hilos **5,18 (24 % peor)**. Y el anclaje **acelera PyTorch un 3 % pero ralentiza
+OpenVINO un 118 %** (89 → 195 ms/llamada): si algún día `voz-stream` deja de caer a torch, hay que
+invertirlo.
+
+**`cuantizar` y `pasosDifusion` son las dos palancas que sí pagaron:** juntas llevaron el RTF de 5,39 a
+2,18. El viaje completo está en [optimizacion.md](optimizacion.md).
 
 **`cfgScale` no acelera nada, y está medido.** Parecía la palanca obvia —con CFG cada paso de difusión
 hace una pasada condicional y otra incondicional— pero bajarlo sale peor por los dos lados:
@@ -138,16 +153,22 @@ hace una pasada condicional y otra incondicional— pero bajarlo sale peor por l
 
 `sample_speech_tokens` concatena condicional e incondicional en un mismo batch **siempre**, sin rama que
 se salte la segunda; parchearlo tampoco sirvió (RTF 3,90). Con dimensión 896 y batch 2 el cuello es el
-ancho de banda de memoria, no los FLOPs. **Déjalo en `1.5`.** El detalle está en
-[rendimiento.md](rendimiento.md#cfgscale-no-acelera-se-midió).
+ancho de banda de memoria, no los FLOPs.
 
-**`hilos` sí importa:** pasar de 4 a 8 núcleos bajó el RTF de 4,80 a 3,92. Fue el único ajuste que movió
-la aguja.
+> ⚠️ **Pero sí conviene subirlo, por calidad.** Un banco de fidelidad posterior (texto → voz → whisper →
+> texto) midió que **3,0 baja el WER medio del 13,6 % al 3,6 %** y el peor caso de 85,7 % a 14,3 % — **sin
+> coste en tiempo**, porque la difusión evalúa las dos ramas en un lote de 2 pase lo que pase. El servicio
+> `voz-stream` ya usa **3.0**; esta opción de la CLI sigue en 1.5 y su descripción no se actualizó.
+> Conviene alinearlas. Ver [optimizacion.md](optimizacion.md#el-viaje-completo).
+
+**`hilos` sí importa, pero al revés de lo que parece:** el óptimo son **6 anclados** (RTF 4,04). Con 8
+sube a 4,31 y con 12 a 5,18 — un 24 % peor. Más hilos compiten por el mismo bus de memoria, que es el
+cuello real.
 
 Las dos se pueden pisar por llamada sin reconstruir el sistema:
 
 ```bash
-VIBEVOICE_HILOS=12 vibevoice --txt_path guion.txt --speaker_names sp-Spk0_woman
+VIBEVOICE_PASOS=4 vibevoice --texto "Compara la calidad." --salida cuatro.wav
 ```
 
 La orden es un envoltorio fino: fija `OMP_NUM_THREADS`, pone `HF_HUB_OFFLINE=1` para que no intente salir
@@ -157,6 +178,83 @@ de inferencia lleva la ruta de las voces sustituida en la propia derivación.
 **Voces disponibles:** las españolas son `sp-Spk0_woman` y `sp-Spk1_man`, añadidas por Microsoft en
 diciembre de 2025 y marcadas por ellos como experimentales. Los modelos 1.5B y Large-7B solo hablan inglés
 y chino; este `Realtime-0.5B` es el único con español.
+
+---
+
+## `services.voz-stream.*`
+
+TTS expresivo **en streaming**: emite el audio según se genera, así que el primer sonido llega en 0,20 s
+en vez de esperar a la síntesis completa.
+Módulo: [`nix/modules/voz-stream.nix`](../nix/modules/voz-stream.nix).
+
+| Opción | Tipo | Por defecto | Qué hace |
+|---|---|---|---|
+| `enable` | `bool` | `false` | Levanta el servicio de streaming. |
+| `puerto` | `port` | `8082` | Puerto HTTP. |
+| `direccion` | `str` | `"0.0.0.0"` | Interfaz de escucha. |
+| `abrirCortafuegos` | `bool` | `false` | Abre el puerto en la LAN. Con el túnel activo no hace falta. |
+| `ficheroToken` | `nullOr path` | `null` | Igual que en `voz-api`: fuera del store. |
+
+**Es un servicio aparte de `voz-api` a propósito.** Este carga VibeVoice (~2,3 GB); `voz-api` solo las
+voces de Piper (~100 MB). Juntarlos haría que una síntesis pesada bloqueara las notas de voz rápidas.
+
+Hereda de `services.vibevoice` el modelo, las voces y la configuración de pasos de difusión, así que no
+hay dos sitios donde ajustar lo mismo. Usa `cfg_scale = 3.0` por petición, que es el valor que midió el
+banco de fidelidad.
+
+**El audio es bit a bit idéntico** al de la generación normal (mismo md5): no es una versión degradada,
+es el mismo resultado entregado según se produce.
+
+```bash
+curl -sN -X POST http://voz:8082/tts -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"texto":"Se oye según se genera."}' | ffplay -autoexit -nodisp -
+```
+
+---
+
+## `services.vibevoice-ov.*`
+
+Genera los grafos **OpenVINO** (IR) que aceleran el motor.
+Módulo: [`nix/modules/vibevoice-ov.nix`](../nix/modules/vibevoice-ov.nix).
+
+| Opción | Tipo | Por defecto | Qué hace |
+|---|---|---|---|
+| `enable` | `bool` | `false` | Activa el `oneshot` que convierte el modelo a IR. |
+| `directorioIR` | `path` | `/var/lib/voz/ov` | Dónde se dejan los grafos. |
+| `precisionLM` | `str` | `"int4"` | Precisión del *backbone*. |
+| `precisionCabeza` | `str` | `"int8"` | Precisión de la cabeza de difusión. |
+
+**Los IR no viven en el `/nix/store`, y es deliberado.** Generarlos pica **4,6 GB** y el contenedor
+constructor tiene 2560 MB. Se generan en la VM desde entradas fijadas —modelo con hash, scripts
+versionados, `openvino` y `nncf` clavados a versión **exacta**—, así que es reproducible **el resultado**,
+no el momento. Es el único artefacto derivado del proyecto que no es una derivación de Nix.
+
+**`precisionCabeza` va en int8 y no int4 a propósito:** con semilla fija se midió que el int4 **sesga el
+fin de frase** (95 tokens frente a 84 de la base) y encima empata en RTF, así que no compra nada.
+
+> Si el servicio no llegó a generar los IR, `voz-stream` **cae a torch en silencio** — RTF 2,2 en vez de
+> 1,09, que se nota como cortes en el streaming.
+
+---
+
+## `homelab.tunel.*`
+
+Túnel **WireGuard** hacia un edge, para llegar a la VM desde fuera estando tras CGNAT.
+Módulo: [`nix/modules/tunel.nix`](../nix/modules/tunel.nix).
+
+| Opción | Tipo | Por defecto | Qué hace |
+|---|---|---|---|
+| `enable` | `bool` | `false` | Levanta el túnel. |
+| `ip` | `str` | — | IP de la VM dentro del túnel (p. ej. `10.10.10.5`). |
+| `ficheroClave` | `path` | `/var/lib/wireguard/privada` | Clave privada, **fuera del store**, permisos `600`. |
+| `clavePublicaEdge` | `str` | — | Clave pública del edge. |
+| `endpoint` | `str` | — | Dónde escucha el edge. |
+| `redTunel` | `str` | `"10.10.10.0/24"` | Red del túnel. |
+
+**La VM abre el túnel hacia el edge**, no al revés: es lo que permite atravesar el CGNAT. **No expone nada
+a internet** — la API sigue escuchando solo en la LAN y en la red del túnel.
+
+La clave privada vive fuera del `/nix/store` por el mismo motivo que el token: el store es legible por
+cualquier usuario del sistema.
 
 ---
 
@@ -193,7 +291,7 @@ El sistema se niega a construirse en estos casos, todos ellos errores que se not
 | `configuration.nix` | `homelab.clavesSSH != [ ]` | la VM se instalaría sin ninguna forma de entrar |
 | `voz-api.nix` | `vozDefecto ∈ voces` | la voz por defecto no estaría instalada; fallaría en la primera petición |
 | `voz-api.nix` | `abrirCortafuegos → ficheroToken != null` | **abrir el puerto sin token deja el TTS y el STT accesibles a cualquiera de la LAN** |
-| `vibevoice.nix` | `swapDevices != [ ]` | VibeVoice hace pico de ~3,9 GB; sin swap, una generación se lleva por delante al que pida memoria |
+| `vibevoice.nix` | `swapDevices != [ ]` | VibeVoice carga ~2,8 GB y pica más al arrancar; sin swap, una VM justa se queda sin memoria |
 | `piper-voices.nix` | las voces pedidas están en el catálogo | mensaje con los nombres desconocidos y la lista de válidos |
 
 La última es la más fácil de encontrarse: si desactivas la swap que declara
