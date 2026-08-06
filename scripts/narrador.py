@@ -129,12 +129,18 @@ def trocear(texto: str, forzar_final: bool = False, primera: bool = False,
     return trozos, resto
 
 
-def sintetizar(frase, url, token, voz, cfg):
-    """Pide una frase y devuelve sus trozos de PCM segun llegan."""
+def sintetizar(frase, url, token, voz, cfg, ajustes=None):
+    """Pide una frase y devuelve sus trozos de PCM segun llegan.
+
+    `ajustes` es un dict con lo opcional (pasos, velocidad, semilla, sesion);
+    lo que no venga, lo decide el servicio.
+    """
+    cuerpo = {"texto": frase, "voz": voz, "cfg_scale": cfg}
+    cuerpo.update({k: v for k, v in (ajustes or {}).items() if v is not None})
     pet = urllib.request.Request(
         f"{url}/tts/stream",
         method="POST",
-        data=json.dumps({"texto": frase, "voz": voz, "cfg_scale": cfg}).encode(),
+        data=json.dumps(cuerpo).encode(),
         headers={"content-type": "application/json",
                  **({"authorization": f"Bearer {token}"} if token else {})},
     )

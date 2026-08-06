@@ -86,6 +86,17 @@ select{background:var(--f);color:var(--t);border:1px solid var(--b);
 @media (prefers-reduced-motion:reduce){.t.sint{animation:none}}
 .ley{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.8rem;font-size:.74rem;color:var(--s)}
 .ley i{font-style:normal;padding:.1rem .35rem;border-radius:3px}
+.ajustes{margin-top:.9rem;border-top:1px solid var(--b);padding-top:.7rem}
+.ajustes summary{cursor:pointer;color:var(--s);font-size:.88rem}
+.rej{display:grid;gap:.9rem;margin-top:.9rem}
+.rej label{display:grid;grid-template-columns:8rem 1fr auto;gap:.6rem;
+ align-items:center;font-size:.88rem;color:var(--s)}
+.rej b{font:600 .9rem ui-monospace,monospace;color:var(--a);
+ font-variant-numeric:tabular-nums;min-width:2.6rem;text-align:right}
+.rej i{grid-column:1/-1;font-style:normal;font-size:.75rem;color:#6b7280;margin-top:-.35rem}
+.rej input[type=range]{width:100%;accent-color:var(--a)}
+.rej select,.rej input[type=number]{background:var(--f);color:var(--t);
+ border:1px solid var(--b);border-radius:6px;padding:.35rem}
 .est{margin-top:.75rem;font-size:.88rem;color:var(--s)}
 .est.err{color:#e0725f}
 </style></head><body><main>
@@ -103,6 +114,22 @@ lo que tarda el modelo de lenguaje de lo que tarda la voz.</p></header>
       <input type="checkbox" id="pensar"> dejar que razone
     </label>
   </div>
+  <details class="ajustes"><summary>Ajustar la voz</summary>
+    <div class="rej">
+      <label>Voz <select id="voz"></select></label>
+      <label>Expresividad <input type="range" id="cfg" min="1.5" max="4.5" step="0.1" value="3.0">
+        <b id="vcfg">3.0</b>
+        <i>Más alta = dicción marcada y fiel. Medido: a 1,5 el WER es 13,6 %; a 3,0 baja a 3,6 %.</i></label>
+      <label>Velocidad <input type="range" id="vel" min="0.85" max="1.20" step="0.01" value="1.00">
+        <b id="vvel">1.00</b>
+        <i>El modelo no tiene control de ritmo: esto reproduce a otro muestreo, así que el tono sube o baja con ella.</i></label>
+      <label>Detalle <input type="range" id="pasos" min="4" max="20" step="1" value="6">
+        <b id="vpasos">6</b>
+        <i>Pasos de difusión. Medido: 6 y 8 dan el mismo RTF; 20 cuesta un 26 % más sin ganar nada audible.</i></label>
+      <label>Semilla <input type="number" id="semilla" placeholder="al azar" min="0" style="width:7rem">
+        <i>Fija, el mismo texto da siempre el mismo audio. Vacía, cada vez sale distinto.</i></label>
+    </div>
+  </details>
   <div class="hitos">
     <div class="h"><div class="n" id="h1">—</div><div class="e">1er token</div></div>
     <div class="h"><div class="n" id="h2">—</div><div class="e">1ª frase</div></div>
@@ -121,6 +148,17 @@ lo que tarda el modelo de lenguaje de lo que tarda la voz.</p></header>
 </main><script>
 const $=i=>document.getElementById(i);
 let ctx,aborto,cabeza=0;
+for(const [r,v] of [["cfg","vcfg"],["vel","vvel"],["pasos","vpasos"]]){
+  const e=$(r), o=$(v);
+  e.addEventListener("input",()=>o.textContent=
+    r==="pasos"?e.value:(+e.value).toFixed(2));
+}
+fetch("/voces").then(r=>r.json()).then(v=>{
+  // Las españolas primero: son las unicas que pronuncian bien el castellano.
+  $("voz").innerHTML=v.map(x=>`<option${x.startsWith("sp-")?"":" "}>${x}</option>`).join("");
+  const es=[...$("voz").options].find(o=>o.value.startsWith("sp-"));
+  if(es) es.selected=true;
+});
 fetch("/modelos").then(r=>r.json()).then(m=>{
   $("modelo").innerHTML=m.map((x,i)=>`<option${i===0?" selected":""}>${x}</option>`).join("");
 });
@@ -157,7 +195,10 @@ $("ir").addEventListener("click",async()=>{
   try{
     const r=await fetch("/preguntar",{method:"POST",signal:aborto.signal,
       headers:{"content-type":"application/json"},
-      body:JSON.stringify({texto:q,modelo:$("modelo").value,pensar:$("pensar").checked})});
+      body:JSON.stringify({texto:q,modelo:$("modelo").value,pensar:$("pensar").checked,
+        voz:$("voz").value, cfg:+$("cfg").value, velocidad:+$("vel").value,
+        pasos:+$("pasos").value,
+        semilla:$("semilla").value===""?null:+$("semilla").value})});
     if(!r.ok) throw new Error("HTTP "+r.status);
     const lector=r.body.getReader();
     // Marcos de [tipo:1][longitud:4 BE][carga]. Se acumula hasta tener el
@@ -237,6 +278,24 @@ class Puente(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(cuerpo)))
             self.end_headers()
             self.wfile.write(cuerpo)
+        elif self.path == "/voces":
+            # Se pregunta al sintetizador en vez de mantener una lista aqui:
+            # una copia local se queda vieja en cuanto cambian las voces.
+            try:
+                pet = urllib.request.Request(f"{CFG['voz_url']}/voces")
+                if CFG["token"]:
+                    pet.add_header("authorization", f"Bearer {CFG['token']}")
+                vs = json.load(urllib.request.urlopen(pet, timeout=5))["voces"]
+            except Exception:
+                vs = [CFG["voz"]]
+            # Espanolas delante: son las unicas que pronuncian bien el castellano.
+            vs.sort(key=lambda v: (not v.startswith("sp-"), v))
+            cuerpo = json.dumps(vs).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(cuerpo)))
+            self.end_headers()
+            self.wfile.write(cuerpo)
         elif self.path == "/modelos":
             # Los de MiniMax van primero: son los rapidos. Detras, lo que haya
             # en Ollama, que puede no estar arrancado y no debe romper la lista.
@@ -294,6 +353,9 @@ class Puente(BaseHTTPRequestHandler):
             marco(1, json.dumps(kw).encode())
 
         modelo = pet.get("modelo") or CFG["modelo"]
+        # Lo que el usuario haya movido en el panel. Lo que no venga, lo
+        # decide el servicio de voz con sus propios defectos.
+        ajustes = {k: pet.get(k) for k in ("pasos", "velocidad", "semilla")}
         # "/no_think" es un truco de qwen bajo Ollama. MiniMax manda el
         # razonamiento en bloques aparte, asi que ahi no pinta nada.
         sistema = CFG["sistema"]
@@ -383,7 +445,9 @@ class Puente(BaseHTTPRequestHandler):
                 evento(tipo="trozo", id=idx, texto=frase, pendiente=pend)
                 evento(tipo="sintetizando", id=idx, s=time.time() - t0)
                 primero = True
-                for pcm in sintetizar(frase, CFG["voz_url"], CFG["token"], CFG["voz"], CFG["cfg"]):
+                for pcm in sintetizar(frase, CFG["voz_url"], CFG["token"],
+                                      pet.get("voz") or CFG["voz"],
+                                      pet.get("cfg") or CFG["cfg"], ajustes):
                     if primero:
                         evento(tipo="sonando", id=idx, s=time.time() - t0)
                         primero = False

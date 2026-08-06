@@ -522,6 +522,7 @@ async def ciclo_vida(app: FastAPI):
     _estado["prefijos"] = {}
     ini = time.perf_counter()
     _estado["procesador"], _estado["modelo"] = cargar_modelo()
+    capturar_estados(_estado["modelo"])
 
     # Calentamiento: la primera generate() de un proceso paga asignaciones
     # unicas. Mejor pagarlas al arrancar que en la primera peticion real.
@@ -622,20 +623,136 @@ class StreamerCancelable:
         return self.interno.get_stream(0)
 
 
-def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None):
+# generate() no devuelve el estado con el que termina: reasigna `outputs` y
+# `tts_lm_outputs` en su bucle local y solo entrega el audio. Como ese estado
+# final es justo lo que hace falta para enlazar con la frase siguiente, se
+# envuelven los dos forward para quedarse con el ultimo de cada uno.
+#
+# Vale un global porque el servicio ya serializa las generaciones con un
+# cerrojo: nunca hay dos a la vez con las que confundirse.
+_ULTIMO = {}
+
+
+def capturar_estados(modelo) -> None:
+    """Envuelve forward_lm y forward_tts_lm para retener su ultima salida."""
+    if getattr(modelo, "_capturado", False):
+        return
+    for nombre in ("forward_lm", "forward_tts_lm"):
+        original = getattr(modelo, nombre, None)
+        if original is None:      # el motor de OpenVINO puede no tenerlos
+            print(f"[aviso] sin {nombre}: las sesiones quedan desactivadas")
+            return
+
+        def envuelto(*a, _o=original, _k=nombre.replace("forward_", ""), **kw):
+            salida = _o(*a, **kw)
+            _ULTIMO[_k] = salida
+            return salida
+
+        setattr(modelo, nombre, envuelto)
+    modelo._capturado = True
+
+
+# --------------------------------------------------------------------------
+# SESIONES: que una frase sepa que viene despues de otra
+#
+# Sin esto, cada peticion arranca con deepcopy(pristino): el modelo empieza
+# SIEMPRE desde el mismo estado acustico, asi que al narrar por frases suena
+# como una lista de frases sueltas y no como alguien hablando seguido.
+#
+# La caché KV si acumula lo generado, en sitio. Medido con una frase corta:
+# tts_lm 381 -> 406 posiciones, lm 130 -> 137. Lo que NO crece es
+# last_hidden_state, y generate() deduce de su longitud los input_ids falsos
+# y las mascaras de atencion. Si se reutiliza la caché crecida con el
+# last_hidden_state viejo, las longitudes no cuadran y sale ruido.
+#
+# Por eso la continuacion se fabrica: last_hidden_state pasa a tener la
+# longitud de la caché, con el estado final de verdad en la ultima posicion,
+# que es la unica que generate() lee (`last_hidden_state[..., -1, :]`).
+#
+# La rama negativa (neg_lm/neg_tts_lm) vuelve al pristino a proposito: es la
+# condicion nula del CFG, no debe arrastrar contexto.
+_SESIONES = {}
+# Tope de la caché. Al pasarse, la sesion se reinicia al pristino: se pierde
+# la continuidad pero no la voz. Recortar por delante no vale, porque lo que
+# hay al principio es justo el prefijo que DEFINE la voz.
+TOPE_CACHE = int(os.environ.get("VIBEVOICE_TOPE_CACHE", "3000"))
+CADUCIDAD_SESION = float(os.environ.get("VIBEVOICE_CADUCIDAD_SESION", "300"))
+
+
+def _largo_cache(c):
+    v = getattr(c, "key_cache", None)
+    if not v:
+        capas = getattr(c, "layers", None)
+        v = [getattr(x, "keys", None) for x in capas] if capas else None
+    return int(v[0].shape[2]) if v and v[0] is not None else 0
+
+
+def _continuacion(usado, ultimo, base):
+    """Prefijo para la SIGUIENTE frase, a partir del que se acaba de gastar."""
+    cont = {"neg_lm": copy.deepcopy(base["neg_lm"]),
+            "neg_tts_lm": copy.deepcopy(base["neg_tts_lm"])}
+    for k in ("lm", "tts_lm"):
+        cache = usado[k].past_key_values
+        largo = _largo_cache(cache)
+        if not largo or k not in ultimo:
+            return None
+        fin = ultimo[k].last_hidden_state[:, -1:, :]
+        h = torch.zeros(fin.shape[0], largo, fin.shape[2],
+                        dtype=fin.dtype, device=fin.device)
+        h[:, -1:, :] = fin
+        usado[k].last_hidden_state = h
+        cont[k] = usado[k]
+    return cont
+
+
+def _caducar_sesiones(ahora):
+    for s in [s for s, d in _SESIONES.items()
+              if ahora - d["visto"] > CADUCIDAD_SESION]:
+        _SESIONES.pop(s, None)
+
+
+def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, sesion=None,
+                pasos=None):
     """Cuerpo sincrono de la sintesis; corre en un hilo del executor."""
     procesador = _estado["procesador"]
+    # El candado ya serializa las generaciones, asi que cambiar los pasos del
+    # modelo aqui no puede pisar a otra peticion en curso.
+    if pasos is not None and pasos != _estado.get("pasos_ahora", PASOS):
+        _estado["modelo"].set_ddpm_inference_steps(pasos)
+        _estado["pasos_ahora"] = pasos
+    elif pasos is None and _estado.get("pasos_ahora", PASOS) != PASOS:
+        _estado["modelo"].set_ddpm_inference_steps(PASOS)
+        _estado["pasos_ahora"] = PASOS
     # Antes de generar, no despues: el ruido se sortea dentro de generate().
     if semilla is not None:
         torch.manual_seed(semilla)
     base = prefijo_voz(voz)
-    # deepcopy DOBLE: ni el procesador ni generate() tocan el pristino.
+
+    ahora = time.time()
+    partida, motivo = base, ""
+    if sesion:
+        _caducar_sesiones(ahora)
+        d = _SESIONES.get(sesion)
+        # Cambiar de voz a media sesion tiene que empezar de cero: la caché
+        # guardada lleva dentro el prefijo de la voz anterior.
+        if d and d["voz"] == voz:
+            if d["largo"] < TOPE_CACHE:
+                partida, motivo = d["prefijo"], f"continua ({d['largo']})"
+            else:
+                _SESIONES.pop(sesion, None)
+                motivo = f"reiniciada, tope {TOPE_CACHE}"
+
+    # deepcopy DOBLE: ni el procesador ni generate() tocan el de partida.
     entradas = procesador.process_input_with_cached_prompt(
-        text=texto, cached_prompt=copy.deepcopy(base),
+        text=texto, cached_prompt=copy.deepcopy(partida),
         padding=True, return_tensors="pt", return_attention_mask=True,
     )
     if EN_GPU:
         entradas = a_dispositivo(entradas)
+    # El que se le pasa a generate() es el que se MUTA, asi que se guarda la
+    # referencia para poder leer la caché ya crecida al terminar.
+    gastado = copy.deepcopy(partida)
+    _ULTIMO.clear()
     try:
         with torch.no_grad():
             _estado["modelo"].generate(
@@ -649,11 +766,27 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None):
                 # generate() ADEMAS acumula la sintesis entera y la concatena
                 # al final, para devolver algo que aqui se ignora.
                 return_speech=False,
-                all_prefilled_outputs=copy.deepcopy(base),
+                all_prefilled_outputs=gastado,
                 audio_streamer=streamer,
             )
+        if sesion:
+            cont = _continuacion(gastado, _ULTIMO, base)
+            if cont is not None:
+                _SESIONES[sesion] = {"prefijo": cont, "voz": voz, "visto": ahora,
+                                     "largo": _largo_cache(cont["tts_lm"].past_key_values)}
+                if motivo:
+                    print(f"[sesion {sesion}] {motivo}", flush=True)
     except GeneracionCancelada:
-        pass  # cliente desconectado: salida limpia, sin ruido en el log
+        # El cliente corto: la sesion se tira, porque el estado quedo a medias.
+        _SESIONES.pop(sesion, None)
+    except Exception:
+        # El futuro del executor no lo espera nadie, asi que sin esto un fallo
+        # aqui desaparece sin dejar rastro y el cliente recibe silencio.
+        import traceback
+        _SESIONES.pop(sesion, None)
+        print("[error] generacion fallida:", flush=True)
+        traceback.print_exc()
+        raise
     finally:
         # Pase lo que pase, cierra la cola: sin esto un fallo dentro de
         # generate() dejaria al consumidor esperando un trozo que no llega.
@@ -712,6 +845,29 @@ class PeticionTTS(BaseModel):
                                    description="fija el ruido de la difusion; "
                                                "misma semilla = mismo audio")
 
+    # Pasos del solver de difusion por latente. Medido en la VM con int8:
+    # 20 -> RTF 2,75 · 8 -> 2,18 · 6 -> 2,18 · 4 -> 2,11. Por debajo de 4 el
+    # solver multistep se degrada; por encima de 8 se paga RTF sin ganar nada
+    # audible. Por defecto manda VIBEVOICE_PASOS.
+    pasos: Optional[int] = Field(None, ge=4, le=20)
+
+    # VELOCIDAD SIN TOCAR EL MODELO
+    # VibeVoice no tiene ningun parametro de duracion ni length_scale: el ritmo
+    # sale de las 6 ventanas acusticas por cada 5 tokens de texto y no se
+    # expone. Lo que si se puede es DECLARAR otro ritmo de muestreo en la
+    # cabecera WAV: el audio no se toca, se reproduce mas o menos deprisa.
+    # Cuesta cero CPU. El precio es que el tono sube o baja con la velocidad,
+    # asi que el margen util es estrecho: a +-10% no se nota, mas alla suena a
+    # ardilla o a resaca. De ahi el rango cerrado.
+    velocidad: float = Field(1.0, ge=0.85, le=1.20)
+
+    # Frases de la misma sesion se encadenan: cada una empieza donde acabo la
+    # anterior en vez de volver al prefijo pristino. Sin sesion, se comporta
+    # igual que siempre.
+    sesion: Optional[str] = Field(None, min_length=1, max_length=64,
+                                  description="enlaza esta frase con las "
+                                              "anteriores de la misma sesion")
+
 
 @app.get("/", response_class=HTMLResponse)
 def pagina_prueba() -> HTMLResponse:
@@ -741,9 +897,20 @@ def health() -> dict:
     }
 
 
+@app.get("/voces")
+def voces(_=Depends(autorizar)):
+    """Las voces instaladas. Sin esto el cliente tiene que adivinar nombres, y
+    equivocarse solo se nota con un 404 a mitad de una peticion."""
+    return {"voces": sorted(p.stem for p in VOCES_DIR.glob("*.pt")),
+            "defecto": VOZ_DEFECTO}
+
+
 @app.post("/tts/stream")
 async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingResponse:
     prefijo_voz(pet.voz)  # valida ANTES de enviar cabeceras, para dar un 404 limpio
+    # Toda la velocidad vive aqui: se declara otro ritmo y el reproductor hace
+    # el resto. Las muestras salen intactas.
+    ritmo = int(round(RITMO * pet.velocidad))
 
     async def generador():
         # El candado se toma DENTRO del generador: si hay otra sintesis en
@@ -754,10 +921,10 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
                 None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
-                pet.semilla,
+                pet.semilla, pet.sesion, pet.pasos,
             )
             try:
-                yield cabecera_wav_flujo()
+                yield cabecera_wav_flujo(ritmo)
                 async for trozo in streamer.flujo():
                     yield a_pcm16(trozo)  # ~133 ms de audio por trozo
             finally:
@@ -776,7 +943,7 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
         headers={
             # Sin Content-Length: uvicorn usa Transfer-Encoding: chunked.
             "Cache-Control": "no-store",
-            "X-Ritmo-Hz": str(RITMO),
+            "X-Ritmo-Hz": str(ritmo),
             "X-RTF-Esperado": str(RTF_MEDIDO),
             "Content-Disposition": 'inline; filename="voz.wav"',
         },
