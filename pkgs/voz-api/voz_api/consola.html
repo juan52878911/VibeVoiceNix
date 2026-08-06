@@ -133,18 +133,22 @@
       <textarea id="s-texto">Esto no es una voz pregrabada: se está generando mientras la escuchas.</textarea>
     </div>
     <div class="fila">
-      <div><label for="s-voz">Voz</label>
-        <select id="s-voz">
-          <option value="sp-Spk1_man">Hombre</option>
-          <option value="sp-Spk0_woman">Mujer</option>
-        </select></div>
-      <div><label for="s-cfg">Expresividad</label>
-        <select id="s-cfg">
-          <option value="1.5">Suave (menos fiel)</option>
-          <option value="3.0" selected>Natural</option>
-          <option value="4.0">Muy marcada</option>
-        </select></div>
+      <div><label for="s-voz">Voz</label><select id="s-voz"></select></div>
+      <div><label for="s-cfg">Expresividad <b id="v-cfg">4.5</b></label>
+        <input type="range" id="s-cfg" min="1.5" max="4.5" step="0.1" value="4.5"></div>
     </div>
+    <div class="fila">
+      <div><label for="s-vel">Velocidad <b id="v-vel">1.00</b></label>
+        <input type="range" id="s-vel" min="0.85" max="1.20" step="0.01" value="1.00"></div>
+      <div><label for="s-pasos">Detalle <b id="v-pasos">6</b></label>
+        <input type="range" id="s-pasos" min="4" max="20" step="1" value="6"></div>
+      <div><label for="s-semilla">Semilla</label>
+        <input type="number" id="s-semilla" min="0" placeholder="al azar"></div>
+    </div>
+    <p class="nota">Expresividad alta suena más marcada pero cuesta fidelidad:
+      medido, el WER sube de 9,7 % a 16,7 % al ir de 3,0 a 4,5. La velocidad
+      estira el tiempo sin tocar el tono. Con semilla fija, el mismo texto da
+      siempre exactamente el mismo audio.</p>
     <div class="btns">
       <button id="b-str" disabled>Generar y escuchar</button>
       <button id="b-stop" class="sec" hidden>Detener</button>
@@ -200,6 +204,35 @@ async function comprobar() {
 // mientras tanto es una mala forma de esperar.
 let reintentoStream = null;
 
+// Las voces se PREGUNTAN al servicio. Antes estaban escritas a mano aqui y
+// una de ellas ni existia, asi que "Mujer" daba 404 sin que nada lo avisara.
+async function cargarVoces(defecto) {
+  const sel = $("s-voz");
+  if (sel.options.length) return;            // ya cargadas
+  try {
+    const u = new URL(location.href); u.port = "8082"; u.pathname = "/voces";
+    const d = await (await fetch(u, { signal: AbortSignal.timeout(2500) })).json();
+    // Espanolas delante: son las unicas que pronuncian bien el castellano.
+    const vs = d.voces.slice().sort((a, b) =>
+      (a.startsWith("sp-") ? 0 : 1) - (b.startsWith("sp-") ? 0 : 1) || a.localeCompare(b));
+    sel.innerHTML = vs.map(v =>
+      `<option${v === (defecto || "sp-Spk1_man") ? " selected" : ""}>${v}</option>`).join("");
+  } catch {
+    sel.innerHTML = '<option>sp-Spk1_man</option>';
+  }
+}
+
+// Los deslizadores tienen que ENSEÑAR su valor: un control sin numero al lado
+// se ajusta a ciegas.
+for (const [r, v] of [["s-cfg","v-cfg"],["s-vel","v-vel"],["s-pasos","v-pasos"]]) {
+  document.addEventListener("DOMContentLoaded", () => {
+    const e = $(r), o = $(v);
+    if (!e || !o) return;
+    e.addEventListener("input", () =>
+      o.textContent = r === "s-pasos" ? e.value : (+e.value).toFixed(2));
+  });
+}
+
 async function comprobarStream() {
   try {
     const u = new URL(location.href); u.port = "8082"; u.pathname = "/health";
@@ -208,6 +241,7 @@ async function comprobarStream() {
     pill("p-str", true, d.motor);
     $("b-str").disabled = false;
     di("e-str", `${d.motor} en ${d.dispositivo} · RTF esperado ${d.rtf_esperado}`, "ok");
+    cargarVoces(d.voz_defecto);
     if (reintentoStream) { clearInterval(reintentoStream); reintentoStream = null; }
   } catch {
     pill("p-str", false, "sin streaming");
@@ -337,7 +371,11 @@ $("b-str").addEventListener("click", async () => {
       method: "POST", signal: aborto.signal,
       headers: { "content-type": "application/json", ...cab() },
       body: JSON.stringify({ texto, voz: $("s-voz").value,
-                             cfg_scale: parseFloat($("s-cfg").value) }),
+                             cfg_scale: parseFloat($("s-cfg").value),
+                             velocidad: parseFloat($("s-vel").value),
+                             pasos: parseInt($("s-pasos").value, 10),
+                             semilla: $("s-semilla").value === ""
+                                        ? null : parseInt($("s-semilla").value, 10) }),
     });
     if (!r.ok) throw new Error(r.status === 401 ? "token inválido" : `HTTP ${r.status}`);
     ritmo = parseInt(r.headers.get("x-ritmo-hz")) || 24000;
