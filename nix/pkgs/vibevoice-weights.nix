@@ -105,10 +105,43 @@ rec {
     done
   '';
 
-  # Voces preentrenadas (.pt). Las de espanol son sp-Spk0_woman y sp-Spk1_man.
+  # Voces "experimentales" de Microsoft. NO vienen en el repo: son adjuntos de
+  # una release, que es justo lo que descarga demo/download_experimental_voices.sh.
+  # Aqui van fijadas por hash en vez de por script, para que el resultado sea
+  # reproducible y no dependa de que GitHub siga sirviendo lo mismo.
+  #
+  # Aportan 36 voces mas, y lo que importa aqui: pasan el espanol de 2 a 6.
+  vocesExperimentales = lib.mapAttrs (nombre: hash: fetchurl {
+    url = "https://github.com/user-attachments/files/${nombre}";
+    inherit hash;
+  }) {
+    "24035884/experimental_voices_sp.tar.gz" = "sha256-pxpYiELNqtCYVQ/xEQLYEeYOt1LelEjCM4DVfOM5MhU=";
+    "24189272/experimental_voices_en1.tar.gz" = "sha256-GUv9cRFwuKbH3pRuvCO9mZ9hXGBzDqGuaYnokh5gRok=";
+    "24189273/experimental_voices_en2.tar.gz" = "sha256-LgUwx1594wreVhhgO8eT/47xOXAk6gO1YWFv6QAyyjo=";
+    "24035887/experimental_voices_de.tar.gz" = "sha256-qIyJd+ML05WCTKNen+OhnCGOtrPFf4EPg2bbCSIXT6U=";
+    "24035880/experimental_voices_fr.tar.gz" = "sha256-xX+WLu79DXOy5yLzvBsK9H422TGHuNUzxLWlsO8JixU=";
+    "24035882/experimental_voices_jp.tar.gz" = "sha256-z3ZYnzD8JdtdenOgKxVfurLkieVGMDtVOflQazTKNks=";
+    "24035883/experimental_voices_kr.tar.gz" = "sha256-sO3DaEPxA0paC+XU+Q4qZTHNyz+HP0JjcQBVHFTPi3Y=";
+    "24035885/experimental_voices_pl.tar.gz" = "sha256-BzaQTBT/BPG6hk79vhJ+c0MzLYdYZTVINbCZZhlpBQ8=";
+    "24035886/experimental_voices_pt.tar.gz" = "sha256-dnCe1pjbPzn2EZeq5H4Uh4L7js6VRVGEMdE0H2ice7s=";
+  };
+
+  # Voces preentrenadas (.pt): 25 del repo mas 36 experimentales.
+  # En espanol quedan sp-Spk0_woman a sp-Spk5_man.
+  #
+  # PLANAS a proposito. Los tarballs traen un subdirectorio por idioma, pero
+  # prefijo_voz() busca con glob("*.pt") y no con rglob, asi que una voz dentro
+  # de una carpeta simplemente no existiria para el servicio.
   voces = runCommand "vibevoice-voces" { } ''
     mkdir -p "$out"
     cp -r ${repo}/demo/voices/streaming_model/. "$out/"
+    ${lib.concatMapStringsSep "\n" (t: ''
+      tar -xzf ${t} -C "$TMPDIR"
+    '') (lib.attrValues vocesExperimentales)}
+    find "$TMPDIR" -name '*.pt' -exec cp -n {} "$out/" \;
+    # Sin espanol el stack no sirve para lo que se usa: mejor fallar al construir
+    # que descubrirlo con un 404 en produccion.
+    test "$(ls "$out"/sp-*.pt | wc -l)" -ge 6
   '';
 
   # CLI propia, en pkgs/vibevoice-cli/. Antes se parcheaba el demo de Microsoft
