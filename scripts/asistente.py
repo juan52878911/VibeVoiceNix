@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Asistente de voz: pregunta -> Ollama -> voz, narrando segun escribe.
+"""Asistente de voz: pregunta -> LLM -> voz, narrando segun escribe.
 
     python scripts/asistente.py "¿que tal va el despliegue?"
     python scripts/asistente.py --modelo qwen3:4b --salida respuesta.wav "..."
@@ -72,17 +72,80 @@ def preguntar_a_ollama(pregunta, modelo, url, sistema=None):
             break
 
 
+# MiniMax sirve un endpoint compatible con la API de Anthropic. Se reutiliza
+# la credencial que opencode ya tiene guardada: asi no hay una segunda copia
+# del secreto rondando por el repo ni por el entorno.
+MINIMAX_API = "https://api.minimax.io/anthropic/v1/messages"
+AUTH_OPENCODE = os.path.expanduser("~/.local/share/opencode/auth.json")
+
+
+def clave_minimax():
+    """La clave, del entorno o de opencode. Nunca se imprime."""
+    k = os.environ.get("MINIMAX_API_KEY")
+    if k:
+        return k
+    try:
+        with open(AUTH_OPENCODE) as f:
+            return json.load(f)["minimax-coding-plan"]["key"]
+    except (OSError, KeyError, ValueError):
+        raise RuntimeError(
+            "sin credencial de MiniMax: exporta MINIMAX_API_KEY o autentica "
+            "el proveedor 'minimax-coding-plan' en opencode")
+
+
+def preguntar_a_minimax(pregunta, modelo, sistema=None, maximo=1024):
+    """Igual que la de Ollama, pero contra MiniMax. Devuelve trozos de texto.
+
+    El razonamiento aqui NO hay que filtrarlo con expresiones regulares: la API
+    lo manda en bloques `thinking_delta` aparte del texto, asi que basta con
+    ignorarlos. Es mas fiable que buscar <think> dentro del flujo.
+    """
+    cuerpo = {"model": modelo, "max_tokens": maximo, "stream": True,
+              "messages": [{"role": "user", "content": pregunta}]}
+    if sistema:
+        cuerpo["system"] = sistema
+    pet = urllib.request.Request(MINIMAX_API, method="POST",
+                                 data=json.dumps(cuerpo).encode(),
+                                 headers={"content-type": "application/json",
+                                          "anthropic-version": "2023-06-01",
+                                          "x-api-key": clave_minimax()})
+    r = urllib.request.urlopen(pet, timeout=300)
+    for linea in r:
+        linea = linea.strip()
+        if not linea.startswith(b"data:"):
+            continue
+        try:
+            d = json.loads(linea[5:])
+        except ValueError:
+            continue
+        if d.get("type") == "content_block_delta":
+            delta = d.get("delta") or {}
+            if delta.get("type") == "text_delta" and delta.get("text"):
+                yield delta["text"]
+        elif d.get("type") == "message_stop":
+            break
+
+
+def preguntar(pregunta, modelo, url, sistema=None):
+    """Elige el proveedor por el nombre del modelo. Los de MiniMax empiezan
+    por 'MiniMax-'; cualquier otra cosa se le pide a Ollama."""
+    if modelo.lower().startswith("minimax"):
+        return preguntar_a_minimax(pregunta, modelo, sistema)
+    return preguntar_a_ollama(pregunta, modelo, url, sistema)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pregunta", nargs="+")
-    ap.add_argument("--modelo", default=os.environ.get("OLLAMA_MODELO", "qwen3:4b"))
+    ap.add_argument("--modelo", default=os.environ.get("ASISTENTE_MODELO", "MiniMax-M3"),
+                    help="MiniMax-M3 (por defecto) o cualquier modelo de Ollama")
     ap.add_argument("--ollama", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
     ap.add_argument("--url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
-    ap.add_argument("--cfg", type=float, default=3.0,
-                    help="guia CFG; 3.0 medido como el mas fiel")
+    ap.add_argument("--cfg", type=float, default=4.5,
+                    help="guia CFG. 4.5 suena mas marcado y es el defecto por\n                         gusto, pero CUESTA fidelidad: medido sobre 6 clips,\n                         WER medio 9,7 % a 3.0 frente a 16,7 % a 4.5, y el\n                         peor caso de 11,1 % a 33,3 %")
     ap.add_argument("--arranque", type=int, default=25,
                     help="caracteres minimos de la PRIMERA frase antes de hablar "
                          "(menos = responde antes, peor entonada)")
@@ -100,7 +163,7 @@ def main():
 
     def productor():
         pendiente, dentro_pensamiento, n_frases = "", False, 0
-        for trozo in preguntar_a_ollama(pregunta, a.modelo, a.ollama, a.sistema):
+        for trozo in preguntar(pregunta, a.modelo, a.ollama, a.sistema):
             hitos.setdefault("primer_token", time.time() - t0)
             # El bloque de razonamiento puede abrirse y cerrarse a mitad de un
             # trozo, asi que se procesa caracter a caracter y no de golpe.

@@ -6,8 +6,12 @@
 
 Hace de puente entre tres cosas que ya funcionan por separado:
 
-    navegador  ->  este puente  ->  Ollama        (el texto)
-                                ->  voz-stream    (la voz)
+    navegador  ->  este puente  ->  MiniMax u Ollama  (el texto)
+                                ->  voz-stream        (la voz)
+
+El proveedor se elige por el nombre del modelo: los 'MiniMax-*' van a la
+suscripcion (mas rapidos y mas capaces), el resto a Ollama en local. La
+credencial se reutiliza de opencode; no hay copia en el repo.
 
 POR QUE UN PUENTE Y NO LLAMAR DESDE EL NAVEGADOR
 Porque el navegador tendria que hacer dos cosas que no sabe hacer bien: trocear
@@ -33,9 +37,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from narrador import RITMO, sintetizar, trocear  # noqa: E402
-from asistente import ABRE_PENSAMIENTO, CIERRA_PENSAMIENTO, limpiar, preguntar_a_ollama  # noqa: E402
+from asistente import ABRE_PENSAMIENTO, CIERRA_PENSAMIENTO, limpiar, preguntar  # noqa: E402
 
 CFG = {}
+
+# Los que sirve la suscripcion de MiniMax. M3 primero: es el mas capaz y el
+# que se usa por defecto. Los "highspeed" responden antes a cambio de calidad.
+MINIMAX_MODELOS = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed",
+                   "MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
 
 PAGINA = """<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -77,6 +86,17 @@ select{background:var(--f);color:var(--t);border:1px solid var(--b);
 @media (prefers-reduced-motion:reduce){.t.sint{animation:none}}
 .ley{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.8rem;font-size:.74rem;color:var(--s)}
 .ley i{font-style:normal;padding:.1rem .35rem;border-radius:3px}
+.ajustes{margin-top:.9rem;border-top:1px solid var(--b);padding-top:.7rem}
+.ajustes summary{cursor:pointer;color:var(--s);font-size:.88rem}
+.rej{display:grid;gap:.9rem;margin-top:.9rem}
+.rej label{display:grid;grid-template-columns:8rem 1fr auto;gap:.6rem;
+ align-items:center;font-size:.88rem;color:var(--s)}
+.rej b{font:600 .9rem ui-monospace,monospace;color:var(--a);
+ font-variant-numeric:tabular-nums;min-width:2.6rem;text-align:right}
+.rej i{grid-column:1/-1;font-style:normal;font-size:.75rem;color:#6b7280;margin-top:-.35rem}
+.rej input[type=range]{width:100%;accent-color:var(--a)}
+.rej select,.rej input[type=number]{background:var(--f);color:var(--t);
+ border:1px solid var(--b);border-radius:6px;padding:.35rem}
 .est{margin-top:.75rem;font-size:.88rem;color:var(--s)}
 .est.err{color:#e0725f}
 </style></head><body><main>
@@ -94,6 +114,22 @@ lo que tarda el modelo de lenguaje de lo que tarda la voz.</p></header>
       <input type="checkbox" id="pensar"> dejar que razone
     </label>
   </div>
+  <details class="ajustes"><summary>Ajustar la voz</summary>
+    <div class="rej">
+      <label>Voz <select id="voz"></select></label>
+      <label>Expresividad <input type="range" id="cfg" min="1.5" max="4.5" step="0.1" value="4.5">
+        <b id="vcfg">4.5</b>
+        <i>Más alta suena más marcada, pero pasado 3,0 empieza a costar fidelidad: medido, el WER sube de 9,7 % a 16,7 % al ir de 3,0 a 4,5.</i></label>
+      <label>Velocidad <input type="range" id="vel" min="0.85" max="1.20" step="0.01" value="1.00">
+        <b id="vvel">1.00</b>
+        <i>El modelo no tiene control de ritmo: esto reproduce a otro muestreo, así que el tono sube o baja con ella.</i></label>
+      <label>Detalle <input type="range" id="pasos" min="4" max="20" step="1" value="6">
+        <b id="vpasos">6</b>
+        <i>Pasos de difusión. Medido: 6 y 8 dan el mismo RTF; 20 cuesta un 26 % más sin ganar nada audible.</i></label>
+      <label>Semilla <input type="number" id="semilla" placeholder="al azar" min="0" style="width:7rem">
+        <i>Fija, el mismo texto da siempre el mismo audio. Vacía, cada vez sale distinto.</i></label>
+    </div>
+  </details>
   <div class="hitos">
     <div class="h"><div class="n" id="h1">—</div><div class="e">1er token</div></div>
     <div class="h"><div class="n" id="h2">—</div><div class="e">1ª frase</div></div>
@@ -112,8 +148,19 @@ lo que tarda el modelo de lenguaje de lo que tarda la voz.</p></header>
 </main><script>
 const $=i=>document.getElementById(i);
 let ctx,aborto,cabeza=0;
+for(const [r,v] of [["cfg","vcfg"],["vel","vvel"],["pasos","vpasos"]]){
+  const e=$(r), o=$(v);
+  e.addEventListener("input",()=>o.textContent=
+    r==="pasos"?e.value:(+e.value).toFixed(2));
+}
+fetch("/voces").then(r=>r.json()).then(v=>{
+  // Las españolas primero: son las unicas que pronuncian bien el castellano.
+  $("voz").innerHTML=v.map(x=>`<option${x.startsWith("sp-")?"":" "}>${x}</option>`).join("");
+  const es=[...$("voz").options].find(o=>o.value.startsWith("sp-"));
+  if(es) es.selected=true;
+});
 fetch("/modelos").then(r=>r.json()).then(m=>{
-  $("modelo").innerHTML=m.map(x=>`<option${x==="qwen3:1.7b"?" selected":""}>${x}</option>`).join("");
+  $("modelo").innerHTML=m.map((x,i)=>`<option${i===0?" selected":""}>${x}</option>`).join("");
 });
 function di(t,e){$("est").className="est"+(e?" err":"");$("est").textContent=t}
 
@@ -148,7 +195,10 @@ $("ir").addEventListener("click",async()=>{
   try{
     const r=await fetch("/preguntar",{method:"POST",signal:aborto.signal,
       headers:{"content-type":"application/json"},
-      body:JSON.stringify({texto:q,modelo:$("modelo").value,pensar:$("pensar").checked})});
+      body:JSON.stringify({texto:q,modelo:$("modelo").value,pensar:$("pensar").checked,
+        voz:$("voz").value, cfg:+$("cfg").value, velocidad:+$("vel").value,
+        pasos:+$("pasos").value,
+        semilla:$("semilla").value===""?null:+$("semilla").value})});
     if(!r.ok) throw new Error("HTTP "+r.status);
     const lector=r.body.getReader();
     // Marcos de [tipo:1][longitud:4 BE][carga]. Se acumula hasta tener el
@@ -228,12 +278,35 @@ class Puente(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(cuerpo)))
             self.end_headers()
             self.wfile.write(cuerpo)
+        elif self.path == "/voces":
+            # Se pregunta al sintetizador en vez de mantener una lista aqui:
+            # una copia local se queda vieja en cuanto cambian las voces.
+            try:
+                pet = urllib.request.Request(f"{CFG['voz_url']}/voces")
+                if CFG["token"]:
+                    pet.add_header("authorization", f"Bearer {CFG['token']}")
+                vs = json.load(urllib.request.urlopen(pet, timeout=5))["voces"]
+            except Exception:
+                vs = [CFG["voz"]]
+            # Espanolas delante: son las unicas que pronuncian bien el castellano.
+            vs.sort(key=lambda v: (not v.startswith("sp-"), v))
+            cuerpo = json.dumps(vs).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(cuerpo)))
+            self.end_headers()
+            self.wfile.write(cuerpo)
         elif self.path == "/modelos":
+            # Los de MiniMax van primero: son los rapidos. Detras, lo que haya
+            # en Ollama, que puede no estar arrancado y no debe romper la lista.
+            ms = list(MINIMAX_MODELOS)
             try:
                 d = json.load(urllib.request.urlopen(f"{CFG['ollama']}/api/tags", timeout=5))
-                ms = sorted(m["name"] for m in d.get("models", []))
+                ms += sorted(m["name"] for m in d.get("models", []))
             except Exception:
-                ms = [CFG["modelo"]]
+                pass
+            if CFG["modelo"] not in ms:
+                ms.insert(0, CFG["modelo"])
             cuerpo = json.dumps(ms).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
@@ -279,8 +352,24 @@ class Puente(BaseHTTPRequestHandler):
         def evento(**kw):
             marco(1, json.dumps(kw).encode())
 
-        sistema = CFG["sistema"] if pet.get("pensar") else CFG["sistema"] + " /no_think"
-        cola, pendiente, n_frases, dentro = queue.Queue(maxsize=64), "", 0, False
+        modelo = pet.get("modelo") or CFG["modelo"]
+        # Lo que el usuario haya movido en el panel. Lo que no venga, lo
+        # decide el servicio de voz con sus propios defectos.
+        ajustes = {k: pet.get(k) for k in ("pasos", "velocidad", "semilla")}
+        # "/no_think" es un truco de qwen bajo Ollama. MiniMax manda el
+        # razonamiento en bloques aparte, asi que ahi no pinta nada.
+        sistema = CFG["sistema"]
+        if not pet.get("pensar") and not modelo.lower().startswith("minimax"):
+            sistema += " /no_think"
+        # DOS colas y no una. Con una sola, el bucle principal se queda 4 s
+        # bloqueado sintetizando un trozo y durante ese rato no lee nada, asi
+        # que los tokens que el LLM va escribiendo se acumulan y salen de
+        # golpe al terminar: en pantalla el texto dejaba de fluir despues del
+        # primer trozo. Separadas, los tokens se drenan ENTRE los fotogramas
+        # de audio y el redactado se ve siempre en vivo.
+        cola_texto = queue.Queue()          # tokens y estado: se drena siempre
+        cola_trozos = queue.Queue(maxsize=64)   # lo que hay que sintetizar
+        pendiente, n_frases, dentro = "", 0, False
 
         # El productor manda SIEMPRE el pendiente que queda tras extraer un
         # trozo, en vez de que la pagina intente descontarlo por su cuenta.
@@ -289,8 +378,7 @@ class Puente(BaseHTTPRequestHandler):
         def productor():
             nonlocal pendiente, n_frases, dentro
             try:
-                for trozo in preguntar_a_ollama(pet["texto"], pet.get("modelo") or CFG["modelo"],
-                                                CFG["ollama"], sistema):
+                for trozo in preguntar(pet["texto"], modelo, CFG["ollama"], sistema):
                     texto = ""
                     for parte in re.split(r"(<[^>]{0,20}>)", trozo):
                         if ABRE_PENSAMIENTO.fullmatch(parte or ""):
@@ -304,52 +392,69 @@ class Puente(BaseHTTPRequestHandler):
                     pendiente += limpiar(texto)
                     frases, pendiente = trocear(pendiente, primera=n_frases == 0,
                                                 minimo_primera=CFG["arranque"])
-                    cola.put(("token", time.time() - t0, texto, pendiente))
+                    cola_texto.put(("token", time.time() - t0, texto, pendiente))
                     for f in frases:
-                        cola.put(("frase", time.time() - t0, (n_frases, f), pendiente))
+                        cola_trozos.put(("frase", time.time() - t0, (n_frases, f), pendiente))
                         n_frases += 1
                 frases, pendiente = trocear(pendiente, forzar_final=True,
                                             primera=n_frases == 0,
                                             minimo_primera=CFG["arranque"])
                 for f in frases:
-                    cola.put(("frase", time.time() - t0, (n_frases, f), pendiente))
+                    cola_trozos.put(("frase", time.time() - t0, (n_frases, f), pendiente))
                     n_frases += 1
             except Exception as e:
-                cola.put(("error", 0, f"{type(e).__name__}: {e}", ""))
-            cola.put(None)
+                cola_trozos.put(("error", 0, f"{type(e).__name__}: {e}", ""))
+            cola_trozos.put(None)
 
         threading.Thread(target=productor, daemon=True).start()
         visto = set()
+
+        def drenar_texto():
+            """Saca los tokens pendientes sin bloquear. Se llama entre
+            fotogramas de audio para que el redactado no se congele mientras
+            se sintetiza."""
+            while True:
+                try:
+                    _, s_t, texto, pend = cola_texto.get_nowait()
+                except queue.Empty:
+                    return
+                if "token" not in visto:
+                    visto.add("token"); evento(tipo="hito", hito="token", s=s_t)
+                evento(tipo="token", texto=texto, pendiente=pend)
+
         try:
             while True:
-                item = cola.get()
+                # Esperar un trozo SIN dejar de atender los tokens.
+                item = None
+                while item is None:
+                    drenar_texto()
+                    try:
+                        item = cola_trozos.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    break
                 if item is None:
                     break
                 clase, s_t, dato, pend = item
                 if clase == "error":
                     evento(tipo="error", texto=dato)
                     break
-                if clase == "token":
-                    if "token" not in visto:
-                        visto.add("token"); evento(tipo="hito", hito="token", s=s_t)
-                    evento(tipo="token", texto=dato, pendiente=pend)
-                    continue
                 idx, frase = dato
                 if "frase" not in visto:
                     visto.add("frase"); evento(tipo="hito", hito="frase", s=s_t)
-                # 1) el trozo existe: ya esta segmentado
                 evento(tipo="trozo", id=idx, texto=frase, pendiente=pend)
-                # 2) entra en el sintetizador
                 evento(tipo="sintetizando", id=idx, s=time.time() - t0)
                 primero = True
-                for pcm in sintetizar(frase, CFG["voz_url"], CFG["token"], CFG["voz"], CFG["cfg"]):
+                for pcm in sintetizar(frase, CFG["voz_url"], CFG["token"],
+                                      pet.get("voz") or CFG["voz"],
+                                      pet.get("cfg") or CFG["cfg"], ajustes):
                     if primero:
-                        # 3) ya suena: este es el instante que percibe el usuario
                         evento(tipo="sonando", id=idx, s=time.time() - t0)
                         primero = False
                     marco(0, pcm)
-                # 4) trozo terminado
+                    drenar_texto()      # <- lo que arregla el congelado
                 evento(tipo="hecho", id=idx, s=time.time() - t0)
+            drenar_texto()
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -357,13 +462,14 @@ class Puente(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--puerto", type=int, default=8090)
-    ap.add_argument("--modelo", default=os.environ.get("OLLAMA_MODELO", "qwen3:1.7b"))
+    ap.add_argument("--modelo", default=os.environ.get("ASISTENTE_MODELO", "MiniMax-M3"),
+                    help="MiniMax-M3 (por defecto) o cualquier modelo de Ollama")
     ap.add_argument("--ollama", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
     ap.add_argument("--voz-url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
-    ap.add_argument("--cfg", type=float, default=3.0,
-                    help="guia CFG; 3.0 medido como el mas fiel")
+    ap.add_argument("--cfg", type=float, default=4.5,
+                    help="guia CFG. 4.5 suena mas marcado y es el defecto por\n                         gusto, pero CUESTA fidelidad: medido sobre 6 clips,\n                         WER medio 9,7 % a 3.0 frente a 16,7 % a 4.5, y el\n                         peor caso de 11,1 % a 33,3 %")
     ap.add_argument("--arranque", type=int, default=15)
     ap.add_argument("--sistema", default="Responde en español, breve y natural, "
                                          "en frases cortas. Sin listas ni markdown.")
@@ -371,7 +477,8 @@ def main():
     CFG.update(modelo=a.modelo, ollama=a.ollama, voz_url=a.voz_url, token=a.token,
                voz=a.voz, arranque=a.arranque, sistema=a.sistema, cfg=a.cfg)
     print(f"asistente en http://127.0.0.1:{a.puerto}")
-    print(f"  LLM : {a.ollama} ({a.modelo})")
+    print(f"  LLM : {a.modelo}"
+          f"{'' if a.modelo.lower().startswith('minimax') else ' via ' + a.ollama}")
     print(f"  voz : {a.voz_url}")
     ThreadingHTTPServer(("127.0.0.1", a.puerto), Puente).serve_forever()
 

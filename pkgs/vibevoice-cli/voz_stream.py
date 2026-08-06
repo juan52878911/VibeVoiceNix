@@ -6,6 +6,31 @@ El cliente empieza a oír ~0,2 s después de pedirlo, mientras el resto se
 genera. Verificado: los trozos emitidos son bit a bit identicos al audio
 completo (mismo md5 que la generacion no-streaming).
 
+Y para narrar algo que aun se esta escribiendo -- la salida de un LLM, por
+ejemplo -- hay ademas SESIONES, que son una sola locucion continua a la que se
+le va metiendo texto:
+
+    POST /tts/sesion/{id}        {"texto": "..."}    encola texto
+    GET  /tts/sesion/{id}/audio                      un WAV, toda la locucion
+    POST /tts/sesion/{id}/fin                        cierra la locucion
+
+y la MISMA sesion por websocket, en una sola conexion bidireccional:
+
+    WS   /tts/sesion/ws                              texto JSON -> marcos PCM
+
+Los dos caminos comparten SesionViva entera, asi que dan el MISMO audio (se
+comprueba por md5, ver el bloque WEBSOCKET mas abajo). El HTTP se queda porque
+es lo que esta en produccion y lo que se puede probar con curl; el websocket
+existe porque la interaccion es de ida y vuelta y de larga duracion -- se mete
+texto mientras sale audio -- y partirla en peticiones sueltas es justo lo que
+obliga a reabrir contexto una y otra vez.
+
+Frase a frase con /tts/stream, cada una empieza desde cero y suena a lista de
+frases sueltas. En una sesion el modelo no deja de hablar entre frases. Y no es
+"parecido" a pasar todo el texto de golpe: es EL MISMO AUDIO, byte a byte
+(medido con 6 semillas, ver scripts/sesiones_fidelidad.py). El bloque SESIONES,
+mas abajo, explica como y que se probo antes.
+
 Medido en la VM: primer sonido 23,21 s -> 0,20 s. El tiempo TOTAL no cambia
 (22,4 s frente a 23,2), pero la espera percibida se divide por 116.
 
@@ -35,21 +60,32 @@ Configuracion por entorno, igual que el resto del stack:
 """
 
 import asyncio
+import contextlib
 import copy
 import ctypes
 import gc
+import json
 import os
 import platform
+import secrets
 import sys
 import struct
+import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from estirar import estirar  # noqa: E402
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import (
+    Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -120,6 +156,43 @@ _estado: dict = {}
 # Un candado: UNA generacion a la vez. El modelo ya satura los 6 nucleos, asi
 # que dos en paralelo solo harian ambas mas lentas.
 _candado = asyncio.Lock()
+# Y este, ademas, porque las sesiones generan desde su PROPIO hilo, que no pasa
+# por el candado asincrono de /tts/stream. No es solo cuestion de rendimiento:
+# el planificador de difusion es un objeto COMPARTIDO del modelo
+# (model.noise_scheduler) con estado interno por solve -- step_index,
+# model_outputs --, asi que dos generaciones a la vez se corrompen la una a la
+# otra. Sin sesiones vivas nadie lo disputa y tomarlo cuesta nanosegundos.
+#
+# LO QUE ESTE CANDADO NO CUBRE POR SI SOLO: DOS SESIONES VIVAS A LA VEZ
+# Una sesion SUELTA el candado mientras espera texto (TextoEnCurso._esperar),
+# que es lo correcto -- callada no debe secuestrar la CPU de nadie --, pero
+# significa que otra puede colarse EN MITAD de su locucion. Y la que entra hace
+# torch.manual_seed() y consume el RNG GLOBAL, asi que la primera reanudaba con
+# otro ruido del que le tocaba.
+#
+# MEDIDO ANTES DEL ARREGLO, mismas 2 frases y misma semilla (11), alimentando
+# frase a frase y esperando la pausa entre ellas:
+#   una sola sesion         4,00 s  md5 34b42c3e...
+#   dos a la vez, la 1a     4,00 s  md5 34b42c3e...   (igual)
+#   dos a la vez, la 2a     4,00 s  md5 b0bfd38b...   (DISTINTO)
+# Daba igual el transporte -- HTTP y websocket comparten el codigo de sesion --
+# y alimentando de golpe no pasaba: sin pausa nadie suelta el candado a mitad.
+#
+# No era corrupcion -- el audio sonaba bien --, pero dejaba de cumplirse "misma
+# semilla = mismo audio", que es justo lo que promete el campo `semilla`.
+#
+# EL ARREGLO: CADA SESION SE LLEVA SU RNG PUESTO
+# SesionViva._pausar/_reanudar fotografian el RNG global antes de soltar el
+# candado y lo reponen despues de recuperarlo, de modo que cada sesion tiene su
+# PROPIO hilo de ruido aunque el generador sea un objeto compartido. Alli esta
+# el detalle de por que asi y no pasando un torch.Generator al modelo.
+#
+# El noise_scheduler, en cambio, no necesita nada: sample_speech_tokens() lo
+# reinicia con set_timesteps() al empezar cada latente y no suelta el candado en
+# medio, asi que su estado por solve -- step_index, model_outputs -- nunca cruza
+# una pausa. Lo que si sigue haciendo falta es el candado: dos generaciones A LA
+# VEZ si se lo corromperian.
+_candado_modelo = threading.Lock()
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -552,6 +625,9 @@ async def ciclo_vida(app: FastAPI):
         flush=True,
     )
     yield
+    for s in list(_SESIONES.values()):
+        s.cerrar()
+    _SESIONES.clear()
     _estado.clear()
 
 
@@ -608,54 +684,692 @@ class StreamerCancelable:
         from vibevoice.modular import AsyncAudioStreamer
         self.interno = AsyncAudioStreamer(batch_size=1, stop_signal=None)
         self.cancelado = False
+        # generate() ya cerro el flujo por su cuenta. Lo que llegue despues
+        # sobra, pero NO es que el cliente se haya ido.
+        self.terminado = False
 
     def put(self, trozos, indices):
-        if self.cancelado:
+        # Solo aborta si el que se fue es el CLIENTE.
+        #
+        # Cuando el clasificador predice EOS a mitad de una ventana acustica,
+        # generate() llama a end() pero NO sale del bucle de 6 latentes: sigue
+        # llamando a put() con los que quedan. Para entonces el consumidor ya
+        # vio el fin del flujo y su `finally` puso cancelado=True, asi que
+        # abortabamos la generacion en las ultimas milesimas -- justo antes de
+        # guardar el estado de la sesion, que por eso nunca se guardaba.
+        #
+        # Solo se salvaba el caso de que el numero de latentes fuera multiplo
+        # de 6, que es 1 de cada 6. De ahi que pareciera aleatorio.
+        if self.cancelado and not self.terminado:
             raise GeneracionCancelada()
         self.interno.put(trozos, indices)
 
     def end(self, indices=None):
+        self.terminado = True
         self.interno.end(indices)
 
     def flujo(self):
         return self.interno.get_stream(0)
 
 
-def _sintetizar(texto, voz, cfg_scale, streamer):
+def _ajustar_pasos(pasos: Optional[int]) -> None:
+    """Fija los pasos de difusion del modelo. Solo con el candado del modelo
+    tomado: es estado GLOBAL del modelo, no un parametro de la llamada."""
+    quiere = PASOS if pasos is None else pasos
+    if quiere != _estado.get("pasos_ahora", PASOS):
+        _estado["modelo"].set_ddpm_inference_steps(quiere)
+    _estado["pasos_ahora"] = quiere
+
+
+def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
     """Cuerpo sincrono de la sintesis; corre en un hilo del executor."""
     procesador = _estado["procesador"]
-    base = prefijo_voz(voz)
-    # deepcopy DOBLE: ni el procesador ni generate() tocan el pristino.
-    entradas = procesador.process_input_with_cached_prompt(
-        text=texto, cached_prompt=copy.deepcopy(base),
-        padding=True, return_tensors="pt", return_attention_mask=True,
-    )
-    if EN_GPU:
-        entradas = a_dispositivo(entradas)
     try:
-        with torch.no_grad():
-            _estado["modelo"].generate(
-                **entradas,
-                max_new_tokens=None,
-                cfg_scale=cfg_scale,
-                tokenizer=procesador.tokenizer,
-                generation_config={"do_sample": False},
-                verbose=False,
-                # El streamer ya entrega cada trozo segun sale; sin esto
-                # generate() ADEMAS acumula la sintesis entera y la concatena
-                # al final, para devolver algo que aqui se ignora.
-                return_speech=False,
-                all_prefilled_outputs=copy.deepcopy(base),
-                audio_streamer=streamer,
+        with _candado_modelo:
+            _ajustar_pasos(pasos)
+            # Antes de generar, no despues: el ruido se sortea dentro de
+            # generate().
+            if semilla is not None:
+                torch.manual_seed(semilla)
+            base = prefijo_voz(voz)
+            # deepcopy DOBLE: ni el procesador ni generate() tocan el pristino.
+            entradas = procesador.process_input_with_cached_prompt(
+                text=texto, cached_prompt=copy.deepcopy(base),
+                padding=True, return_tensors="pt", return_attention_mask=True,
             )
+            if EN_GPU:
+                entradas = a_dispositivo(entradas)
+            with torch.no_grad():
+                _estado["modelo"].generate(
+                    **entradas,
+                    max_new_tokens=None,
+                    cfg_scale=cfg_scale,
+                    tokenizer=procesador.tokenizer,
+                    generation_config={"do_sample": False},
+                    verbose=False,
+                    # El streamer ya entrega cada trozo segun sale; sin esto
+                    # generate() ADEMAS acumula la sintesis entera y la
+                    # concatena al final, para devolver algo que aqui se ignora.
+                    return_speech=False,
+                    all_prefilled_outputs=copy.deepcopy(base),
+                    audio_streamer=streamer,
+                )
     except GeneracionCancelada:
-        pass  # cliente desconectado: salida limpia, sin ruido en el log
+        # Se avisa: cuando esto salta por error, callarlo cuesta horas.
+        print("[aviso] generacion cancelada por el cliente", flush=True)
+    except Exception:
+        # El futuro del executor no lo espera nadie, asi que sin esto un fallo
+        # aqui desaparece sin dejar rastro y el cliente recibe silencio.
+        import traceback
+        print("[error] generacion fallida:", flush=True)
+        traceback.print_exc()
+        raise
     finally:
         # Pase lo que pase, cierra la cola: sin esto un fallo dentro de
         # generate() dejaria al consumidor esperando un trozo que no llega.
         # end() es idempotente.
         if streamer is not None:
             streamer.end()
+
+
+# --------------------------------------------------------------------------
+# SESIONES: UNA generate() VIVA por sesion, alimentada con texto segun llega
+#
+# EL PROBLEMA
+# Sin esto, cada peticion arranca con deepcopy(pristino): el modelo empieza
+# SIEMPRE desde el mismo estado acustico, asi que al narrar por frases suena
+# como una lista de frases sueltas y no como alguien hablando seguido.
+#
+# LO QUE SE PROBO ANTES Y NO FUNCIONA: TRASPLANTAR LA CACHÉ KV
+# Guardar el estado al final de una llamada y arrancar la siguiente desde ahi.
+# La maquinaria era fiel -- recortar la caché a k posiciones daba exactamente el
+# mismo audio que haber parado la generacion en el latente k --, pero el estado
+# transportado era el equivocado. Cada llamada termina cuando el clasificador de
+# EOS dice que la locucion se acabo, asi que lo que se guardaba era el estado de
+# "ya he terminado de hablar". Al reanudar desde ahi con texto nuevo, el modelo
+# vuelve a disparar EOS en la primera ventana: la frase sale MUDA y su texto,
+# que quedo pendiente, se cuela al principio de la SIGUIENTE. De ahi
+# transcripciones como "El tren llega a Manana por la tarde y vemos al parque".
+#
+# Medido entonces con 6 frases x 4 semillas, voz sp-Spk3_man, 6 pasos, cfg 1,5:
+#
+#                                   WER    no dicho   frases mudas
+#   sueltas                        25,0 %    21,5 %       0 / 24
+#   encadenadas (trasplante)       50,5 %    42,5 %       7 / 24
+#   ... recortando la cola muda    62,5 %    56,5 %       7 / 24
+#   ... recortando 6 latentes mas  54,7 %    28,0 %       1 / 18
+#
+# Ninguno de los dos arreglos vale: el segundo quita las frases mudas pero
+# entonces REPITE el final de la anterior. Y las dos sospechas que habia estan
+# descartadas por experimento: ni el last_hidden_state fabricado se lee (audio
+# identico bit a bit rellenandolo de ruido), ni la rama negativa es la culpable
+# (con cfg_scale=1,0 no interviene y encadenar sigue destrozando el audio).
+#
+# LO QUE SI FUNCIONA
+# generate() YA sabe encadenar: consume `tts_text_ids` en ventanas de 5 tokens
+# intercaladas con 6 latentes acusticos, y con varias frases en UNA sola llamada
+# el audio sale perfecto. Nunca dispara EOS a mitad porque EL TEXTO LE LLEGA POR
+# DELANTE DEL HABLA. Asi que en vez de partir la generacion en trozos, se deja
+# UNA sola viva en su hilo y se le va metiendo texto por debajo.
+#
+# El unico obstaculo era que `tts_text_ids` es un tensor fijo. Resulta que
+# generate() lo toca en tres sitios y nada mas -- .to(), .shape[1] y dos cortes
+# [:, a:b] --, asi que basta con pasarle un objeto que se haga pasar por tensor
+# y que RELEA su contenido en cada vuelta: TextoEnCurso. No hay que parchear ni
+# una linea de Microsoft, ni reimplementar el bucle.
+#
+# Y como la pausa no cambia ningun calculo -- el estado se queda quieto mientras
+# el hilo espera --, alimentar por trozos da EXACTAMENTE el mismo audio que
+# haber pasado todo el texto de golpe. Eso no hay que creerselo, se comprueba
+# por md5 (scripts/sesiones_fidelidad.py).
+#
+# MEDIDO ASI, con 6 frases x 6 semillas (11, 7, 3, 23, 42, 101), voz
+# sp-Spk3_man, 6 pasos, cfg 1,5, transcrito con whisper.cpp. "sesion" alimenta
+# frase a frase esperando a que el modelo se quede PARADO sin texto antes de
+# meter la siguiente, que es el caso dificil:
+#
+#                        WER    peor    mudas    repiten
+#   sueltas             0,8 %  16,7 %   0 / 36      0
+#   junta (1 llamada)   2,8 %  50,0 %   0 / 36      0
+#   sesion de golpe     2,8 %  50,0 %   0 / 36      0
+#   sesion frase a frase 2,8 % 50,0 %   0 / 36      0
+#
+#   audio identico bit a bit a 'junta': 6/6 semillas, en los dos modos de sesion
+#
+# Las tres ultimas filas son la MISMA fila: no es que se parezcan, es que el
+# audio es el mismo. Encadenar cuesta 2 puntos de WER frente a decir las frases
+# sueltas -- el peor caso es un "Tienes" que whisper oye "quiénes" --, y ese
+# coste es del modelo al encadenar, no de las sesiones: sale igual en 'junta',
+# que es el camino bueno de Microsoft. A cambio no hay ni una frase muda ni una
+# que repita a la anterior, que era justo lo que hundia al trasplante de caché.
+VENTANA_TEXTO = 5      # TTS_TEXT_WINDOW_SIZE de modeling_..._streaming_inference
+LATENTES_VENTANA = 6   # TTS_SPEECH_WINDOW_SIZE, idem
+
+SESIONES_ACTIVAS = os.environ.get("VIBEVOICE_SESIONES", "1") not in ("0", "no")
+# Tope de posiciones de la caché. Al pasarse, la locucion se cierra bien y la
+# sesion sigue con una generate() nueva desde el prefijo pristino: se pierde la
+# continuidad en esa costura, pero no la voz. Recortar por delante no vale,
+# porque lo que hay al principio es justo el prefijo que DEFINE la voz.
+# Cada ventana son 5 tokens de texto + 6 latentes = 11 posiciones ~ 0,8 s de
+# audio, asi que 3000 son unos tres minutos seguidos. El limite duro del modelo
+# son 8192 (decoder_config.max_position_embeddings) y ahi corta a lo bruto, a
+# mitad de palabra; por eso se para antes.
+TOPE_CACHE = int(os.environ.get("VIBEVOICE_TOPE_CACHE", "3000"))
+CADUCIDAD_SESION = float(os.environ.get("VIBEVOICE_CADUCIDAD_SESION", "300"))
+# Cuanto espera el bucle, parado, a que llegue mas texto antes de dar la
+# locucion por terminada. Es el margen que tiene el LLM de arriba para producir
+# la frase siguiente sin que se cierre la locucion.
+ESPERA_TEXTO = float(os.environ.get("VIBEVOICE_ESPERA_TEXTO", "20"))
+
+_SESIONES: dict = {}
+_FIN = object()   # centinela: se acabo el audio de la sesion
+
+
+class TextoEnCurso:
+    """Se hace pasar por el tensor `tts_text_ids`, pero CRECE mientras generate()
+    lo consume, y BLOQUEA el bucle cuando se queda sin texto por delante.
+
+    CONTRATO CON generate() (modeling_vibevoice_streaming_inference.py). De todo
+    el tensor, generate() usa exactamente esto y nada mas:
+
+        625  tts_text_ids = tts_text_ids.to(self.device)
+        672  ... if tts_text_ids.shape[1] >= TTS_TEXT_WINDOW_SIZE else ...
+        727  cur  = tts_text_ids[:, i*VENTANA:(i+1)*VENTANA]
+        728  next = tts_text_ids[:, (i+1)*VENTANA:(i+2)*VENTANA].shape[1]
+
+    SI MICROSOFT CAMBIA ESO, ESTO SE ROMPE. En concreto:
+      - Si materializan el tensor antes del bucle (`ids = tts_text_ids.clone()`),
+        deja de releerse y las sesiones se quedan mudas tras la primera frase.
+      - Si dejan de leer exactamente dos cortes por vuelta, se descuadra el
+        reparto cur/lookahead y `restante()` devolveria texto ya dicho (se
+        repetiria) o se comeria texto sin decir. Hay un aviso por consola.
+      - Si cambian VENTANA_TEXTO, hay que cambiarlo aqui tambien.
+
+    POR QUE NO SE PUEDE ENTREGAR UNA VENTANA A MEDIAS
+    Los cortes son ABSOLUTOS sobre el buffer: la ventana i son los tokens
+    [5i, 5i+5). Si en la vuelta i solo hay 3 tokens y se entregan, el bucle pasa
+    a la ventana i+1 = [5i+5, 5i+10) y los tokens 5i+3 y 5i+4 que lleguen
+    despues NO SE DICEN NUNCA. Por eso solo se sirve una ventana completa, y si
+    no lo esta, se espera.
+
+    Y POR QUE HAY QUE MIRAR UNA VENTANA MAS ALLA
+    `next_text_window_size` no es informativo: con el se alarga por adelantado
+    la mascara de atencion y el cache_position de la vuelta SIGUIENTE. Lo que se
+    promete ahi hay que cumplirlo token a token. Como el buffer solo crece y las
+    ventanas solo se sirven completas, la promesa se cumple sola... salvo al
+    sellar. Por eso sellar CONGELA el buffer: a partir de ahi ya no entra texto,
+    se sirve lo que quede -- ultima ventana corta incluida -- y el modelo cierra
+    la locucion con su EOS de siempre.
+    """
+
+    def __init__(self, ids, dispositivo, espera_max=ESPERA_TEXTO,
+                 al_pausar=None, al_reanudar=None,
+                 posicion_inicial=0, tope=TOPE_CACHE):
+        self._ids = list(ids)
+        self._dispositivo = dispositivo
+        self._espera_max = espera_max
+        self._al_pausar = al_pausar or (lambda: None)
+        self._al_reanudar = al_reanudar or (lambda: None)
+        self._cond = threading.Condition()
+        self._sellado = False
+        self._corte = None         # tope de caché: texto que ya no cabe aqui
+        self._toca_cur = True      # los cortes llegan alternados: cur, lookahead
+        self.posicion_inicial = posicion_inicial
+        self.tope = tope
+        self.consumidos = 0        # tokens que el bucle ya ha metido en el modelo
+        self.ventanas = 0
+        self.esperado = 0.0        # segundos que el bucle paso quieto
+        self.esperando = False     # ahora mismo, parado esperando texto
+        self.sellado_por_espera = False
+        self.sellado_por_tope = False
+        self.descuadre = False
+
+    # ---- lado del que alimenta (hilos de HTTP) ----
+    def alimentar(self, ids) -> bool:
+        """Anade texto. False si ya estaba sellado (hay que abrir otra)."""
+        with self._cond:
+            if self._sellado:
+                return False
+            self._ids.extend(ids)
+            self._cond.notify_all()
+            return True
+
+    def sellar(self) -> None:
+        """Se acabo el texto: que diga lo que le queda y cierre la locucion."""
+        with self._cond:
+            self._sellado = True
+            self._cond.notify_all()
+
+    @property
+    def sellado(self) -> bool:
+        with self._cond:
+            return self._sellado
+
+    def restante(self) -> list:
+        """Texto que entro pero que el modelo no llego a decir."""
+        with self._cond:
+            return self._ids[self.consumidos:]
+
+    def _disponible(self) -> int:
+        """Cuanto texto puede ver el bucle. Solo es menos que todo cuando el
+        tope de caché obliga a dejar el resto para la generate() siguiente."""
+        return len(self._ids) if self._corte is None else self._corte
+
+    def posicion(self) -> int:
+        """Posiciones ocupadas en la caché del tts_lm, contadas por fuera."""
+        return self.posicion_inicial + self.consumidos + LATENTES_VENTANA * self.ventanas
+
+    # ---- lado de generate() (hilo del modelo) ----
+    def to(self, dispositivo):
+        self._dispositivo = dispositivo
+        return self
+
+    @property
+    def shape(self):
+        # Solo se consulta para decidir el tamano de la PRIMERA ventana, que
+        # tiene que coincidir con el primer corte. Esperar aqui a tener una
+        # ventana entera es lo que garantiza que coincidan.
+        self._esperar(VENTANA_TEXTO)
+        with self._cond:
+            return (1, self._disponible())
+
+    def __getitem__(self, clave):
+        _, corte = clave
+        ini, fin = corte.start, corte.stop
+        self._esperar(fin)
+        with self._cond:
+            trozo = self._ids[ini:min(fin, self._disponible())]
+        if self._toca_cur:
+            if ini != self.ventanas * VENTANA_TEXTO and not self.descuadre:
+                # No es fatal, pero significa que el reparto cur/lookahead ya no
+                # es el que este codigo supone. Se avisa una vez.
+                self.descuadre = True
+                print(f"[aviso] tts_text_ids: corte inesperado {ini}:{fin} en la "
+                      f"ventana {self.ventanas}; revisa si generate() cambio de "
+                      f"forma de leer el texto", flush=True)
+            self.consumidos = ini + len(trozo)
+            self.ventanas += 1
+            with self._cond:
+                if self.posicion() > self.tope and self._corte is None:
+                    # No cabe mas en esta locucion. Se corta AQUI, en el borde
+                    # de una ventana ya servida: el siguiente vistazo devuelve 0
+                    # -- que es lo que se promete para la vuelta siguiente -- y
+                    # el modelo cierra con su EOS. Lo que queda se dice en la
+                    # generate() siguiente, con la voz intacta.
+                    self._corte = self.consumidos
+                    self._sellado = True
+                    self.sellado_por_tope = True
+                    self._cond.notify_all()
+                    print(f"[sesion] tope de caché ({self.tope}) en la posicion "
+                          f"{self.posicion()}: se cierra la locucion y sigue en "
+                          f"otra ({len(self._ids) - self.consumidos} tokens "
+                          f"pendientes)", flush=True)
+        self._toca_cur = not self._toca_cur
+        return torch.tensor([trozo], dtype=torch.long, device=self._dispositivo)
+
+    def _esperar(self, hasta: int) -> None:
+        with self._cond:
+            if self._sellado or self._disponible() >= hasta:
+                return
+        # A partir de aqui el bucle se queda QUIETO. Se suelta el candado del
+        # modelo para que otra peticion pueda usarlo mientras esta sesion calla:
+        # una sesion esperando texto no debe secuestrar la CPU de nadie.
+        marca = time.monotonic()
+        self.esperando = True
+        self._al_pausar()
+        try:
+            with self._cond:
+                queda = self._espera_max
+                while not self._sellado and self._disponible() < hasta and queda > 0:
+                    t = time.monotonic()
+                    self._cond.wait(queda)
+                    queda -= time.monotonic() - t
+                if not self._sellado and self._disponible() < hasta:
+                    # Se acabo la paciencia: mejor cerrar bien la locucion que
+                    # dejar al oyente con una frase colgada para siempre.
+                    self._sellado = True
+                    self.sellado_por_espera = True
+        finally:
+            self._al_reanudar()
+            self.esperando = False
+            self.esperado += time.monotonic() - marca
+
+
+class ColaAudioSesion:
+    """El `audio_streamer` que espera generate(), volcado a una cola asincrona.
+
+    No cierra la cola de la sesion al terminar: una sesion larga puede encadenar
+    varias generate() (al llegar al tope de caché) sobre el MISMO flujo de audio.
+    """
+
+    def __init__(self, lazo, cola):
+        self.lazo, self.cola = lazo, cola
+        self.cerrado = False
+        self.trozos = 0
+        # Lo pone SesionViva.abortar() cuando el cliente se larga. Por la via
+        # HTTP nadie lo toca nunca, asi que ahi el comportamiento no cambia.
+        self.cancelado = False
+
+    def put(self, trozos, indices):
+        # Tras end() lo que llegue sobra: generate() no sale del bucle de 6
+        # latentes aunque el EOS salte a mitad, y esos ultimos son silencio.
+        if self.cerrado:
+            return
+        # UNICO punto de corte que ofrece generate(): no mira ningun flag
+        # externo, asi que abortar es lanzar desde aqui y dejar que la excepcion
+        # desmonte su pila. Es lo mismo que hace StreamerCancelable en
+        # /tts/stream, y por eso el corte tarda como mucho lo que dure un trozo
+        # (~133 ms de audio) en notarse.
+        if self.cancelado:
+            raise GeneracionCancelada()
+        for i, idx in enumerate(indices):
+            if int(idx) != 0:
+                continue
+            self.trozos += 1
+            self.lazo.call_soon_threadsafe(
+                self.cola.put_nowait, trozos[i].detach().float().cpu())
+
+    def end(self, indices=None):
+        self.cerrado = True
+
+
+class SesionViva:
+    """Una generate() viva en su hilo, con una cola de texto por delante."""
+
+    def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo):
+        self.nombre = nombre
+        self.voz = voz
+        self.cfg_scale = cfg_scale
+        self.semilla = semilla
+        self.pasos = pasos
+        self.lazo = lazo
+        self.cola = asyncio.Queue()
+        self.visto = time.time()
+        self.cerrada = False
+        self.terminada = False
+        self.escuchando = False
+        self.generaciones = 0
+        self.error = None
+        self.eos_temprano = 0     # veces que el modelo callo con texto pendiente
+        self.abortada = False     # el cliente se fue: cortar sin miramientos
+        self._pendiente = []
+        self._alimentador = None
+        self._audio = None        # el ColaAudioSesion de la generate() en curso
+        self._arrancado = False
+        self._entre_locuciones = False   # parado, pero no dentro de generate()
+        self._rng = None          # foto del RNG global mientras esta parada
+        self._cond = threading.Condition()
+        self._hilo = threading.Thread(target=self._correr, daemon=True,
+                                      name=f"sesion-{nombre}")
+
+    # ---- API ----
+    def arrancar(self):
+        self._arrancado = True
+        self._hilo.start()
+
+    def alimentar(self, texto: str) -> int:
+        """Encola texto. Va al alimentador vivo si lo hay; si no, a la reserva
+        para la generate() siguiente."""
+        # Exactamente como lo tokeniza el procesador para una peticion normal
+        # (process_input_with_cached_prompt: text.strip() + "\n"), asi que una
+        # frase por sesion produce los mismos tokens que esa frase suelta.
+        # VERIFICADO: alimentar frase a frase da audio IDENTICO BIT A BIT al de
+        # mandar el texto entero en una sola llamada -- siempre que se compare
+        # contra el texto unido con SALTOS DE LINEA, no con espacios. Unir con
+        # espacios da otro audio (5,33 s frente a 6,80 s) porque es otro texto,
+        # no porque la sesion haga nada raro. Comparar contra la referencia
+        # equivocada costo media investigacion.
+        ids = _estado["procesador"].tokenizer.encode(
+            texto.strip() + "\n", add_special_tokens=False)
+        self.visto = time.time()
+        with self._cond:
+            if self.cerrada:
+                raise HTTPException(409, f"sesion '{self.nombre}' ya cerrada")
+            al = self._alimentador
+            if al is not None and al.alimentar(ids):
+                return len(ids)
+            self._pendiente.extend(ids)
+            self._cond.notify_all()
+        return len(ids)
+
+    def cerrar(self) -> None:
+        """Termina la locucion limpiamente: el modelo dice lo que le queda y
+        cierra con su EOS."""
+        with self._cond:
+            self.cerrada = True
+            al = self._alimentador
+            self._cond.notify_all()
+        if al is not None:
+            al.sellar()
+
+    def abortar(self) -> None:
+        """Corta YA la generacion en curso: el cliente se fue.
+
+        cerrar() es lo educado -- el modelo dice lo que le queda y cierra con su
+        EOS --, y es lo correcto por HTTP, donde el POST /fin lo manda alguien
+        que sigue escuchando. Pero cuando lo que se cae es el websocket no queda
+        nadie al otro lado: seguir seria medio minuto de CPU al 100 % con el
+        candado del modelo tomado, generando audio para el vacio.
+
+        Se tira de los dos hilos a la vez porque el bucle puede estar en
+        cualquiera de los dos sitios: se sella el texto (por si esta parado
+        esperando mas, dentro de TextoEnCurso._esperar) y se marca la cola de
+        audio (por si esta dentro de generate(), donde put() es el unico punto
+        por el que se puede desmontar la pila).
+        """
+        with self._cond:
+            self.cerrada = True
+            self.abortada = True
+            self._pendiente = []
+            al, audio = self._alimentador, self._audio
+            self._cond.notify_all()
+        if audio is not None:
+            audio.cancelado = True
+        if al is not None:
+            al.sellar()
+
+    def esperar_fin(self, segundos: float) -> bool:
+        """Espera a que muera el hilo. False si sigue vivo al agotarse el plazo.
+
+        Hace falta esperarlo de verdad: mientras viva tiene tomado
+        _candado_modelo, y devolver el control al cliente antes de eso dejaria
+        la siguiente peticion bloqueada contra un hilo fantasma.
+        """
+        if not self._arrancado:
+            return True
+        self._hilo.join(segundos)
+        return not self._hilo.is_alive()
+
+    def estado(self) -> dict:
+        al = self._alimentador
+        return {
+            "sesion": self.nombre, "voz": self.voz,
+            "viva": not self.terminada, "cerrada": self.cerrada,
+            "abortada": self.abortada,
+            "escuchando": self.escuchando, "generaciones": self.generaciones,
+            "pendientes": len(self._pendiente) + (len(al.restante()) if al else 0),
+            "posicion": al.posicion() if al else 0,
+            # Lo que mira el cliente para saber si puede mandar la frase
+            # siguiente sin que se le cuele un silencio: el modelo esta parado
+            # porque se ha quedado sin texto por delante.
+            "esperando": bool(al and al.esperando) or self._entre_locuciones,
+            "esperado_s": round(al.esperado, 2) if al else 0.0,
+            "eos_temprano": self.eos_temprano,
+            "error": self.error,
+        }
+
+    # ---- hilo ----
+    def _correr(self):
+        esperar_mas = False
+        try:
+            while True:
+                with self._cond:
+                    # Tras un corte por tope de caché la sesion SIGUE viva: el
+                    # modelo se ha puesto al dia con el texto, no es que se haya
+                    # acabado. Sin esta espera, la sesion moria justo aqui -- y
+                    # como el corte pasa cuando ya no queda nada pendiente, moria
+                    # SIEMPRE que se llegaba al tope, dejando al oyente colgado.
+                    fin_espera = time.monotonic() + ESPERA_TEXTO
+                    self._entre_locuciones = esperar_mas
+                    while (esperar_mas and not self._pendiente
+                           and not self.cerrada
+                           and time.monotonic() < fin_espera):
+                        self._cond.wait(fin_espera - time.monotonic())
+                    self._entre_locuciones = False
+                    if not self._pendiente:
+                        break
+                    ids, self._pendiente = self._pendiente, []
+                    al = TextoEnCurso(
+                        ids, DISPOSITIVO, ESPERA_TEXTO,
+                        al_pausar=self._pausar,
+                        al_reanudar=self._reanudar,
+                        tope=TOPE_CACHE,
+                    )
+                    if self.cerrada:
+                        al.sellar()
+                    self._alimentador = al
+                self._generar(al)
+                with self._cond:
+                    # Lo que el modelo no llego a decir vuelve a la reserva y
+                    # abre la generate() siguiente.
+                    self._pendiente = al.restante() + self._pendiente
+                    self._alimentador = None
+                    if al.restante() and not al.sellado_por_tope:
+                        # El modelo cerro la locucion teniendo texto sin decir:
+                        # es justo el fallo que este diseno viene a evitar.
+                        self.eos_temprano += 1
+                        print(f"[aviso] sesion {self.nombre}: EOS con "
+                              f"{len(al.restante())} tokens sin decir", flush=True)
+                    if not al.consumidos:
+                        # No dijo NADA: seguir seria un bucle infinito diciendo
+                        # nada. Mejor terminar y que se vea.
+                        break
+                    # Cerrada pero con texto sin decir (solo pasa tras un EOS
+                    # prematuro): se abre otra y se dice, en vez de tragarselo.
+                    if self.cerrada and not self._pendiente:
+                        break
+                    if al.sellado_por_espera and not self._pendiente:
+                        break
+                    esperar_mas = True
+        except GeneracionCancelada:
+            # El cliente se fue y abortar() corto la generate() desde dentro.
+            # NO es un fallo: no se guarda en self.error ni se imprime traza.
+            print(f"[sesion] {self.nombre}: generacion abortada, el cliente se fue",
+                  flush=True)
+        except Exception as e:
+            import traceback
+            self.error = f"{type(e).__name__}: {e}"
+            print(f"[error] sesion {self.nombre}:", flush=True)
+            traceback.print_exc()
+        finally:
+            self.terminada = True
+            self.cerrada = True
+            self.lazo.call_soon_threadsafe(self.cola.put_nowait, _FIN)
+            devolver_memoria()
+
+    # ---- el ruido de ESTA sesion, y de ninguna otra ----
+    # Lo que se le pasa a TextoEnCurso como al_pausar/al_reanudar. Ademas de
+    # soltar y recuperar el candado del modelo, se llevan y traen el RNG.
+    #
+    # POR QUE HACE FALTA
+    # El RNG de torch es GLOBAL y el candado se suelta en cada pausa, asi que la
+    # sesion que se cuela en medio -- que hace su torch.manual_seed() y consume
+    # ruido -- dejaba a la primera reanudando con un ruido que no era el suyo.
+    # Ver el bloque de _candado_modelo, con la medida.
+    #
+    # POR QUE ASI Y NO CON UN torch.Generator PROPIO
+    # Un generador por sesion habria que METERLO donde se sortea, y ahi solo se
+    # llega parcheando a Microsoft: sample_speech_tokens() llama a torch.randn()
+    # sin admitir `generator`. Fotografiar y reponer el estado global consigue lo
+    # mismo -- un hilo de ruido por sesion -- sin tocar upstream, y ademas cubre
+    # CUALQUIER punto que sortee, no solo el unico que hoy se conoce.
+    #
+    # EL ORDEN IMPORTA EN LOS DOS SENTIDOS
+    # La foto ANTES de soltar (si no, otra sesion podria avanzar el RNG antes de
+    # que se mire) y la reposicion DESPUES de recuperar el candado (si no, se
+    # pisaria con la que todavia esta generando).
+    #
+    # SOLO EL RNG DE CPU
+    # El ruido de la difusion sale de un torch.randn(...) SIN device en
+    # sample_speech_tokens() y se mueve despues con .to(condition), asi que quien
+    # lo sortea es el generador de CPU aunque el modelo corra en mps o cuda.
+    # COMPROBADO: tras un torch.randn(4, 64).to("mps") cambia el estado de CPU y
+    # NO el de MPS. Si algun dia upstream crea el ruido ya en el dispositivo,
+    # aqui hay que guardar tambien torch.mps/cuda.get_rng_state().
+    #
+    # Cuesta 1,5 us por pausa (5056 bytes de estado), y las pausas son una por
+    # frase: al lado de los segundos que dura una locucion, nada.
+    def _pausar(self) -> None:
+        self._rng = torch.get_rng_state()
+        _candado_modelo.release()
+
+    def _reanudar(self) -> None:
+        _candado_modelo.acquire()
+        if self._rng is not None:
+            torch.set_rng_state(self._rng)
+
+    def _generar(self, al: TextoEnCurso):
+        procesador = _estado["procesador"]
+        base = prefijo_voz(self.voz)
+        audio = ColaAudioSesion(self.lazo, self.cola)
+        with self._cond:
+            # Bajo el candado y comprobando abortada: si el cliente se fue entre
+            # que se armo la cola y que se registra, abortar() no la habria
+            # visto y la generate() arrancaria ya sin nadie que la oiga.
+            if self.abortada:
+                audio.cancelado = True
+            self._audio = audio
+        _candado_modelo.acquire()
+        try:
+            _ajustar_pasos(self.pasos)
+            if self.semilla is not None:
+                # Aqui EMPIEZA el hilo de ruido de esta locucion; de conservarlo
+                # a traves de las pausas se encargan _pausar/_reanudar. Se
+                # siembra en cada generate() y no una sola vez por sesion a
+                # proposito: una sesion larga puede encadenar varias -- al llegar
+                # al tope de caché -- y asi cada una arranca igual que si fuera
+                # la primera, que es lo que hace comparable el audio.
+                torch.manual_seed(self.semilla)
+            # text="" porque el texto ya no viene de aqui: lo pone el
+            # alimentador. Lo unico que se aprovecha son los input_ids falsos
+            # y las mascaras, que salen de la longitud del prefijo de voz.
+            entradas = procesador.process_input_with_cached_prompt(
+                text="", cached_prompt=copy.deepcopy(base),
+                padding=True, return_tensors="pt", return_attention_mask=True,
+            )
+            if EN_GPU:
+                entradas = a_dispositivo(entradas)
+            entradas.pop("tts_text_ids")
+            al.posicion_inicial = int(entradas["tts_lm_input_ids"].shape[1])
+            self.generaciones += 1
+            with torch.no_grad():
+                _estado["modelo"].generate(
+                    **entradas,
+                    tts_text_ids=al,
+                    max_new_tokens=None,
+                    cfg_scale=self.cfg_scale,
+                    tokenizer=procesador.tokenizer,
+                    generation_config={"do_sample": False},
+                    verbose=False,
+                    show_progress_bar=False,
+                    return_speech=False,
+                    all_prefilled_outputs=copy.deepcopy(base),
+                    audio_streamer=audio,
+                )
+        finally:
+            _candado_modelo.release()
+            with self._cond:
+                self._audio = None
+
+
+def _caducar_sesiones() -> None:
+    ahora = time.time()
+    for nombre, s in list(_SESIONES.items()):
+        if s.terminada and not s.escuchando and ahora - s.visto > 5:
+            _SESIONES.pop(nombre, None)
+        elif ahora - s.visto > CADUCIDAD_SESION:
+            s.cerrar()
+            _SESIONES.pop(nombre, None)
 
 
 def cabecera_wav_flujo(ritmo: int = RITMO) -> bytes:
@@ -693,6 +1407,53 @@ class PeticionTTS(BaseModel):
     # ibamos por debajo de lo que el modelo espera.
     cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
 
+    # MISMO TEXTO, AUDIO DISTINTO CADA VEZ
+    # sample_speech_tokens() arranca cada latente con torch.randn() sin
+    # semilla, una vez por fotograma acustico. `do_sample=False` no lo toca:
+    # eso solo fija que token elige el modelo de lenguaje, no el ruido del
+    # que parte la difusion. Medido pidiendo la misma frase cuatro veces:
+    # duraciones 3,47 / 3,20 / 3,20 / 3,47 s y correlacion entre pasadas de
+    # 0,019 -- es decir, audio sin ningun parecido forma a forma.
+    #
+    # Casi siempre suena bien, pero de vez en cuando el sorteo cae mal y sale
+    # un clip que ni whisper entiende. Con semilla fija eso deja de ser una
+    # loteria: la misma peticion da exactamente el mismo audio.
+    semilla: Optional[int] = Field(None, ge=0, lt=2**31,
+                                   description="fija el ruido de la difusion; "
+                                               "misma semilla = mismo audio")
+
+    # Pasos del solver de difusion por latente. Medido en la VM con int8:
+    # 20 -> RTF 2,75 · 8 -> 2,18 · 6 -> 2,18 · 4 -> 2,11. Por debajo de 4 el
+    # solver multistep se degrada; por encima de 8 se paga RTF sin ganar nada
+    # audible. Por defecto manda VIBEVOICE_PASOS.
+    pasos: Optional[int] = Field(None, ge=4, le=20)
+
+    # VELOCIDAD SIN TOCAR EL MODELO
+    # VibeVoice no tiene ningun parametro de duracion ni length_scale: el ritmo
+    # sale de las 6 ventanas acusticas por cada 5 tokens de texto y no se
+    # expone. Lo que si se puede es DECLARAR otro ritmo de muestreo en la
+    # cabecera WAV: el audio no se toca, se reproduce mas o menos deprisa.
+    # Cuesta cero CPU. El precio es que el tono sube o baja con la velocidad,
+    # asi que el margen util es estrecho: a +-10% no se nota, mas alla suena a
+    # ardilla o a resaca. De ahi el rango cerrado.
+    velocidad: float = Field(1.0, ge=0.85, le=1.20)
+
+
+class PeticionSesion(BaseModel):
+    """Texto que se le mete a una sesion viva. La voz y los ajustes solo se
+    miran al CREARLA: cambiarlos a mitad exigiria empezar otra locucion."""
+    texto: str = Field(..., min_length=1, max_length=8000)
+    # voz OPCIONAL a proposito. Si tuviera valor por defecto, el cliente que
+    # manda solo {"texto": ...} en las frases siguientes -- que es lo natural --
+    # estaria pidiendo la voz por defecto sin saberlo y se llevaria un 409 por
+    # "cambio de voz a mitad de sesion". Solo se comprueba si viene puesta.
+    voz: Optional[str] = None
+    cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
+    semilla: Optional[int] = Field(None, ge=0, lt=2**31)
+    pasos: Optional[int] = Field(None, ge=4, le=20)
+    # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
+    fin: bool = False
+
 
 @app.get("/", response_class=HTMLResponse)
 def pagina_prueba() -> HTMLResponse:
@@ -717,14 +1478,33 @@ def health() -> dict:
         "pasos": PASOS,
         "voz_defecto": VOZ_DEFECTO,
         "rtf_esperado": RTF_MEDIDO,
-        "ocupado": _candado.locked(),
+        "ocupado": _candado.locked() or _candado_modelo.locked(),
         "auth": "bearer" if TOKEN else "abierta",
+        "sesiones": {"activas": SESIONES_ACTIVAS,
+                     "abiertas": sorted(_SESIONES),
+                     "espera_texto_s": ESPERA_TEXTO,
+                     "tope_cache": TOPE_CACHE,
+                     "websocket": "/tts/sesion/ws"},
     }
+
+
+@app.get("/voces")
+def voces(_=Depends(autorizar)):
+    """Las voces instaladas. Sin esto el cliente tiene que adivinar nombres, y
+    equivocarse solo se nota con un 404 a mitad de una peticion."""
+    return {"voces": sorted(p.stem for p in VOCES_DIR.glob("*.pt")),
+            "defecto": VOZ_DEFECTO}
 
 
 @app.post("/tts/stream")
 async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingResponse:
     prefijo_voz(pet.voz)  # valida ANTES de enviar cabeceras, para dar un 404 limpio
+    # La velocidad NO se hace remuestreando. Remuestrear mueve el tono junto
+    # con la duracion, y a +-15% lo que se oye es "mas agudo", no "mas rapido".
+    # Aqui se estira el tiempo de verdad (WSOLA, ver estirar.py) y el ritmo de
+    # salida no cambia nunca.
+    ritmo = RITMO
+    estirando = abs(pet.velocidad - 1.0) > 1e-3
 
     async def generador():
         # El candado se toma DENTRO del generador: si hay otra sintesis en
@@ -735,11 +1515,27 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
                 None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
+                pet.semilla, pet.pasos,
             )
             try:
-                yield cabecera_wav_flujo()
-                async for trozo in streamer.flujo():
-                    yield a_pcm16(trozo)  # ~133 ms de audio por trozo
+                yield cabecera_wav_flujo(ritmo)
+                if not estirando:
+                    async for trozo in streamer.flujo():
+                        yield a_pcm16(trozo)  # ~133 ms de audio por trozo
+                else:
+                    # A velocidad distinta de 1 se acumula la frase ENTERA y se
+                    # estira de una vez. Estirar cada trozo de 133 ms por su
+                    # cuenta dejaria una costura audible en cada empalme, y
+                    # arrastrar el estado de WSOLA entre trozos es mas maquinaria
+                    # de la que merece: una frase dura unos segundos, asi que lo
+                    # unico que se pierde es la reproduccion progresiva DENTRO de
+                    # la frase. Al narrar por frases encadenadas ni se nota.
+                    trozos = []
+                    async for trozo in streamer.flujo():
+                        trozos.append(trozo.detach().float().cpu().numpy().reshape(-1))
+                    if trozos:
+                        entero = np.concatenate(trozos)
+                        yield a_pcm16(torch.from_numpy(estirar(entero, pet.velocidad)))
             finally:
                 # Cliente desconectado o flujo terminado: marcamos cancelado
                 # (inofensivo si ya acabo) y esperamos al hilo, para no solapar
@@ -756,11 +1552,491 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
         headers={
             # Sin Content-Length: uvicorn usa Transfer-Encoding: chunked.
             "Cache-Control": "no-store",
-            "X-Ritmo-Hz": str(RITMO),
+            "X-Ritmo-Hz": str(ritmo),
             "X-RTF-Esperado": str(RTF_MEDIDO),
             "Content-Disposition": 'inline; filename="voz.wav"',
         },
     )
+
+
+# --------------------------------------------------------------------------
+# API de sesiones. Tres verbos y un flujo de audio:
+#
+#   POST /tts/sesion/{id}          {"texto": "..."}   crea la sesion y encola
+#   GET  /tts/sesion/{id}/audio                       WAV continuo, hasta el fin
+#   POST /tts/sesion/{id}/fin                         cierra la locucion
+#
+# El texto va por un lado y el audio por otro A PROPOSITO. La locucion es UNA,
+# continua, y el modelo va por detras del texto: cuando termina de decir la
+# frase 2 ya se le metio la 3. Devolver "el audio de esta frase" en la respuesta
+# de cada POST seria mentir, porque en ese instante todavia no existe.
+#
+# El orden es: POST con la primera frase, GET del audio, y a partir de ahi POST
+# cuantos haga falta. Un POST no espera a nada: vuelve en cuanto encola.
+
+
+def _sesion(nombre: str) -> "SesionViva":
+    s = _SESIONES.get(nombre)
+    if s is None:
+        raise HTTPException(404, f"no hay sesion '{nombre}'")
+    return s
+
+
+@app.post("/tts/sesion/{nombre}")
+async def sesion_texto(nombre: str, pet: PeticionSesion,
+                       _=Depends(autorizar)) -> dict:
+    """Encola texto. La primera llamada crea la sesion y arranca su generate().
+
+    Si la sesion anterior con ese nombre ya habia terminado -- por inactividad o
+    porque alguien la cerro --, esta llamada abre otra y la respuesta lo dice en
+    `reabierta`. Ojo: el flujo de /audio de la anterior ya se cerro, asi que hay
+    que volver a pedirlo.
+    """
+    if not SESIONES_ACTIVAS:
+        raise HTTPException(503, "sesiones desactivadas (VIBEVOICE_SESIONES=0)")
+    _caducar_sesiones()
+    prefijo_voz(pet.voz or VOZ_DEFECTO)  # valida antes de montar nada
+    s = _SESIONES.get(nombre)
+    reabierta = s is not None and s.terminada
+    if reabierta:
+        _SESIONES.pop(nombre, None)
+        s = None
+    nueva = s is None
+    if nueva:
+        s = SesionViva(nombre, pet.voz or VOZ_DEFECTO, pet.cfg_scale,
+                       pet.semilla, pet.pasos, asyncio.get_running_loop())
+        _SESIONES[nombre] = s
+    elif pet.voz is not None and pet.voz != s.voz:
+        raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
+                                 f"cierrala para cambiar de voz")
+    s.alimentar(pet.texto)
+    if nueva:
+        # Despues de alimentar: el hilo termina si arranca sin nada que decir.
+        s.arrancar()
+    if pet.fin:
+        s.cerrar()
+    return {**s.estado(), "reabierta": reabierta}
+
+
+@app.get("/tts/sesion/{nombre}/audio")
+async def sesion_audio(nombre: str, _=Depends(autorizar)) -> StreamingResponse:
+    """El audio de la sesion entera, como un solo WAV que va llegando."""
+    s = _sesion(nombre)
+    if s.escuchando:
+        raise HTTPException(409, f"ya hay un oyente en la sesion '{nombre}'")
+    s.escuchando = True
+
+    async def generador():
+        try:
+            yield cabecera_wav_flujo(RITMO)
+            while True:
+                trozo = await s.cola.get()
+                if trozo is _FIN:
+                    break
+                yield a_pcm16(trozo)
+        finally:
+            s.escuchando = False
+            # Si el que escuchaba se fue, la locucion no le sirve a nadie.
+            s.cerrar()
+            if s.terminada:
+                _SESIONES.pop(nombre, None)
+
+    return StreamingResponse(
+        generador(),
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Ritmo-Hz": str(RITMO),
+            "X-RTF-Esperado": str(RTF_MEDIDO),
+            "Content-Disposition": f'inline; filename="{nombre}.wav"',
+        },
+    )
+
+
+@app.post("/tts/sesion/{nombre}/fin")
+async def sesion_fin(nombre: str, _=Depends(autorizar)) -> dict:
+    """Cierra la locucion: el modelo dice lo que le queda y termina."""
+    s = _sesion(nombre)
+    s.cerrar()
+    return s.estado()
+
+
+@app.get("/tts/sesion/{nombre}")
+async def sesion_estado(nombre: str, _=Depends(autorizar)) -> dict:
+    return _sesion(nombre).estado()
+
+
+@app.delete("/tts/sesion/{nombre}")
+async def sesion_borrar(nombre: str, _=Depends(autorizar)) -> dict:
+    s = _sesion(nombre)
+    s.cerrar()
+    _SESIONES.pop(nombre, None)
+    return {"sesion": nombre, "cerrada": True}
+
+
+# --------------------------------------------------------------------------
+# WEBSOCKET: la misma sesion, pero en una sola conexion
+#
+# POR QUE, SI YA FUNCIONA POR HTTP
+# La interaccion es bidireccional y de larga duracion: entra texto mientras
+# sale audio, durante minutos. HTTP obliga a partir eso en un POST por frase
+# mas un GET de audio que dura toda la locucion, y a que el cliente sondee
+# GET /tts/sesion/{id} para saber si el modelo se ha quedado sin texto por
+# delante. Aqui es un solo socket: el texto sube, el audio y los avisos bajan,
+# y "el modelo esta esperando" llega como evento en vez de por sondeo.
+#
+# LO QUE NO CAMBIA
+# Por debajo es SesionViva, la misma clase, sin una rama especial. Asi que
+# respeta _candado_modelo igual (lo toma _generar), suelta el candado mientras
+# espera texto igual (TextoEnCurso._esperar, via al_pausar/al_reanudar) y
+# tokeniza igual (texto.strip() + "\n"). De ahi que el audio salga IDENTICO bit
+# a bit al de la via HTTP, que es lo que se comprueba por md5. El HTTP se queda
+# intacto: es lo que corre en la VM y lo que se prueba con curl.
+#
+# PROTOCOLO
+# Del cliente al servidor, mensajes de TEXTO con JSON:
+#
+#   {"accion":"abrir","voz":"sp-Spk3_man","cfg_scale":4.5,"pasos":6,"semilla":11}
+#   {"accion":"texto","texto":"..."}
+#   {"accion":"fin"}
+#
+# Del servidor al cliente, mensajes BINARIOS con el marco de
+# scripts/asistente_web.py:
+#
+#   [tipo:1 byte][longitud:4 bytes big-endian][carga]
+#   tipo 0 = PCM crudo, 16 bits con signo, 24000 Hz, mono
+#   tipo 1 = evento JSON
+#
+# El websocket ya trae longitud propia, asi que el marco es redundante ahi. Se
+# mantiene A PROPOSITO: el lector de asistente_web.py -- el bucle que acumula
+# hasta tener el marco entero y reparte por tipo -- vale tal cual, sin tocar
+# una linea, y el navegador puede alimentar el mismo camino de Web Audio venga
+# el flujo de donde venga. Lo que cuesta son 5 bytes por trozo de 133 ms.
+#
+# Eventos (campo "tipo"): abierta, texto, esperando, fin_texto, sonando,
+# hecho, error. Ver el detalle en sesion_ws().
+#
+# DEPENDENCIA QUE NO SE VE: uvicorn no habla websocket por si solo, necesita el
+# paquete `websockets` (o wsproto). Aqui llega por uvicorn[standard], que es
+# dependencia DIRECTA de vibevoice en el lock, asi que esta tanto en el venv del
+# Mac como en la imagen Docker. Si algun dia se poda -- docker/Dockerfile.voz-
+# stream ya desinstala uvloop, que viene del mismo extra --, esta ruta deja de
+# existir y uvicorn responde 404 al apreton de manos SIN decir por que.
+#
+# VELOCIDAD: NO SE ADMITE DISTINTA DE 1, Y ES A PROPOSITO
+# estirar() es WSOLA (ver estirar.py) y necesita la locucion ENTERA por tres
+# razones que aqui no se pueden salvar:
+#
+#   1. Arrastra estado entre ventanas -- la `referencia` con la que empalma la
+#      siguiente -- y mira 1024+384 muestras por delante. Estirar cada trozo de
+#      133 ms por su cuenta deja una costura audible en CADA empalme, y aqui
+#      los empalmes son ~7 por segundo durante toda la locucion.
+#   2. La salida no dura lo mismo que la entrada, asi que los trozos dejarian de
+#      encajar con los latentes y el cliente no podria alinear nada.
+#   3. La locucion de una sesion NO TIENE FIN CONOCIDO: encadena generate() al
+#      llegar a TOPE_CACHE y dura lo que el de arriba siga escribiendo.
+#      "Acumularlo todo y estirar al final" es exactamente no hacer streaming:
+#      seria no emitir un solo byte hasta el "fin", que es todo lo contrario de
+#      para lo que existe este websocket.
+#
+# /tts/stream si lo hace -- acumula la frase y la estira de golpe -- porque alli
+# la locucion es UNA frase de unos segundos y se sabe cuando acaba. Aqui se
+# rechaza con un error claro en vez de fingir. El cliente que quiera ir mas
+# deprisa tiene dos salidas honestas: (a) reproducir el PCM a otro ritmo
+# (playbackRate en Web Audio), que es gratis pero mueve el tono -- justo lo que
+# estirar.py existe para evitar --, o (b) acumular el audio de su lado y
+# estirarlo el, ya sin restriccion de tiempo real. Ninguna de las dos es
+# trabajo del servidor.
+
+MARCO_PCM = 0
+MARCO_EVENTO = 1
+
+
+def marco(tipo: int, carga: bytes) -> bytes:
+    """[tipo:1][longitud:4 BE][carga], igual que scripts/asistente_web.py."""
+    return struct.pack(">BI", tipo, len(carga)) + carga
+
+
+class AbrirSesionWS(BaseModel):
+    """Ajustes de la locucion. Solo se miran AL ABRIR: cambiarlos a mitad
+    obligaria a empezar otra locucion, que es justo lo que la sesion evita."""
+    sesion: Optional[str] = Field(None, min_length=1, max_length=64)
+    voz: str = VOZ_DEFECTO
+    cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
+    semilla: Optional[int] = Field(None, ge=0, lt=2**31)
+    pasos: Optional[int] = Field(None, ge=4, le=20)
+    # Aceptado solo para poder dar un error claro; ver el bloque VELOCIDAD.
+    velocidad: float = Field(1.0, ge=0.85, le=1.20)
+
+
+def _autorizado_ws(ws: WebSocket, token: Optional[str]) -> bool:
+    """El mismo bearer que autorizar(), mas un repliegue por query.
+
+    OJO, ESTO DEJA EL TOKEN EN LOS REGISTROS: la URL completa -- con
+    ?token=... -- aparece en el log de acceso de uvicorn, en el de cualquier
+    proxy que haya delante y en el historial del navegador. Es aceptable en una
+    red domestica y NO lo es en internet.
+
+    Se admite igualmente porque la API de WebSocket del navegador no deja poner
+    cabeceras: `new WebSocket(url)` no tiene donde meter Authorization, y el
+    unico hueco del protocolo (Sec-WebSocket-Protocol) es un apano peor. Los
+    clientes que SI pueden -- python, curl, cualquier cosa que no sea un
+    navegador -- deben usar la cabecera, que es lo que se mira primero.
+    """
+    if not TOKEN:
+        return True
+    cabecera = ws.headers.get("authorization", "")
+    if cabecera.lower().startswith("bearer "):
+        dado = cabecera[7:].strip()
+    else:
+        dado = token or ""
+    return secrets.compare_digest(dado, TOKEN)
+
+
+@app.websocket("/tts/sesion/ws")
+async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
+    """Una sesion viva por conexion. Ver el bloque WEBSOCKET de arriba.
+
+    Eventos que emite, en el orden tipico:
+
+      abierta     la sesion existe y tiene nombre (util para GET /tts/sesion/{id})
+      texto       acuse de cada frase encolada, con los tokens que salieron
+      sonando     primer trozo de PCM: a partir de aqui ya se oye algo
+      esperando   el modelo se quedo sin texto por delante y esta PARADO
+                  (esperando=true) o volvio a arrancar (esperando=false). Es el
+                  mismo flag que la via HTTP publica en GET /tts/sesion/{id},
+                  pero empujado en vez de sondeado: es la senal de "manda ya la
+                  frase siguiente si no quieres un silencio".
+      fin_texto   acuse de {"accion":"fin"}: no entra mas texto
+      hecho       la locucion termino; lleva el estado final de la sesion
+      error       cualquier cosa que salio mal, con texto explicativo
+    """
+    if not _autorizado_ws(ws, token):
+        # Se rechaza ANTES del accept: Starlette contesta 403 al apreton de
+        # manos y no llega a existir websocket ninguno. Asi un cliente sin token
+        # no consume ni una sesion ni un hilo.
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+
+    lazo = asyncio.get_running_loop()
+    t0 = time.perf_counter()
+    candado_envio = asyncio.Lock()
+    s: Optional[SesionViva] = None
+    nombre: Optional[str] = None
+    arrancado = False
+    tareas: list = []
+
+    async def enviar(tipo: int, carga: bytes) -> None:
+        # Dos tareas emiten a la vez (la bomba de audio y el vigia de
+        # 'esperando') y send_bytes no es reentrante: sin este candado se
+        # podrian intercalar dos marcos y el lector del cliente leeria basura.
+        async with candado_envio:
+            await ws.send_bytes(marco(tipo, carga))
+
+    async def evento(**kw) -> None:
+        await enviar(MARCO_EVENTO, json.dumps(kw, ensure_ascii=False).encode())
+
+    def transcurrido() -> float:
+        return round(time.perf_counter() - t0, 3)
+
+    async def bombear() -> str:
+        """Vuelca la cola de audio de la sesion al socket."""
+        primero = True
+        try:
+            while True:
+                trozo = await s.cola.get()
+                if trozo is _FIN:
+                    return "hecho"
+                if primero:
+                    primero = False
+                    await evento(tipo="sonando", s=transcurrido())
+                await enviar(MARCO_PCM, a_pcm16(trozo))
+        except (WebSocketDisconnect, RuntimeError, ConnectionError):
+            return "roto"
+
+    async def vigilar() -> None:
+        """Empuja los cambios del flag 'esperando'.
+
+        Se SONDEA el estado en vez de colgar una devolucion de llamada dentro de
+        TextoEnCurso porque 'esperando' tiene dos fuentes -- el bucle parado sin
+        texto por delante y el hueco ENTRE dos generate() -- y solo estado() las
+        junta. 100 ms es dos ordenes de magnitud mas fino que lo que tarda una
+        frase y no cuesta nada medible.
+        """
+        antes = False
+        try:
+            while True:
+                ahora = bool(s.estado()["esperando"])
+                if ahora != antes:
+                    antes = ahora
+                    await evento(tipo="esperando", esperando=ahora,
+                                 s=transcurrido())
+                await asyncio.sleep(0.1)
+        except (WebSocketDisconnect, RuntimeError, ConnectionError):
+            return
+
+    async def leer() -> str:
+        """Consume los mensajes del cliente hasta que se va.
+
+        No termina con {"accion":"fin"}: despues de cerrar el texto aun queda
+        por bajar todo el audio, y el que decide que se acabo es la bomba.
+        """
+        nonlocal arrancado
+        while True:
+            try:
+                msg = await ws.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                return "desconectado"
+            if msg["type"] == "websocket.disconnect":
+                return "desconectado"
+            crudo = msg.get("text")
+            if crudo is None:
+                await evento(tipo="error",
+                             texto="se esperaba JSON de texto, llego binario")
+                continue
+            try:
+                m = json.loads(crudo)
+            except (json.JSONDecodeError, TypeError):
+                await evento(tipo="error", texto="el mensaje no es JSON")
+                continue
+            accion = m.get("accion") if isinstance(m, dict) else None
+            if accion == "texto":
+                cuerpo = (m.get("texto") or "").strip()
+                if not cuerpo:
+                    await evento(tipo="error", texto="texto vacio")
+                    continue
+                try:
+                    n = s.alimentar(cuerpo)
+                except HTTPException as e:
+                    await evento(tipo="error", texto=str(e.detail))
+                    continue
+                if not arrancado:
+                    # Despues de alimentar, igual que por HTTP: el hilo se muere
+                    # solo si arranca sin nada que decir.
+                    s.arrancar()
+                    arrancado = True
+                await evento(tipo="texto", tokens=n, s=transcurrido())
+            elif accion == "fin":
+                s.cerrar()
+                if not arrancado:
+                    # Nunca hubo texto, asi que el hilo no arranco y nadie va a
+                    # poner el centinela en la cola. Sin esto la bomba se
+                    # quedaria esperando un fin que no llega.
+                    s.terminada = True
+                    s.cola.put_nowait(_FIN)
+                await evento(tipo="fin_texto", s=transcurrido())
+            elif accion == "abrir":
+                await evento(tipo="error",
+                             texto="la sesion ya esta abierta; abre otra conexion")
+            else:
+                await evento(tipo="error", texto=f"accion desconocida: {accion!r}")
+
+    try:
+        # ---- 1) primer mensaje: abrir ----
+        try:
+            crudo = await ws.receive_text()
+        except (WebSocketDisconnect, RuntimeError, KeyError):
+            return
+        try:
+            pet = json.loads(crudo)
+        except (json.JSONDecodeError, TypeError):
+            await evento(tipo="error", texto="el primer mensaje no es JSON")
+            return
+        if not isinstance(pet, dict) or pet.get("accion") != "abrir":
+            await evento(tipo="error",
+                         texto='el primer mensaje tiene que ser {"accion":"abrir"}')
+            return
+        try:
+            cfg = AbrirSesionWS(**{k: v for k, v in pet.items() if k != "accion"})
+        except Exception as e:
+            await evento(tipo="error",
+                         texto=f"ajustes invalidos: {str(e).splitlines()[0]}")
+            return
+        if abs(cfg.velocidad - 1.0) > 1e-3:
+            # Ver el bloque VELOCIDAD de arriba. Mejor un error claro que un
+            # audio con una costura cada 133 ms o un socket que no emite nada
+            # hasta el final.
+            await evento(
+                tipo="error",
+                texto="velocidad != 1 no se admite por websocket: estirar() "
+                      "necesita la locucion entera y aqui no tiene fin conocido. "
+                      "Usa /tts/stream para una frase suelta, o cambia el ritmo "
+                      "al reproducir.")
+            return
+        if not SESIONES_ACTIVAS:
+            await evento(tipo="error",
+                         texto="sesiones desactivadas (VIBEVOICE_SESIONES=0)")
+            return
+        _caducar_sesiones()
+        try:
+            prefijo_voz(cfg.voz)   # valida antes de montar nada
+        except HTTPException as e:
+            await evento(tipo="error", texto=str(e.detail))
+            return
+        nombre = cfg.sesion or f"ws-{uuid.uuid4().hex[:8]}"
+        if nombre in _SESIONES:
+            await evento(tipo="error", texto=f"la sesion '{nombre}' ya existe")
+            nombre = None
+            return
+        s = SesionViva(nombre, cfg.voz, cfg.cfg_scale, cfg.semilla, cfg.pasos,
+                       lazo)
+        # El audio ya sale por aqui: que GET /tts/sesion/{id}/audio no lo robe.
+        s.escuchando = True
+        _SESIONES[nombre] = s
+        await evento(tipo="abierta", sesion=nombre, voz=cfg.voz,
+                     cfg_scale=cfg.cfg_scale, semilla=cfg.semilla,
+                     pasos=cfg.pasos if cfg.pasos is not None else PASOS,
+                     ritmo=RITMO, formato="pcm_s16le_mono",
+                     rtf_esperado=RTF_MEDIDO, s=transcurrido())
+
+        # ---- 2) texto para arriba, audio para abajo ----
+        bomba = asyncio.create_task(bombear(), name=f"ws-audio-{nombre}")
+        lector = asyncio.create_task(leer(), name=f"ws-texto-{nombre}")
+        vigia = asyncio.create_task(vigilar(), name=f"ws-espera-{nombre}")
+        tareas = [bomba, lector, vigia]
+        # Termina lo que ocurra primero: o se acaba la locucion (bomba) o se va
+        # el cliente (lector). El vigia no decide nada, solo acompana.
+        await asyncio.wait({bomba, lector},
+                           return_when=asyncio.FIRST_COMPLETED)
+        if bomba.done() and bomba.result() == "hecho":
+            est = s.estado()
+            # En suppress porque la locucion puede acabar en el mismo instante
+            # en que el cliente cierra: entonces el socket ya no admite nada y
+            # eso no es un fallo que merezca una traza en el log.
+            with contextlib.suppress(Exception):
+                if est.get("error"):
+                    await evento(tipo="error", texto=est["error"])
+                await evento(tipo="hecho", s=transcurrido(), estado=est)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with contextlib.suppress(Exception):
+            await evento(tipo="error", texto=f"{type(e).__name__}: {e}")
+    finally:
+        for t in tareas:
+            t.cancel()
+        if tareas:
+            await asyncio.gather(*tareas, return_exceptions=True)
+        if s is not None:
+            # Se saca del registro ANTES de esperar al hilo: GET /tts/sesion/{id}
+            # tiene que dar 404 en cuanto se cae el websocket, no cuando el hilo
+            # se entere. Y se ABORTA en vez de cerrar educadamente porque ya no
+            # hay nadie escuchando (ver SesionViva.abortar).
+            _SESIONES.pop(nombre, None)
+            s.escuchando = False
+            s.abortar()
+            # join en un hilo del executor para no bloquear el bucle de eventos.
+            # El plazo es por si generate() se atasca: mas vale un aviso en el
+            # log que un handler colgado para siempre.
+            if not await lazo.run_in_executor(None, s.esperar_fin, 15.0):
+                print(f"[aviso] sesion {nombre}: el hilo sigue vivo 15 s despues "
+                      f"de abortar; puede quedar reteniendo _candado_modelo",
+                      flush=True)
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 def main() -> None:

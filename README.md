@@ -37,10 +37,41 @@ curl -X POST http://voz:8080/stt \
   -F archivo=@nota.ogg
 ```
 
-**VibeVoice empezó siendo un laboratorio y acabó siendo utilizable:** de **RTF
-5,39 a 0,75** (7,2× más rápido) y del primer sonido en **23,21 s a 0,20 s**. El
-viaje completo, con lo que funcionó y lo que no, está en
-[docs/optimizacion.md](docs/optimizacion.md).
+### Narrar un LLM según escribe: sesiones
+
+VibeVoice (puerto 8082) tiene además un modo de **sesión**: una sola locución
+continua a la que se le va metiendo texto conforme llega, en vez de una petición
+por frase.
+
+```bash
+curl -X POST http://voz:8082/tts/sesion/charla \
+     -d '{"texto":"El backup de anoche terminó sin errores."}'   # encola
+curl http://voz:8082/tts/sesion/charla/audio -o charla.wav &     # un solo WAV
+curl -X POST http://voz:8082/tts/sesion/charla \
+     -d '{"texto":"Los tres servicios responden con normalidad."}'
+curl -X POST http://voz:8082/tts/sesion/charla/fin                # cierra
+```
+
+Frase a frase con `/tts/stream` cada una empieza desde cero y suena a lista de
+frases sueltas. En una sesión el modelo nunca deja de hablar: el texto le llega
+por delante del habla y la prosodia sigue de una frase a la siguiente. Y el
+audio resultante es **idéntico bit a bit** al de haber pasado todo el texto de
+golpe en una sola llamada — comprobado con `scripts/sesiones_fidelidad.py`.
+
+Si el texto deja de llegar, el modelo espera parado (por defecto 20 s,
+`VIBEVOICE_ESPERA_TEXTO`) y cierra la locución bien en vez de dejarla colgada.
+Mientras espera no consume CPU, así que otras peticiones normales pasan.
+
+La misma sesión está también en `WS /tts/sesion/ws`, que es lo cómodo desde un
+navegador: el texto sube como JSON (`{"accion":"abrir"|"texto"|"fin"}`) y bajan
+marcos binarios `[tipo:1][longitud:4 BE][carga]` — tipo 0 PCM de 16 bits a
+24 kHz, tipo 1 evento JSON —, el mismo formato que usa
+`scripts/asistente_web.py`, así que su lector vale tal cual. La ventaja sobre
+HTTP no es el audio, que es **idéntico bit a bit** por los dos caminos, sino que
+el aviso de «el modelo se quedó sin texto» llega empujado en vez de por sondeo,
+y que al caerse el socket la sesión se aborta y libera el modelo sola. El HTTP
+se queda como está: es lo que se prueba con `curl`. Se verifica con
+`scripts/ws_fidelidad.py`.
 
 ## Tres cosas que conviene saber antes de empezar
 

@@ -129,12 +129,18 @@ def trocear(texto: str, forzar_final: bool = False, primera: bool = False,
     return trozos, resto
 
 
-def sintetizar(frase, url, token, voz, cfg):
-    """Pide una frase y devuelve sus trozos de PCM segun llegan."""
+def sintetizar(frase, url, token, voz, cfg, ajustes=None):
+    """Pide una frase y devuelve sus trozos de PCM segun llegan.
+
+    `ajustes` es un dict con lo opcional (pasos, velocidad, semilla); lo que no
+    venga, lo decide el servicio.
+    """
+    cuerpo = {"texto": frase, "voz": voz, "cfg_scale": cfg}
+    cuerpo.update({k: v for k, v in (ajustes or {}).items() if v is not None})
     pet = urllib.request.Request(
         f"{url}/tts/stream",
         method="POST",
-        data=json.dumps({"texto": frase, "voz": voz, "cfg_scale": cfg}).encode(),
+        data=json.dumps(cuerpo).encode(),
         headers={"content-type": "application/json",
                  **({"authorization": f"Bearer {token}"} if token else {})},
     )
@@ -157,8 +163,8 @@ def main():
     ap.add_argument("--url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
-    ap.add_argument("--cfg", type=float, default=3.0,
-                    help="guia CFG; 3.0 medido como el mas fiel")
+    ap.add_argument("--cfg", type=float, default=4.5,
+                    help="guia CFG. 4.5 suena mas marcado y es el defecto por\n                         gusto, pero CUESTA fidelidad: medido sobre 6 clips,\n                         WER medio 9,7 % a 3.0 frente a 16,7 % a 4.5, y el\n                         peor caso de 11,1 % a 33,3 %")
     ap.add_argument("--salida", help="escribir a un WAV en vez de reproducir")
     ap.add_argument("--bufer", type=float, default=1.5,
                     help="segundos de audio a acumular antes de empezar a sonar "
