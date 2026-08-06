@@ -416,7 +416,23 @@ def frenar_guia(modelo, freno: float = None) -> None:
     freno 0.75 -> RMS estable en -25 +-1,5 dB los 44 s enteros, 0,00 % de
     recorte, pico 0,71, y el WER de la locucion entera pasa de 9 % a 8 %.
     En frases sueltas no empeora: WER medio 10 % frente a 11 % sin freno.
-    De ahi el defecto 0.75; VIBEVOICE_FRENO_GUIA=0 lo desactiva y deja el
+    EL DEFECTO SE QUEDA EN 0.75. Se probo 0.85 en la VM y CUESTA FIDELIDAD:
+    9 clips con cfg 3.5 dieron WER medio 14,8 % y peor caso 50,0 %, frente a
+    9,7 % y 11,1 % con 0.75. Aplana la rampa de energia, si, pero a un precio
+    que no compensa. Queda como palanca por si alguien prefiere el volumen
+    plano a la precision.
+
+    El detalle de por que 0.75 no basta en OpenVINO: la deriva se corta del todo
+    en torch (pendiente +0,03) pero en OpenVINO, donde la cabeza de
+    prediccion va en int8, queda residuo -- pendiente +0,26, la norma del
+    latente de 8,2 a 9,1 y +3,8 dB de RMS por locucion. Eso es lo que se oia
+    como voz que se enturbia segun avanza. Con 0.85 la pendiente baja a
+    -0,05 y el RMS queda plano.
+
+    OJO CON SUBIRLO MAS: 1.0 tambien aplana la curva pero SOBREFRENA y la voz
+    colapsa (WER 71,6 %). El margen util es estrecho y esta cerca.
+
+    VIBEVOICE_FRENO_GUIA=0 lo desactiva y deja el
     comportamiento anterior bit a bit.
 
     Se sustituye sample_speech_tokens ENTERO en vez de envolverlo porque el
