@@ -6,6 +6,20 @@ El cliente empieza a oír ~0,2 s después de pedirlo, mientras el resto se
 genera. Verificado: los trozos emitidos son bit a bit identicos al audio
 completo (mismo md5 que la generacion no-streaming).
 
+Y para narrar algo que aun se esta escribiendo -- la salida de un LLM, por
+ejemplo -- hay ademas SESIONES, que son una sola locucion continua a la que se
+le va metiendo texto:
+
+    POST /tts/sesion/{id}        {"texto": "..."}    encola texto
+    GET  /tts/sesion/{id}/audio                      un WAV, toda la locucion
+    POST /tts/sesion/{id}/fin                        cierra la locucion
+
+Frase a frase con /tts/stream, cada una empieza desde cero y suena a lista de
+frases sueltas. En una sesion el modelo no deja de hablar entre frases. Y no es
+"parecido" a pasar todo el texto de golpe: es EL MISMO AUDIO, byte a byte
+(medido con 6 semillas, ver scripts/sesiones_fidelidad.py). El bloque SESIONES,
+mas abajo, explica como y que se probo antes.
+
 Medido en la VM: primer sonido 23,21 s -> 0,20 s. El tiempo TOTAL no cambia
 (22,4 s frente a 23,2), pero la espera percibida se divide por 116.
 
@@ -42,6 +56,7 @@ import os
 import platform
 import sys
 import struct
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -124,6 +139,13 @@ _estado: dict = {}
 # Un candado: UNA generacion a la vez. El modelo ya satura los 6 nucleos, asi
 # que dos en paralelo solo harian ambas mas lentas.
 _candado = asyncio.Lock()
+# Y este, ademas, porque las sesiones generan desde su PROPIO hilo, que no pasa
+# por el candado asincrono de /tts/stream. No es solo cuestion de rendimiento:
+# el planificador de difusion es un objeto COMPARTIDO del modelo
+# (model.noise_scheduler) con estado interno por solve -- step_index,
+# model_outputs --, asi que dos generaciones a la vez se corrompen la una a la
+# otra. Sin sesiones vivas nadie lo disputa y tomarlo cuesta nanosegundos.
+_candado_modelo = threading.Lock()
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -525,7 +547,6 @@ async def ciclo_vida(app: FastAPI):
     _estado["prefijos"] = {}
     ini = time.perf_counter()
     _estado["procesador"], _estado["modelo"] = cargar_modelo()
-    capturar_estados(_estado["modelo"])
 
     # Calentamiento: la primera generate() de un proceso paga asignaciones
     # unicas. Mejor pagarlas al arrancar que en la primera peticion real.
@@ -557,6 +578,9 @@ async def ciclo_vida(app: FastAPI):
         flush=True,
     )
     yield
+    for s in list(_SESIONES.values()):
+        s.cerrar()
+    _SESIONES.clear()
     _estado.clear()
 
 
@@ -641,236 +665,55 @@ class StreamerCancelable:
         return self.interno.get_stream(0)
 
 
-# generate() no devuelve el estado con el que termina: reasigna `outputs` y
-# `tts_lm_outputs` en su bucle local y solo entrega el audio. Como ese estado
-# final es justo lo que hace falta para enlazar con la frase siguiente, se
-# envuelven los dos forward para quedarse con el ultimo de cada uno.
-#
-# Vale un global porque el servicio ya serializa las generaciones con un
-# cerrojo: nunca hay dos a la vez con las que confundirse.
-#
-# OJO con lo que queda aqui dentro: en cada latente, generate() llama a
-# forward_tts_lm DOS veces, la positiva y la del CFG nulo, y la ultima es la
-# NEGATIVA. Asi que _ULTIMO["tts_lm"] es la rama negativa, con su caché de
-# longitud 1+N, no la positiva de 300 y pico. Comprobado por identidad del
-# objeto past_key_values: 0 de 6 coincidencias con la rama positiva.
-# Da igual, porque _continuacion solo usa ese valor para rellenar una fila que
-# nadie lee (ver el bloque SESIONES), pero si algun dia se usa de verdad, hay
-# que distinguir las dos ramas.
-_ULTIMO = {}
+def _ajustar_pasos(pasos: Optional[int]) -> None:
+    """Fija los pasos de difusion del modelo. Solo con el candado del modelo
+    tomado: es estado GLOBAL del modelo, no un parametro de la llamada."""
+    quiere = PASOS if pasos is None else pasos
+    if quiere != _estado.get("pasos_ahora", PASOS):
+        _estado["modelo"].set_ddpm_inference_steps(quiere)
+    _estado["pasos_ahora"] = quiere
 
 
-def capturar_estados(modelo) -> None:
-    """Envuelve forward_lm y forward_tts_lm para retener su ultima salida."""
-    if getattr(modelo, "_capturado", False):
-        return
-    for nombre in ("forward_lm", "forward_tts_lm"):
-        original = getattr(modelo, nombre, None)
-        if original is None:      # el motor de OpenVINO puede no tenerlos
-            print(f"[aviso] sin {nombre}: las sesiones quedan desactivadas")
-            return
-
-        def envuelto(*a, _o=original, _k=nombre.replace("forward_", ""), **kw):
-            salida = _o(*a, **kw)
-            _ULTIMO[_k] = salida
-            return salida
-
-        setattr(modelo, nombre, envuelto)
-    modelo._capturado = True
-
-
-# --------------------------------------------------------------------------
-# SESIONES: que una frase sepa que viene despues de otra
-#
-# Sin esto, cada peticion arranca con deepcopy(pristino): el modelo empieza
-# SIEMPRE desde el mismo estado acustico, asi que al narrar por frases suena
-# como una lista de frases sueltas y no como alguien hablando seguido.
-#
-# La caché KV si acumula lo generado, en sitio. Medido con una frase corta:
-# tts_lm 381 -> 406 posiciones, lm 130 -> 137. Lo que NO crece es
-# last_hidden_state, y generate() deduce de su longitud los input_ids falsos
-# y las mascaras de atencion. Si se reutiliza la caché crecida con el
-# last_hidden_state viejo, las longitudes no cuadran y sale ruido.
-#
-# Por eso la continuacion se fabrica: last_hidden_state pasa a tener la
-# longitud de la caché. Sus VALORES no importan, y esto ya NO es una deduccion
-# de leer el codigo: rellenando ese tensor con ruido gaussiano por cinco (todo
-# menos la ultima fila) el audio sale identico bit a bit en las tres frases.
-# generate() reasigna `outputs` y `tts_lm_outputs` con sus propios forward en
-# la primera vuelta del bucle, antes de leer ningun valor.
-#
-# La rama negativa (neg_lm/neg_tts_lm) vuelve al pristino a proposito: es la
-# condicion nula del CFG, no debe arrastrar contexto.
-#
-# ESTO NO FUNCIONA, Y NO ES CUESTION DE AFINARLO. Viene apagado por eso.
-#
-# Lo que falla NO es la maquinaria. La maquinaria es fiel: recortar la caché a
-# k posiciones da exactamente el mismo audio que haber parado la generacion en
-# el latente k, asi que el estado se transporta bien. Lo que falla es CUAL es
-# el estado que se transporta.
-#
-# Cada llamada termina cuando el clasificador de EOS dice que la locucion se
-# acabo, y despues aun se generan hasta 5 latentes mas (generate() no sale del
-# bucle de 6 hasta acabar la ventana). El estado que se guarda es, por tanto,
-# el de "ya he terminado de hablar". Al reanudar desde ahi y darle texto nuevo,
-# el modelo esta fuera de su distribucion y vuelve a disparar EOS en la primera
-# ventana: la frase sale muda (6 latentes, todos de silencio) y su texto, que
-# quedo pendiente, se cuela al principio de la SIGUIENTE frase. De ahi
-# transcripciones como "El tren llega a Manana por la tarde y vemos al parque".
-#
-# Medido con 6 frases x 4 semillas (11, 7, 3, 23), voz sp-Spk3_man, 6 pasos,
-# cfg 1,5, transcrito con faster-whisper base. "no dicho" es la fraccion de
-# palabras de la referencia que no aparecen (WER con inserciones gratis):
-#
-#                                   WER    no dicho   frases mudas
-#   sueltas                        25,0 %    21,5 %       0 / 24
-#   encadenadas                    50,5 %    42,5 %       7 / 24
-#   encadenadas, cola muda fuera   62,5 %    56,5 %       7 / 24
-#   encadenadas, cola muda + 6     54,7 %    28,0 %       1 / 18
-#
-# Las dos ultimas filas son los intentos de arreglo, y ninguno vale. Recortar
-# solo el silencio final deja al modelo igual de "acabado". Recortar seis
-# latentes mas si le devuelve el hilo -- deja de haber frases mudas -- pero
-# entonces REPITE el final de la frase anterior, porque el texto sigue en su
-# contexto y le ha desaparecido la prueba acustica de haberlo dicho
-# ("interesante. Espero que os guste mucho la explicacion").
-#
-# Las dos sospechas que habia quedan descartadas, las dos por experimento:
-#   1. El last_hidden_state de ceros NO se lee (ver arriba, audio identico con
-#      ruido dentro).
-#   2. La rama negativa NO es la culpable. Con cfg_scale=1,0 el CFG se reduce a
-#      half_eps = cond y la rama negativa no interviene en nada; aun asi
-#      encadenar sigue destrozando el audio (suelta 60,0 % de WER frente a
-#      143,3 % encadenada). Que crezca o no es irrelevante.
-#
-# QUE HARIA FALTA. generate() ya sabe encadenar: consume `tts_text_ids` en
-# ventanas de 5 tokens e intercala 6 latentes, y con las tres frases juntas en
-# UNA llamada el audio sale perfecto. Nunca dispara EOS a mitad porque el texto
-# le llega por delante del habla. Para tener eso por HTTP no vale trasplantar
-# caché entre llamadas: hay que dejar UNA generate() viva por sesion, en su
-# hilo, alimentandola con una cola de texto -- lo que obliga a tocar generate()
-# (hoy `tts_text_ids` es un tensor fijo) o a reimplementar su bucle aqui.
-SESIONES_ACTIVAS = os.environ.get("VIBEVOICE_SESIONES", "") == "1"
-_SESIONES = {}
-# Tope de la caché. Al pasarse, la sesion se reinicia al pristino: se pierde
-# la continuidad pero no la voz. Recortar por delante no vale, porque lo que
-# hay al principio es justo el prefijo que DEFINE la voz.
-TOPE_CACHE = int(os.environ.get("VIBEVOICE_TOPE_CACHE", "3000"))
-CADUCIDAD_SESION = float(os.environ.get("VIBEVOICE_CADUCIDAD_SESION", "300"))
-
-
-def _largo_cache(c):
-    v = getattr(c, "key_cache", None)
-    if not v:
-        capas = getattr(c, "layers", None)
-        v = [getattr(x, "keys", None) for x in capas] if capas else None
-    return int(v[0].shape[2]) if v and v[0] is not None else 0
-
-
-def _continuacion(usado, ultimo, base):
-    """Prefijo para la SIGUIENTE frase, a partir del que se acaba de gastar."""
-    cont = {"neg_lm": copy.deepcopy(base["neg_lm"]),
-            "neg_tts_lm": copy.deepcopy(base["neg_tts_lm"])}
-    for k in ("lm", "tts_lm"):
-        cache = usado[k].past_key_values
-        largo = _largo_cache(cache)
-        if not largo or k not in ultimo:
-            return None
-        # De `ultimo` solo se sacan la forma y el tipo: el contenido no lo lee
-        # nadie (y ademas es el de la rama negativa, ver _ULTIMO). Lo unico que
-        # importa de este tensor es su LONGITUD, que es de donde generate()
-        # deduce los input_ids falsos y las mascaras de atencion.
-        fin = ultimo[k].last_hidden_state[:, -1:, :]
-        h = torch.zeros(fin.shape[0], largo, fin.shape[2],
-                        dtype=fin.dtype, device=fin.device)
-        h[:, -1:, :] = fin
-        usado[k].last_hidden_state = h
-        cont[k] = usado[k]
-    return cont
-
-
-def _caducar_sesiones(ahora):
-    for s in [s for s, d in _SESIONES.items()
-              if ahora - d["visto"] > CADUCIDAD_SESION]:
-        _SESIONES.pop(s, None)
-
-
-def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, sesion=None,
-                pasos=None):
+def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
     """Cuerpo sincrono de la sintesis; corre en un hilo del executor."""
     procesador = _estado["procesador"]
-    # El candado ya serializa las generaciones, asi que cambiar los pasos del
-    # modelo aqui no puede pisar a otra peticion en curso.
-    if pasos is not None and pasos != _estado.get("pasos_ahora", PASOS):
-        _estado["modelo"].set_ddpm_inference_steps(pasos)
-        _estado["pasos_ahora"] = pasos
-    elif pasos is None and _estado.get("pasos_ahora", PASOS) != PASOS:
-        _estado["modelo"].set_ddpm_inference_steps(PASOS)
-        _estado["pasos_ahora"] = PASOS
-    # Antes de generar, no despues: el ruido se sortea dentro de generate().
-    if semilla is not None:
-        torch.manual_seed(semilla)
-    base = prefijo_voz(voz)
-
-    ahora = time.time()
-    partida, motivo = base, ""
-    sesion = sesion if SESIONES_ACTIVAS else None
-    if sesion:
-        _caducar_sesiones(ahora)
-        d = _SESIONES.get(sesion)
-        # Cambiar de voz a media sesion tiene que empezar de cero: la caché
-        # guardada lleva dentro el prefijo de la voz anterior.
-        if d and d["voz"] == voz:
-            if d["largo"] < TOPE_CACHE:
-                partida, motivo = d["prefijo"], f"continua ({d['largo']})"
-            else:
-                _SESIONES.pop(sesion, None)
-                motivo = f"reiniciada, tope {TOPE_CACHE}"
-
-    # deepcopy DOBLE: ni el procesador ni generate() tocan el de partida.
-    entradas = procesador.process_input_with_cached_prompt(
-        text=texto, cached_prompt=copy.deepcopy(partida),
-        padding=True, return_tensors="pt", return_attention_mask=True,
-    )
-    if EN_GPU:
-        entradas = a_dispositivo(entradas)
-    # El que se le pasa a generate() es el que se MUTA, asi que se guarda la
-    # referencia para poder leer la caché ya crecida al terminar.
-    gastado = copy.deepcopy(partida)
-    _ULTIMO.clear()
     try:
-        with torch.no_grad():
-            _estado["modelo"].generate(
-                **entradas,
-                max_new_tokens=None,
-                cfg_scale=cfg_scale,
-                tokenizer=procesador.tokenizer,
-                generation_config={"do_sample": False},
-                verbose=False,
-                # El streamer ya entrega cada trozo segun sale; sin esto
-                # generate() ADEMAS acumula la sintesis entera y la concatena
-                # al final, para devolver algo que aqui se ignora.
-                return_speech=False,
-                all_prefilled_outputs=gastado,
-                audio_streamer=streamer,
+        with _candado_modelo:
+            _ajustar_pasos(pasos)
+            # Antes de generar, no despues: el ruido se sortea dentro de
+            # generate().
+            if semilla is not None:
+                torch.manual_seed(semilla)
+            base = prefijo_voz(voz)
+            # deepcopy DOBLE: ni el procesador ni generate() tocan el pristino.
+            entradas = procesador.process_input_with_cached_prompt(
+                text=texto, cached_prompt=copy.deepcopy(base),
+                padding=True, return_tensors="pt", return_attention_mask=True,
             )
-        if sesion:
-            cont = _continuacion(gastado, _ULTIMO, base)
-            if cont is not None:
-                _SESIONES[sesion] = {"prefijo": cont, "voz": voz, "visto": ahora,
-                                     "largo": _largo_cache(cont["tts_lm"].past_key_values)}
-                if motivo:
-                    print(f"[sesion {sesion}] {motivo}", flush=True)
+            if EN_GPU:
+                entradas = a_dispositivo(entradas)
+            with torch.no_grad():
+                _estado["modelo"].generate(
+                    **entradas,
+                    max_new_tokens=None,
+                    cfg_scale=cfg_scale,
+                    tokenizer=procesador.tokenizer,
+                    generation_config={"do_sample": False},
+                    verbose=False,
+                    # El streamer ya entrega cada trozo segun sale; sin esto
+                    # generate() ADEMAS acumula la sintesis entera y la
+                    # concatena al final, para devolver algo que aqui se ignora.
+                    return_speech=False,
+                    all_prefilled_outputs=copy.deepcopy(base),
+                    audio_streamer=streamer,
+                )
     except GeneracionCancelada:
-        # El cliente corto: la sesion se tira, porque el estado quedo a medias.
         # Se avisa: cuando esto salta por error, callarlo cuesta horas.
-        _SESIONES.pop(sesion, None)
         print("[aviso] generacion cancelada por el cliente", flush=True)
     except Exception:
         # El futuro del executor no lo espera nadie, asi que sin esto un fallo
         # aqui desaparece sin dejar rastro y el cliente recibe silencio.
         import traceback
-        _SESIONES.pop(sesion, None)
         print("[error] generacion fallida:", flush=True)
         traceback.print_exc()
         raise
@@ -880,6 +723,484 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, sesion=None,
         # end() es idempotente.
         if streamer is not None:
             streamer.end()
+
+
+# --------------------------------------------------------------------------
+# SESIONES: UNA generate() VIVA por sesion, alimentada con texto segun llega
+#
+# EL PROBLEMA
+# Sin esto, cada peticion arranca con deepcopy(pristino): el modelo empieza
+# SIEMPRE desde el mismo estado acustico, asi que al narrar por frases suena
+# como una lista de frases sueltas y no como alguien hablando seguido.
+#
+# LO QUE SE PROBO ANTES Y NO FUNCIONA: TRASPLANTAR LA CACHÉ KV
+# Guardar el estado al final de una llamada y arrancar la siguiente desde ahi.
+# La maquinaria era fiel -- recortar la caché a k posiciones daba exactamente el
+# mismo audio que haber parado la generacion en el latente k --, pero el estado
+# transportado era el equivocado. Cada llamada termina cuando el clasificador de
+# EOS dice que la locucion se acabo, asi que lo que se guardaba era el estado de
+# "ya he terminado de hablar". Al reanudar desde ahi con texto nuevo, el modelo
+# vuelve a disparar EOS en la primera ventana: la frase sale MUDA y su texto,
+# que quedo pendiente, se cuela al principio de la SIGUIENTE. De ahi
+# transcripciones como "El tren llega a Manana por la tarde y vemos al parque".
+#
+# Medido entonces con 6 frases x 4 semillas, voz sp-Spk3_man, 6 pasos, cfg 1,5:
+#
+#                                   WER    no dicho   frases mudas
+#   sueltas                        25,0 %    21,5 %       0 / 24
+#   encadenadas (trasplante)       50,5 %    42,5 %       7 / 24
+#   ... recortando la cola muda    62,5 %    56,5 %       7 / 24
+#   ... recortando 6 latentes mas  54,7 %    28,0 %       1 / 18
+#
+# Ninguno de los dos arreglos vale: el segundo quita las frases mudas pero
+# entonces REPITE el final de la anterior. Y las dos sospechas que habia estan
+# descartadas por experimento: ni el last_hidden_state fabricado se lee (audio
+# identico bit a bit rellenandolo de ruido), ni la rama negativa es la culpable
+# (con cfg_scale=1,0 no interviene y encadenar sigue destrozando el audio).
+#
+# LO QUE SI FUNCIONA
+# generate() YA sabe encadenar: consume `tts_text_ids` en ventanas de 5 tokens
+# intercaladas con 6 latentes acusticos, y con varias frases en UNA sola llamada
+# el audio sale perfecto. Nunca dispara EOS a mitad porque EL TEXTO LE LLEGA POR
+# DELANTE DEL HABLA. Asi que en vez de partir la generacion en trozos, se deja
+# UNA sola viva en su hilo y se le va metiendo texto por debajo.
+#
+# El unico obstaculo era que `tts_text_ids` es un tensor fijo. Resulta que
+# generate() lo toca en tres sitios y nada mas -- .to(), .shape[1] y dos cortes
+# [:, a:b] --, asi que basta con pasarle un objeto que se haga pasar por tensor
+# y que RELEA su contenido en cada vuelta: TextoEnCurso. No hay que parchear ni
+# una linea de Microsoft, ni reimplementar el bucle.
+#
+# Y como la pausa no cambia ningun calculo -- el estado se queda quieto mientras
+# el hilo espera --, alimentar por trozos da EXACTAMENTE el mismo audio que
+# haber pasado todo el texto de golpe. Eso no hay que creerselo, se comprueba
+# por md5 (scripts/sesiones_fidelidad.py).
+#
+# MEDIDO ASI, con 6 frases x 6 semillas (11, 7, 3, 23, 42, 101), voz
+# sp-Spk3_man, 6 pasos, cfg 1,5, transcrito con whisper.cpp. "sesion" alimenta
+# frase a frase esperando a que el modelo se quede PARADO sin texto antes de
+# meter la siguiente, que es el caso dificil:
+#
+#                        WER    peor    mudas    repiten
+#   sueltas             0,8 %  16,7 %   0 / 36      0
+#   junta (1 llamada)   2,8 %  50,0 %   0 / 36      0
+#   sesion de golpe     2,8 %  50,0 %   0 / 36      0
+#   sesion frase a frase 2,8 % 50,0 %   0 / 36      0
+#
+#   audio identico bit a bit a 'junta': 6/6 semillas, en los dos modos de sesion
+#
+# Las tres ultimas filas son la MISMA fila: no es que se parezcan, es que el
+# audio es el mismo. Encadenar cuesta 2 puntos de WER frente a decir las frases
+# sueltas -- el peor caso es un "Tienes" que whisper oye "quiénes" --, y ese
+# coste es del modelo al encadenar, no de las sesiones: sale igual en 'junta',
+# que es el camino bueno de Microsoft. A cambio no hay ni una frase muda ni una
+# que repita a la anterior, que era justo lo que hundia al trasplante de caché.
+VENTANA_TEXTO = 5      # TTS_TEXT_WINDOW_SIZE de modeling_..._streaming_inference
+LATENTES_VENTANA = 6   # TTS_SPEECH_WINDOW_SIZE, idem
+
+SESIONES_ACTIVAS = os.environ.get("VIBEVOICE_SESIONES", "1") not in ("0", "no")
+# Tope de posiciones de la caché. Al pasarse, la locucion se cierra bien y la
+# sesion sigue con una generate() nueva desde el prefijo pristino: se pierde la
+# continuidad en esa costura, pero no la voz. Recortar por delante no vale,
+# porque lo que hay al principio es justo el prefijo que DEFINE la voz.
+# Cada ventana son 5 tokens de texto + 6 latentes = 11 posiciones ~ 0,8 s de
+# audio, asi que 3000 son unos tres minutos seguidos. El limite duro del modelo
+# son 8192 (decoder_config.max_position_embeddings) y ahi corta a lo bruto, a
+# mitad de palabra; por eso se para antes.
+TOPE_CACHE = int(os.environ.get("VIBEVOICE_TOPE_CACHE", "3000"))
+CADUCIDAD_SESION = float(os.environ.get("VIBEVOICE_CADUCIDAD_SESION", "300"))
+# Cuanto espera el bucle, parado, a que llegue mas texto antes de dar la
+# locucion por terminada. Es el margen que tiene el LLM de arriba para producir
+# la frase siguiente sin que se cierre la locucion.
+ESPERA_TEXTO = float(os.environ.get("VIBEVOICE_ESPERA_TEXTO", "20"))
+
+_SESIONES: dict = {}
+_FIN = object()   # centinela: se acabo el audio de la sesion
+
+
+class TextoEnCurso:
+    """Se hace pasar por el tensor `tts_text_ids`, pero CRECE mientras generate()
+    lo consume, y BLOQUEA el bucle cuando se queda sin texto por delante.
+
+    CONTRATO CON generate() (modeling_vibevoice_streaming_inference.py). De todo
+    el tensor, generate() usa exactamente esto y nada mas:
+
+        625  tts_text_ids = tts_text_ids.to(self.device)
+        672  ... if tts_text_ids.shape[1] >= TTS_TEXT_WINDOW_SIZE else ...
+        727  cur  = tts_text_ids[:, i*VENTANA:(i+1)*VENTANA]
+        728  next = tts_text_ids[:, (i+1)*VENTANA:(i+2)*VENTANA].shape[1]
+
+    SI MICROSOFT CAMBIA ESO, ESTO SE ROMPE. En concreto:
+      - Si materializan el tensor antes del bucle (`ids = tts_text_ids.clone()`),
+        deja de releerse y las sesiones se quedan mudas tras la primera frase.
+      - Si dejan de leer exactamente dos cortes por vuelta, se descuadra el
+        reparto cur/lookahead y `restante()` devolveria texto ya dicho (se
+        repetiria) o se comeria texto sin decir. Hay un aviso por consola.
+      - Si cambian VENTANA_TEXTO, hay que cambiarlo aqui tambien.
+
+    POR QUE NO SE PUEDE ENTREGAR UNA VENTANA A MEDIAS
+    Los cortes son ABSOLUTOS sobre el buffer: la ventana i son los tokens
+    [5i, 5i+5). Si en la vuelta i solo hay 3 tokens y se entregan, el bucle pasa
+    a la ventana i+1 = [5i+5, 5i+10) y los tokens 5i+3 y 5i+4 que lleguen
+    despues NO SE DICEN NUNCA. Por eso solo se sirve una ventana completa, y si
+    no lo esta, se espera.
+
+    Y POR QUE HAY QUE MIRAR UNA VENTANA MAS ALLA
+    `next_text_window_size` no es informativo: con el se alarga por adelantado
+    la mascara de atencion y el cache_position de la vuelta SIGUIENTE. Lo que se
+    promete ahi hay que cumplirlo token a token. Como el buffer solo crece y las
+    ventanas solo se sirven completas, la promesa se cumple sola... salvo al
+    sellar. Por eso sellar CONGELA el buffer: a partir de ahi ya no entra texto,
+    se sirve lo que quede -- ultima ventana corta incluida -- y el modelo cierra
+    la locucion con su EOS de siempre.
+    """
+
+    def __init__(self, ids, dispositivo, espera_max=ESPERA_TEXTO,
+                 al_pausar=None, al_reanudar=None,
+                 posicion_inicial=0, tope=TOPE_CACHE):
+        self._ids = list(ids)
+        self._dispositivo = dispositivo
+        self._espera_max = espera_max
+        self._al_pausar = al_pausar or (lambda: None)
+        self._al_reanudar = al_reanudar or (lambda: None)
+        self._cond = threading.Condition()
+        self._sellado = False
+        self._corte = None         # tope de caché: texto que ya no cabe aqui
+        self._toca_cur = True      # los cortes llegan alternados: cur, lookahead
+        self.posicion_inicial = posicion_inicial
+        self.tope = tope
+        self.consumidos = 0        # tokens que el bucle ya ha metido en el modelo
+        self.ventanas = 0
+        self.esperado = 0.0        # segundos que el bucle paso quieto
+        self.esperando = False     # ahora mismo, parado esperando texto
+        self.sellado_por_espera = False
+        self.sellado_por_tope = False
+        self.descuadre = False
+
+    # ---- lado del que alimenta (hilos de HTTP) ----
+    def alimentar(self, ids) -> bool:
+        """Anade texto. False si ya estaba sellado (hay que abrir otra)."""
+        with self._cond:
+            if self._sellado:
+                return False
+            self._ids.extend(ids)
+            self._cond.notify_all()
+            return True
+
+    def sellar(self) -> None:
+        """Se acabo el texto: que diga lo que le queda y cierre la locucion."""
+        with self._cond:
+            self._sellado = True
+            self._cond.notify_all()
+
+    @property
+    def sellado(self) -> bool:
+        with self._cond:
+            return self._sellado
+
+    def restante(self) -> list:
+        """Texto que entro pero que el modelo no llego a decir."""
+        with self._cond:
+            return self._ids[self.consumidos:]
+
+    def _disponible(self) -> int:
+        """Cuanto texto puede ver el bucle. Solo es menos que todo cuando el
+        tope de caché obliga a dejar el resto para la generate() siguiente."""
+        return len(self._ids) if self._corte is None else self._corte
+
+    def posicion(self) -> int:
+        """Posiciones ocupadas en la caché del tts_lm, contadas por fuera."""
+        return self.posicion_inicial + self.consumidos + LATENTES_VENTANA * self.ventanas
+
+    # ---- lado de generate() (hilo del modelo) ----
+    def to(self, dispositivo):
+        self._dispositivo = dispositivo
+        return self
+
+    @property
+    def shape(self):
+        # Solo se consulta para decidir el tamano de la PRIMERA ventana, que
+        # tiene que coincidir con el primer corte. Esperar aqui a tener una
+        # ventana entera es lo que garantiza que coincidan.
+        self._esperar(VENTANA_TEXTO)
+        with self._cond:
+            return (1, self._disponible())
+
+    def __getitem__(self, clave):
+        _, corte = clave
+        ini, fin = corte.start, corte.stop
+        self._esperar(fin)
+        with self._cond:
+            trozo = self._ids[ini:min(fin, self._disponible())]
+        if self._toca_cur:
+            if ini != self.ventanas * VENTANA_TEXTO and not self.descuadre:
+                # No es fatal, pero significa que el reparto cur/lookahead ya no
+                # es el que este codigo supone. Se avisa una vez.
+                self.descuadre = True
+                print(f"[aviso] tts_text_ids: corte inesperado {ini}:{fin} en la "
+                      f"ventana {self.ventanas}; revisa si generate() cambio de "
+                      f"forma de leer el texto", flush=True)
+            self.consumidos = ini + len(trozo)
+            self.ventanas += 1
+            with self._cond:
+                if self.posicion() > self.tope and self._corte is None:
+                    # No cabe mas en esta locucion. Se corta AQUI, en el borde
+                    # de una ventana ya servida: el siguiente vistazo devuelve 0
+                    # -- que es lo que se promete para la vuelta siguiente -- y
+                    # el modelo cierra con su EOS. Lo que queda se dice en la
+                    # generate() siguiente, con la voz intacta.
+                    self._corte = self.consumidos
+                    self._sellado = True
+                    self.sellado_por_tope = True
+                    self._cond.notify_all()
+                    print(f"[sesion] tope de caché ({self.tope}) en la posicion "
+                          f"{self.posicion()}: se cierra la locucion y sigue en "
+                          f"otra ({len(self._ids) - self.consumidos} tokens "
+                          f"pendientes)", flush=True)
+        self._toca_cur = not self._toca_cur
+        return torch.tensor([trozo], dtype=torch.long, device=self._dispositivo)
+
+    def _esperar(self, hasta: int) -> None:
+        with self._cond:
+            if self._sellado or self._disponible() >= hasta:
+                return
+        # A partir de aqui el bucle se queda QUIETO. Se suelta el candado del
+        # modelo para que otra peticion pueda usarlo mientras esta sesion calla:
+        # una sesion esperando texto no debe secuestrar la CPU de nadie.
+        marca = time.monotonic()
+        self.esperando = True
+        self._al_pausar()
+        try:
+            with self._cond:
+                queda = self._espera_max
+                while not self._sellado and self._disponible() < hasta and queda > 0:
+                    t = time.monotonic()
+                    self._cond.wait(queda)
+                    queda -= time.monotonic() - t
+                if not self._sellado and self._disponible() < hasta:
+                    # Se acabo la paciencia: mejor cerrar bien la locucion que
+                    # dejar al oyente con una frase colgada para siempre.
+                    self._sellado = True
+                    self.sellado_por_espera = True
+        finally:
+            self._al_reanudar()
+            self.esperando = False
+            self.esperado += time.monotonic() - marca
+
+
+class ColaAudioSesion:
+    """El `audio_streamer` que espera generate(), volcado a una cola asincrona.
+
+    No cierra la cola de la sesion al terminar: una sesion larga puede encadenar
+    varias generate() (al llegar al tope de caché) sobre el MISMO flujo de audio.
+    """
+
+    def __init__(self, lazo, cola):
+        self.lazo, self.cola = lazo, cola
+        self.cerrado = False
+        self.trozos = 0
+
+    def put(self, trozos, indices):
+        # Tras end() lo que llegue sobra: generate() no sale del bucle de 6
+        # latentes aunque el EOS salte a mitad, y esos ultimos son silencio.
+        if self.cerrado:
+            return
+        for i, idx in enumerate(indices):
+            if int(idx) != 0:
+                continue
+            self.trozos += 1
+            self.lazo.call_soon_threadsafe(
+                self.cola.put_nowait, trozos[i].detach().float().cpu())
+
+    def end(self, indices=None):
+        self.cerrado = True
+
+
+class SesionViva:
+    """Una generate() viva en su hilo, con una cola de texto por delante."""
+
+    def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo):
+        self.nombre = nombre
+        self.voz = voz
+        self.cfg_scale = cfg_scale
+        self.semilla = semilla
+        self.pasos = pasos
+        self.lazo = lazo
+        self.cola = asyncio.Queue()
+        self.visto = time.time()
+        self.cerrada = False
+        self.terminada = False
+        self.escuchando = False
+        self.generaciones = 0
+        self.error = None
+        self.eos_temprano = 0     # veces que el modelo callo con texto pendiente
+        self._pendiente = []
+        self._alimentador = None
+        self._entre_locuciones = False   # parado, pero no dentro de generate()
+        self._cond = threading.Condition()
+        self._hilo = threading.Thread(target=self._correr, daemon=True,
+                                      name=f"sesion-{nombre}")
+
+    # ---- API ----
+    def arrancar(self):
+        self._hilo.start()
+
+    def alimentar(self, texto: str) -> int:
+        """Encola texto. Va al alimentador vivo si lo hay; si no, a la reserva
+        para la generate() siguiente."""
+        # Exactamente como lo tokeniza el procesador para una peticion normal
+        # (process_input_with_cached_prompt: text.strip() + "\n"), asi que una
+        # frase por sesion produce los mismos tokens que esa frase suelta.
+        ids = _estado["procesador"].tokenizer.encode(
+            texto.strip() + "\n", add_special_tokens=False)
+        self.visto = time.time()
+        with self._cond:
+            if self.cerrada:
+                raise HTTPException(409, f"sesion '{self.nombre}' ya cerrada")
+            al = self._alimentador
+            if al is not None and al.alimentar(ids):
+                return len(ids)
+            self._pendiente.extend(ids)
+            self._cond.notify_all()
+        return len(ids)
+
+    def cerrar(self) -> None:
+        """Termina la locucion limpiamente: el modelo dice lo que le queda y
+        cierra con su EOS."""
+        with self._cond:
+            self.cerrada = True
+            al = self._alimentador
+            self._cond.notify_all()
+        if al is not None:
+            al.sellar()
+
+    def estado(self) -> dict:
+        al = self._alimentador
+        return {
+            "sesion": self.nombre, "voz": self.voz,
+            "viva": not self.terminada, "cerrada": self.cerrada,
+            "escuchando": self.escuchando, "generaciones": self.generaciones,
+            "pendientes": len(self._pendiente) + (len(al.restante()) if al else 0),
+            "posicion": al.posicion() if al else 0,
+            # Lo que mira el cliente para saber si puede mandar la frase
+            # siguiente sin que se le cuele un silencio: el modelo esta parado
+            # porque se ha quedado sin texto por delante.
+            "esperando": bool(al and al.esperando) or self._entre_locuciones,
+            "esperado_s": round(al.esperado, 2) if al else 0.0,
+            "eos_temprano": self.eos_temprano,
+            "error": self.error,
+        }
+
+    # ---- hilo ----
+    def _correr(self):
+        esperar_mas = False
+        try:
+            while True:
+                with self._cond:
+                    # Tras un corte por tope de caché la sesion SIGUE viva: el
+                    # modelo se ha puesto al dia con el texto, no es que se haya
+                    # acabado. Sin esta espera, la sesion moria justo aqui -- y
+                    # como el corte pasa cuando ya no queda nada pendiente, moria
+                    # SIEMPRE que se llegaba al tope, dejando al oyente colgado.
+                    fin_espera = time.monotonic() + ESPERA_TEXTO
+                    self._entre_locuciones = esperar_mas
+                    while (esperar_mas and not self._pendiente
+                           and not self.cerrada
+                           and time.monotonic() < fin_espera):
+                        self._cond.wait(fin_espera - time.monotonic())
+                    self._entre_locuciones = False
+                    if not self._pendiente:
+                        break
+                    ids, self._pendiente = self._pendiente, []
+                    al = TextoEnCurso(
+                        ids, DISPOSITIVO, ESPERA_TEXTO,
+                        al_pausar=_candado_modelo.release,
+                        al_reanudar=_candado_modelo.acquire,
+                        tope=TOPE_CACHE,
+                    )
+                    if self.cerrada:
+                        al.sellar()
+                    self._alimentador = al
+                self._generar(al)
+                with self._cond:
+                    # Lo que el modelo no llego a decir vuelve a la reserva y
+                    # abre la generate() siguiente.
+                    self._pendiente = al.restante() + self._pendiente
+                    self._alimentador = None
+                    if al.restante() and not al.sellado_por_tope:
+                        # El modelo cerro la locucion teniendo texto sin decir:
+                        # es justo el fallo que este diseno viene a evitar.
+                        self.eos_temprano += 1
+                        print(f"[aviso] sesion {self.nombre}: EOS con "
+                              f"{len(al.restante())} tokens sin decir", flush=True)
+                    if not al.consumidos:
+                        # No dijo NADA: seguir seria un bucle infinito diciendo
+                        # nada. Mejor terminar y que se vea.
+                        break
+                    # Cerrada pero con texto sin decir (solo pasa tras un EOS
+                    # prematuro): se abre otra y se dice, en vez de tragarselo.
+                    if self.cerrada and not self._pendiente:
+                        break
+                    if al.sellado_por_espera and not self._pendiente:
+                        break
+                    esperar_mas = True
+        except Exception as e:
+            import traceback
+            self.error = f"{type(e).__name__}: {e}"
+            print(f"[error] sesion {self.nombre}:", flush=True)
+            traceback.print_exc()
+        finally:
+            self.terminada = True
+            self.cerrada = True
+            self.lazo.call_soon_threadsafe(self.cola.put_nowait, _FIN)
+            devolver_memoria()
+
+    def _generar(self, al: TextoEnCurso):
+        procesador = _estado["procesador"]
+        base = prefijo_voz(self.voz)
+        _candado_modelo.acquire()
+        try:
+            _ajustar_pasos(self.pasos)
+            if self.semilla is not None:
+                torch.manual_seed(self.semilla)
+            # text="" porque el texto ya no viene de aqui: lo pone el
+            # alimentador. Lo unico que se aprovecha son los input_ids falsos
+            # y las mascaras, que salen de la longitud del prefijo de voz.
+            entradas = procesador.process_input_with_cached_prompt(
+                text="", cached_prompt=copy.deepcopy(base),
+                padding=True, return_tensors="pt", return_attention_mask=True,
+            )
+            if EN_GPU:
+                entradas = a_dispositivo(entradas)
+            entradas.pop("tts_text_ids")
+            al.posicion_inicial = int(entradas["tts_lm_input_ids"].shape[1])
+            self.generaciones += 1
+            with torch.no_grad():
+                _estado["modelo"].generate(
+                    **entradas,
+                    tts_text_ids=al,
+                    max_new_tokens=None,
+                    cfg_scale=self.cfg_scale,
+                    tokenizer=procesador.tokenizer,
+                    generation_config={"do_sample": False},
+                    verbose=False,
+                    show_progress_bar=False,
+                    return_speech=False,
+                    all_prefilled_outputs=copy.deepcopy(base),
+                    audio_streamer=ColaAudioSesion(self.lazo, self.cola),
+                )
+        finally:
+            _candado_modelo.release()
+
+
+def _caducar_sesiones() -> None:
+    ahora = time.time()
+    for nombre, s in list(_SESIONES.items()):
+        if s.terminada and not s.escuchando and ahora - s.visto > 5:
+            _SESIONES.pop(nombre, None)
+        elif ahora - s.visto > CADUCIDAD_SESION:
+            s.cerrar()
+            _SESIONES.pop(nombre, None)
 
 
 def cabecera_wav_flujo(ritmo: int = RITMO) -> bytes:
@@ -948,15 +1269,21 @@ class PeticionTTS(BaseModel):
     # ardilla o a resaca. De ahi el rango cerrado.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
-    # Frases de la misma sesion se encadenan: cada una empieza donde acabo la
-    # anterior en vez de volver al prefijo pristino. Sin sesion, se comporta
-    # igual que siempre.
-    # ROTO y apagado salvo VIBEVOICE_SESIONES=1: encadenar el estado entre
-    # llamadas dobla el WER (25 % -> 50 %) y deja mudas 7 de cada 24 frases.
-    # El bloque SESIONES explica por que no tiene arreglo por esta via.
-    sesion: Optional[str] = Field(None, min_length=1, max_length=64,
-                                  description="ROTO, requiere "
-                                              "VIBEVOICE_SESIONES=1")
+
+class PeticionSesion(BaseModel):
+    """Texto que se le mete a una sesion viva. La voz y los ajustes solo se
+    miran al CREARLA: cambiarlos a mitad exigiria empezar otra locucion."""
+    texto: str = Field(..., min_length=1, max_length=8000)
+    # voz OPCIONAL a proposito. Si tuviera valor por defecto, el cliente que
+    # manda solo {"texto": ...} en las frases siguientes -- que es lo natural --
+    # estaria pidiendo la voz por defecto sin saberlo y se llevaria un 409 por
+    # "cambio de voz a mitad de sesion". Solo se comprueba si viene puesta.
+    voz: Optional[str] = None
+    cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
+    semilla: Optional[int] = Field(None, ge=0, lt=2**31)
+    pasos: Optional[int] = Field(None, ge=4, le=20)
+    # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
+    fin: bool = False
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -982,8 +1309,12 @@ def health() -> dict:
         "pasos": PASOS,
         "voz_defecto": VOZ_DEFECTO,
         "rtf_esperado": RTF_MEDIDO,
-        "ocupado": _candado.locked(),
+        "ocupado": _candado.locked() or _candado_modelo.locked(),
         "auth": "bearer" if TOKEN else "abierta",
+        "sesiones": {"activas": SESIONES_ACTIVAS,
+                     "abiertas": sorted(_SESIONES),
+                     "espera_texto_s": ESPERA_TEXTO,
+                     "tope_cache": TOPE_CACHE},
     }
 
 
@@ -1014,7 +1345,7 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
                 None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
-                pet.semilla, pet.sesion, pet.pasos,
+                pet.semilla, pet.pasos,
             )
             try:
                 yield cabecera_wav_flujo(ritmo)
@@ -1056,6 +1387,121 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             "Content-Disposition": 'inline; filename="voz.wav"',
         },
     )
+
+
+# --------------------------------------------------------------------------
+# API de sesiones. Tres verbos y un flujo de audio:
+#
+#   POST /tts/sesion/{id}          {"texto": "..."}   crea la sesion y encola
+#   GET  /tts/sesion/{id}/audio                       WAV continuo, hasta el fin
+#   POST /tts/sesion/{id}/fin                         cierra la locucion
+#
+# El texto va por un lado y el audio por otro A PROPOSITO. La locucion es UNA,
+# continua, y el modelo va por detras del texto: cuando termina de decir la
+# frase 2 ya se le metio la 3. Devolver "el audio de esta frase" en la respuesta
+# de cada POST seria mentir, porque en ese instante todavia no existe.
+#
+# El orden es: POST con la primera frase, GET del audio, y a partir de ahi POST
+# cuantos haga falta. Un POST no espera a nada: vuelve en cuanto encola.
+
+
+def _sesion(nombre: str) -> "SesionViva":
+    s = _SESIONES.get(nombre)
+    if s is None:
+        raise HTTPException(404, f"no hay sesion '{nombre}'")
+    return s
+
+
+@app.post("/tts/sesion/{nombre}")
+async def sesion_texto(nombre: str, pet: PeticionSesion,
+                       _=Depends(autorizar)) -> dict:
+    """Encola texto. La primera llamada crea la sesion y arranca su generate().
+
+    Si la sesion anterior con ese nombre ya habia terminado -- por inactividad o
+    porque alguien la cerro --, esta llamada abre otra y la respuesta lo dice en
+    `reabierta`. Ojo: el flujo de /audio de la anterior ya se cerro, asi que hay
+    que volver a pedirlo.
+    """
+    if not SESIONES_ACTIVAS:
+        raise HTTPException(503, "sesiones desactivadas (VIBEVOICE_SESIONES=0)")
+    _caducar_sesiones()
+    prefijo_voz(pet.voz or VOZ_DEFECTO)  # valida antes de montar nada
+    s = _SESIONES.get(nombre)
+    reabierta = s is not None and s.terminada
+    if reabierta:
+        _SESIONES.pop(nombre, None)
+        s = None
+    nueva = s is None
+    if nueva:
+        s = SesionViva(nombre, pet.voz or VOZ_DEFECTO, pet.cfg_scale,
+                       pet.semilla, pet.pasos, asyncio.get_running_loop())
+        _SESIONES[nombre] = s
+    elif pet.voz is not None and pet.voz != s.voz:
+        raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
+                                 f"cierrala para cambiar de voz")
+    s.alimentar(pet.texto)
+    if nueva:
+        # Despues de alimentar: el hilo termina si arranca sin nada que decir.
+        s.arrancar()
+    if pet.fin:
+        s.cerrar()
+    return {**s.estado(), "reabierta": reabierta}
+
+
+@app.get("/tts/sesion/{nombre}/audio")
+async def sesion_audio(nombre: str, _=Depends(autorizar)) -> StreamingResponse:
+    """El audio de la sesion entera, como un solo WAV que va llegando."""
+    s = _sesion(nombre)
+    if s.escuchando:
+        raise HTTPException(409, f"ya hay un oyente en la sesion '{nombre}'")
+    s.escuchando = True
+
+    async def generador():
+        try:
+            yield cabecera_wav_flujo(RITMO)
+            while True:
+                trozo = await s.cola.get()
+                if trozo is _FIN:
+                    break
+                yield a_pcm16(trozo)
+        finally:
+            s.escuchando = False
+            # Si el que escuchaba se fue, la locucion no le sirve a nadie.
+            s.cerrar()
+            if s.terminada:
+                _SESIONES.pop(nombre, None)
+
+    return StreamingResponse(
+        generador(),
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Ritmo-Hz": str(RITMO),
+            "X-RTF-Esperado": str(RTF_MEDIDO),
+            "Content-Disposition": f'inline; filename="{nombre}.wav"',
+        },
+    )
+
+
+@app.post("/tts/sesion/{nombre}/fin")
+async def sesion_fin(nombre: str, _=Depends(autorizar)) -> dict:
+    """Cierra la locucion: el modelo dice lo que le queda y termina."""
+    s = _sesion(nombre)
+    s.cerrar()
+    return s.estado()
+
+
+@app.get("/tts/sesion/{nombre}")
+async def sesion_estado(nombre: str, _=Depends(autorizar)) -> dict:
+    return _sesion(nombre).estado()
+
+
+@app.delete("/tts/sesion/{nombre}")
+async def sesion_borrar(nombre: str, _=Depends(autorizar)) -> dict:
+    s = _sesion(nombre)
+    s.cerrar()
+    _SESIONES.pop(nombre, None)
+    return {"sesion": nombre, "cerrada": True}
 
 
 def main() -> None:

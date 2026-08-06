@@ -40,6 +40,31 @@ curl -X POST http://voz:8080/stt \
   -F archivo=@nota.ogg
 ```
 
+### Narrar un LLM según escribe: sesiones
+
+VibeVoice (puerto 8082) tiene además un modo de **sesión**: una sola locución
+continua a la que se le va metiendo texto conforme llega, en vez de una petición
+por frase.
+
+```bash
+curl -X POST http://voz:8082/tts/sesion/charla \
+     -d '{"texto":"El backup de anoche terminó sin errores."}'   # encola
+curl http://voz:8082/tts/sesion/charla/audio -o charla.wav &     # un solo WAV
+curl -X POST http://voz:8082/tts/sesion/charla \
+     -d '{"texto":"Los tres servicios responden con normalidad."}'
+curl -X POST http://voz:8082/tts/sesion/charla/fin                # cierra
+```
+
+Frase a frase con `/tts/stream` cada una empieza desde cero y suena a lista de
+frases sueltas. En una sesión el modelo nunca deja de hablar: el texto le llega
+por delante del habla y la prosodia sigue de una frase a la siguiente. Y el
+audio resultante es **idéntico bit a bit** al de haber pasado todo el texto de
+golpe en una sola llamada — comprobado con `scripts/sesiones_fidelidad.py`.
+
+Si el texto deja de llegar, el modelo espera parado (por defecto 20 s,
+`VIBEVOICE_ESPERA_TEXTO`) y cierra la locución bien en vez de dejarla colgada.
+Mientras espera no consume CPU, así que otras peticiones normales pasan.
+
 ## Tres cosas que conviene saber antes de empezar
 
 **VibeVoice apenas habla español.** El 1.5B y el Large-7B están entrenados solo

@@ -132,8 +132,8 @@ def trocear(texto: str, forzar_final: bool = False, primera: bool = False,
 def sintetizar(frase, url, token, voz, cfg, ajustes=None):
     """Pide una frase y devuelve sus trozos de PCM segun llegan.
 
-    `ajustes` es un dict con lo opcional (pasos, velocidad, semilla, sesion);
-    lo que no venga, lo decide el servicio.
+    `ajustes` es un dict con lo opcional (pasos, velocidad, semilla); lo que no
+    venga, lo decide el servicio.
     """
     cuerpo = {"texto": frase, "voz": voz, "cfg_scale": cfg}
     cuerpo.update({k: v for k, v in (ajustes or {}).items() if v is not None})
