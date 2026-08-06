@@ -156,6 +156,9 @@ rec {
     # "/" porque desde otro origen el navegador la bloquearia por CORS.
     # voz_stream.py la busca con Path(__file__).with_name(...).
     cp ${../../pkgs/vibevoice-cli/prueba.html} "$out/bin/prueba.html"
+    # El estirado temporal (velocidad sin cambiar el tono). Va al lado porque
+    # voz_stream.py lo importa por ruta, igual que prueba.html.
+    cp ${../../pkgs/vibevoice-cli/estirar.py} "$out/bin/estirar.py"
     chmod +x "$out/bin/vibevoice-cli.py" "$out/bin/voz-stream.py"
   '';
 }
