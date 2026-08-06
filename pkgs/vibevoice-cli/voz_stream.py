@@ -67,6 +67,7 @@ import gc
 import json
 import os
 import platform
+import re
 import secrets
 import sys
 import struct
@@ -114,6 +115,10 @@ OV_CODIGO = os.environ.get("VIBEVOICE_OV_CODIGO", "")
 IR_LM = os.environ.get("VIBEVOICE_IR_LM", "")
 IR_CABEZA = os.environ.get("VIBEVOICE_IR_CABEZA", "")
 IR_ACUSTICO = os.environ.get("VIBEVOICE_IR_ACUSTICO", "")
+# Cuanto se frena la extrapolacion de la guia (0 = nada, 1 = del todo). Ver
+# frenar_guia(): sin esto, una locucion larga con cfg alto se desboca de
+# volumen hasta recortar. El defecto se midio ahi.
+FRENO_GUIA = float(os.environ.get("VIBEVOICE_FRENO_GUIA", "0.75"))
 
 
 def elegir_dispositivo() -> str:
@@ -275,6 +280,10 @@ def cargar_modelo():
             procesador, modelo = cargar_ov(
                 MODELO_DIR, HILOS, IR_LM, IR_CABEZA, IR_ACUSTICO
             )
+            # El freno tambien aqui: sample_speech_tokens sigue siendo la de
+            # torch con este motor (solo cambian los grafos que llama), y la
+            # rampa de volumen se midio en LOS DOS motores.
+            frenar_guia(modelo)
             modelo.set_ddpm_inference_steps(PASOS)
             devolver_memoria()
             _estado["motor"] = "openvino"
@@ -302,6 +311,7 @@ def cargar_modelo():
     acelerar_convoluciones_depthwise(modelo)
     cebar_decoder_acustico(modelo)
     compartir_embeddings_muertos(modelo)
+    frenar_guia(modelo)
 
     if EN_GPU:
         modelo.to(DISPOSITIVO)
@@ -371,6 +381,83 @@ def cebar_decoder_acustico(modelo) -> None:
     tok._cebado = True
     print("[arranque] decoder cebado con silencio (quita el chasquido inicial)",
           flush=True)
+
+
+def frenar_guia(modelo, freno: float = None) -> None:
+    """Reescala la guia de la difusion para que una locucion larga no se
+    desboque de volumen (el "CFG rescale" de Lin et al. 2023, aplicado aqui).
+
+    EL FALLO QUE ARREGLA, medido (2026-08-06, 8 frases encadenadas, 42 s,
+    voz sp-Spk1_man, semilla 11, 6 pasos): con cfg 4.5 el RMS sube de
+    -22 dB a -7 dB en los primeros 20 segundos de locucion y se queda ahi,
+    con hasta un 4,8 % de muestras recortadas en el peor tramo de 5 s -- eso
+    es la voz "creciendo hasta distorsionarse" que se oia en el asistente.
+    No es del motor (openvino 1,85 % de recorte, torch-mps 0,30 %, la misma
+    rampa en ambos) ni de las sesiones (una peticion larga por /tts/stream da
+    EXACTAMENTE el mismo audio); es del modelo al encadenar contexto largo:
+    los latentes que genera vuelven a entrar como contexto, con cfg > 1 la
+    extrapolacion uncond + cfg*(cond - uncond) los saca un poco mas de rango
+    en cada vuelta, y el bucle se realimenta hasta que el decodificador
+    satura. Por frases sueltas no se ve porque cada peticion arranca de cero
+    y en ~5 s la deriva no da tiempo a nada (0,00 % de recorte en 8 frases).
+    Con cfg 1.5 tampoco (RMS plano en -25 dB), pero cfg bajo cuesta
+    fidelidad: WER peor 85,7 % (ver PeticionTTS.cfg_scale).
+
+    EL ARREGLO: tras extrapolar, el eps guiado se reescala para que su
+    desviacion tipica vuelva a ser la de la rama condicional -- la energia
+    que el modelo aprendio en entrenamiento -- y se mezcla con el original
+    segun `freno` (0 = todo extrapolado, como antes; 1 = todo reescalado).
+    Eso corta la realimentacion sin renunciar a la direccion de la guia.
+
+    MEDIDO con el mismo banco (misma semilla, mismas 8 frases, cfg 4.5,
+    torch-mps): freno 0 -> rampa de -22,5 a -9,3 dB y 0,30 % de recorte;
+    freno 0.75 -> RMS estable en -25 +-1,5 dB los 44 s enteros, 0,00 % de
+    recorte, pico 0,71, y el WER de la locucion entera pasa de 9 % a 8 %.
+    En frases sueltas no empeora: WER medio 10 % frente a 11 % sin freno.
+    De ahi el defecto 0.75; VIBEVOICE_FRENO_GUIA=0 lo desactiva y deja el
+    comportamiento anterior bit a bit.
+
+    Se sustituye sample_speech_tokens ENTERO en vez de envolverlo porque el
+    reescalado va DENTRO del bucle de pasos, entre la extrapolacion y el
+    solver: desde fuera no hay donde engancharse. Copia fiel de upstream
+    (modeling_vibevoice_streaming_inference.py, sample_speech_tokens) mas
+    las tres lineas del freno; si Microsoft cambia esa funcion, esto hay
+    que re-copiarlo.
+    """
+    import types
+
+    fi = FRENO_GUIA if freno is None else freno
+    if fi <= 0:
+        return
+
+    @torch.no_grad()
+    def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
+        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
+        condition = torch.cat([condition, neg_condition], dim=0).to(
+            self.model.prediction_head.device)
+        speech = torch.randn(condition.shape[0],
+                             self.config.acoustic_vae_dim).to(condition)
+        for t in self.model.noise_scheduler.timesteps:
+            half = speech[: len(speech) // 2]
+            combined = torch.cat([half, half], dim=0)
+            eps = self.model.prediction_head(
+                combined, t.repeat(combined.shape[0]).to(combined),
+                condition=condition)
+            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            # ---- el freno: la energia del eps guiado vuelve a la de la
+            # rama condicional, y se mezcla segun `fi` ----
+            std_cond = cond_eps.std(dim=-1, keepdim=True)
+            std_guiado = half_eps.std(dim=-1, keepdim=True)
+            half_eps = (fi * (half_eps * (std_cond / (std_guiado + 1e-8)))
+                        + (1.0 - fi) * half_eps)
+            eps = torch.cat([half_eps, half_eps], dim=0)
+            speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
+        return speech[: len(speech) // 2]
+
+    modelo.sample_speech_tokens = types.MethodType(sample_speech_tokens, modelo)
+    print(f"[arranque] freno de guia {fi} (una locucion larga ya no se "
+          f"desboca de volumen)", flush=True)
 
 
 class ConvDepthwiseRapida(torch.nn.Module):
@@ -889,6 +976,12 @@ ESPERA_TEXTO = float(os.environ.get("VIBEVOICE_ESPERA_TEXTO", "20"))
 # dejar que un descarrile se coma minutos de CPU y de oyente.
 MARGEN_EOS = int(os.environ.get("VIBEVOICE_MARGEN_EOS", "100"))
 
+# Tramo FINAL de puntuacion de un trozo. Es lo que el pretokenizador de Qwen2
+# puede fundir con un "\n" posterior (".\n" es un token), asi que se retiene
+# hasta saber que viene detras; ver SesionViva.alimentar(). \w en vez de
+# \p{L}\p{N} deja fuera el "_", que en texto hablado no aparece.
+_COLA_PUNTUACION = re.compile(r"[^\s\w]+$")
+
 _SESIONES: dict = {}
 _FIN = object()   # centinela: se acabo el audio de la sesion
 
@@ -1137,6 +1230,8 @@ class SesionViva:
         self.error = None
         self.eos_temprano = 0     # veces que el modelo callo con texto pendiente
         self.abortada = False     # el cliente se fue: cortar sin miramientos
+        self._hablado = False     # ya entro texto: los siguientes llevan costura
+        self._cola_punt = ""      # puntuacion final retenida; ver alimentar()
         self._pendiente = []
         self._alimentador = None
         self._audio = None        # el ColaAudioSesion de la generate() en curso
@@ -1155,21 +1250,65 @@ class SesionViva:
     def alimentar(self, texto: str) -> int:
         """Encola texto. Va al alimentador vivo si lo hay; si no, a la reserva
         para la generate() siguiente."""
-        # Exactamente como lo tokeniza el procesador para una peticion normal
-        # (process_input_with_cached_prompt: text.strip() + "\n"), asi que una
-        # frase por sesion produce los mismos tokens que esa frase suelta.
-        # VERIFICADO: alimentar frase a frase da audio IDENTICO BIT A BIT al de
-        # mandar el texto entero en una sola llamada -- siempre que se compare
-        # contra el texto unido con SALTOS DE LINEA, no con espacios. Unir con
-        # espacios da otro audio (5,33 s frente a 6,80 s) porque es otro texto,
-        # no porque la sesion haga nada raro. Comparar contra la referencia
-        # equivocada costo media investigacion.
-        ids = _estado["procesador"].tokenizer.encode(
-            texto.strip() + "\n", add_special_tokens=False)
+        # EL SEPARADOR ENTRE TROZOS ES PROSODIA, no un detalle de formato.
+        # Antes cada trozo se tokenizaba como texto.strip() + "\n", que es lo
+        # que hace el procesador con una peticion suelta. Pero el modelo trata
+        # el salto de linea como frontera de PARRAFO y mete una pausa larga y
+        # ademas ERRATICA. Medido (Mac, torch-mps, misma semilla 11, 6 trozos
+        # de un texto seguido, silencio = tramos bajo el 2 % del pico):
+        #
+        #   "\n" en cada costura      30,9 s · 7,3 s callado · pausas de
+        #                             0,9 s (tras una COMA), 2,4 s y 1,6 s
+        #   "\n" solo tras .!?        31,7 s · 5,9 s callado · aun una de 2,7 s
+        #   espacio en toda costura   28,1 s · 2,5 s callado · la mas larga
+        #                             0,37 s, y el WER identico (10 %)
+        #
+        # La pausa de 0,9 s tras la coma era el caso mas grave: el troceador
+        # de arriba (scripts/narrador.py) corta por comas o por espacios para
+        # arrancar pronto, y el "\n" acababa incrustado en mitad de una frase
+        # del LLM. Pero incluso en un punto de verdad el "\n" mete pausas de
+        # hasta 2,7 s donde el punto con espacio pone 0,3 s. Asi que el texto
+        # que ve el modelo es ahora EL QUE ESCRIBIO EL LLM: los trozos se
+        # cosen con espacio -- el LLM separa sus frases con ". ", no con
+        # saltos de linea -- y el unico "\n" es el del final de la locucion,
+        # que lo pone cerrar() igual que el procesador en una peticion suelta.
+        # Un cliente que QUIERA una pausa de parrafo puede seguir mandando el
+        # "\n" dentro de su propio texto: aqui solo se quita el inventado.
+        #
+        # El espacio va como PREFIJO del trozo siguiente, no como sufijo del
+        # anterior, porque el BPE funde " y" en un token: sufijo daria un
+        # token de espacio suelto y OTRO texto. VERIFICADO con el tokenizador:
+        # encode(trozo) + encode(" resto") == encode("trozo resto") token a
+        # token, asi que alimentar por trozos sigue dando EXACTAMENTE los
+        # mismos ids -- y por tanto el mismo audio bit a bit -- que el texto
+        # continuo equivalente en una sola llamada (se comprueba por md5 en
+        # scripts/ws_fidelidad.py, ahora contra " ".join).
+        #
+        # LA PUNTUACION FINAL SE RETIENE hasta saber que viene detras. El
+        # pretokenizador de Qwen2 deja que un tramo de puntuacion absorba los
+        # saltos de linea que le sigan (" ?[^\s\p{L}\p{N}]+[\r\n]*"), asi que
+        # "texto." + "\n" del cierre tokeniza DISTINTO segun se codifique
+        # junto (un token ".\n") o por separado ("." y "\n") -- se midio: era
+        # el unico token de 120 que divergia de la peticion unica, y con el
+        # su audio. Retener el tramo final de puntuacion y soltarlo pegado a
+        # lo siguiente (el trozo que viene, o el "\n" del cierre) restaura la
+        # igualdad exacta. Cortar delante de la puntuacion es seguro: letras
+        # y digitos no absorben nada, encode("texto")+encode(".") ==
+        # encode("texto."). El retardo es de un token y el modelo de todas
+        # formas no habla hasta tener dos ventanas por delante.
         self.visto = time.time()
         with self._cond:
             if self.cerrada:
                 raise HTTPException(409, f"sesion '{self.nombre}' ya cerrada")
+            pieza = (self._cola_punt + (" " if self._hablado else "")
+                     + texto.strip())
+            m = _COLA_PUNTUACION.search(pieza)
+            self._cola_punt = m.group(0) if m else ""
+            if m:
+                pieza = pieza[:m.start()]
+            ids = _estado["procesador"].tokenizer.encode(
+                pieza, add_special_tokens=False)
+            self._hablado = True
             al = self._alimentador
             if al is not None and al.alimentar(ids):
                 return len(ids)
@@ -1181,6 +1320,20 @@ class SesionViva:
         """Termina la locucion limpiamente: el modelo dice lo que le queda y
         cierra con su EOS."""
         with self._cond:
+            if self.cerrada:
+                return
+            # El texto sellado termina en "\n", igual que el de una peticion
+            # normal (text.strip() + "\n"): es la unica frontera de parrafo
+            # legitima -- el final -- y con ella el EOS sale como siempre. Se
+            # codifica PEGADO a la puntuacion retenida (".\n" es UN token para
+            # el BPE); ver el bloque de alimentar().
+            if self._hablado or self._cola_punt:
+                ids = _estado["procesador"].tokenizer.encode(
+                    self._cola_punt + "\n", add_special_tokens=False)
+                self._cola_punt = ""
+                al = self._alimentador
+                if al is None or not al.alimentar(ids):
+                    self._pendiente.extend(ids)
             self.cerrada = True
             al = self._alimentador
             self._cond.notify_all()
@@ -1749,9 +1902,10 @@ async def sesion_borrar(nombre: str, _=Depends(autorizar)) -> dict:
 # Por debajo es SesionViva, la misma clase, sin una rama especial. Asi que
 # respeta _candado_modelo igual (lo toma _generar), suelta el candado mientras
 # espera texto igual (TextoEnCurso._esperar, via al_pausar/al_reanudar) y
-# tokeniza igual (texto.strip() + "\n"). De ahi que el audio salga IDENTICO bit
-# a bit al de la via HTTP, que es lo que se comprueba por md5. El HTTP se queda
-# intacto: es lo que corre en la VM y lo que se prueba con curl.
+# tokeniza igual (trozos cosidos con espacio y un "\n" al final; ver
+# alimentar()). De ahi que el audio salga IDENTICO bit a bit al de la via
+# HTTP, que es lo que se comprueba por md5. El HTTP se queda intacto: es lo
+# que corre en la VM y lo que se prueba con curl.
 #
 # PROTOCOLO
 # Del cliente al servidor, mensajes de TEXTO con JSON:

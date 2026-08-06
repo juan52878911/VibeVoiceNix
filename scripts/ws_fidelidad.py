@@ -9,10 +9,12 @@ Cuatro cosas, y las cuatro con numeros:
   1. FIDELIDAD. El PCM que baja por el websocket tiene que ser IDENTICO -- md5,
      no "parecido" -- al de la sesion HTTP con las mismas frases, la misma voz
      y la misma semilla, y tambien al de /tts/stream con las frases unidas por
-     SALTO DE LINEA. Lo de los saltos de linea no es un detalle: la sesion
-     tokeniza cada frase como texto.strip() + "\\n", asi que unir con espacios
-     da OTRO texto y por tanto otro audio. Comparar contra la referencia
-     equivocada es el error clasico aqui.
+     ESPACIO. El separador no es un detalle: la sesion cose los trozos con
+     espacio y pone un unico "\\n" al final de la locucion (igual que hace el
+     procesador con una peticion suelta), desde que se midio que un "\\n" por
+     costura mete pausas de parrafo erraticas -- hasta 2,7 s -- en mitad de la
+     locucion; ver SesionViva.alimentar() en voz_stream.py. Comparar contra la
+     referencia equivocada es el error clasico aqui.
 
      El websocket ademas se alimenta en el CASO DIFICIL: cada frase se manda
      solo cuando llega el evento esperando=true, es decir cuando el modelo ya
@@ -291,7 +293,10 @@ def main():
               f"{time.time()-t:5.1f} s · {len(pcm_ses)} bytes · md5 {md5(pcm_ses)}")
 
         t = time.time()
-        pcm_str = http_stream(a.url, a.token, "\n".join(FRASES), a.voz, a.cfg,
+        # Con ESPACIOS: la sesion cose los trozos con espacio y solo pone el
+        # "\n" del final de la locucion (SesionViva.alimentar/cerrar), que
+        # /tts/stream anade igual por su cuenta (text.strip() + "\n").
+        pcm_str = http_stream(a.url, a.token, " ".join(FRASES), a.voz, a.cfg,
                               a.semilla, a.pasos)
         print(f"[http stream] {dur(pcm_str):5.2f} s de audio en "
               f"{time.time()-t:5.1f} s · {len(pcm_str)} bytes · md5 {md5(pcm_str)}")

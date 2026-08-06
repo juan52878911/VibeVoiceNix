@@ -221,7 +221,11 @@ def main():
                                 "muda": len(hip) == 0 or not set(hip) & set(ref)})
             else:
                 if modo == "junta":
-                    pcm, dur = sintetizar("\n".join(frases), a.voz_url,
+                    # Con ESPACIOS, no con saltos de linea: es como la sesion
+                    # cose los trozos desde que se midio que el "\n" mete
+                    # pausas de parrafo erraticas (hasta 2,7 s) en cada
+                    # costura; ver SesionViva.alimentar() en voz_stream.py.
+                    pcm, dur = sintetizar(" ".join(frases), a.voz_url,
                                           a.token_voz, a.voz, a.cfg, semilla, ruta)
                 else:
                     s = Sesion(a.voz_url, a.token_voz, f"{modo}-{semilla}",
