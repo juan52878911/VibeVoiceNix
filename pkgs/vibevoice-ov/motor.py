@@ -30,11 +30,27 @@ Orden de carga pensado para el techo de 5 GB de RAM:
 """
 import gc
 import time
+import weakref
 
 import numpy as np
 import torch
 
 CRONO = {"tts_lm": [0.0, 0], "cabeza": [0.0, 0], "acustico": [0.0, 0]}
+
+
+def _referencia(obj):
+    """Callable que devuelve `obj`, debil si se puede. None -> None.
+
+    Debil porque quien lo usa (AcusticoOV) apunta a un objeto de generate() y no
+    debe alargarle la vida. El repliegue fuerte es por si algun dia el objeto no
+    admite weakref: mejor retener 711 KB de mas que tumbar el motor entero.
+    """
+    if obj is None:
+        return None
+    try:
+        return weakref.ref(obj)
+    except TypeError:
+        return lambda o=obj: o
 
 
 class SalidaLM:
@@ -144,8 +160,64 @@ class CabezaOV(torch.nn.Module):
 class AcusticoOV:
     """Reemplazo de acoustic_tokenizer.decode: IR con estado, formas fijas.
 
-    El estado interno de OV sustituye a VibeVoiceTokenizerStreamingCache;
-    nueva_sesion() lo pone a cero (== cache vacia) antes de cada generate.
+    El estado interno de OV sustituye a VibeVoiceTokenizerStreamingCache: las
+    34 colas de las convoluciones causales, que en el original viven en el
+    objeto `cache` que generate() pasa en cada llamada a decode().
+
+    EL ESTADO ES DE UNA CORRIENTE, NO DEL PROCESO  (esto era un fallo)
+    Aqui solo hay UN InferRequest, y su estado es unico para todo el proceso.
+    Al principio se ponia a cero una sola vez, en el constructor, y a partir de
+    ahi cada sintesis heredaba las colas que dejo la ANTERIOR. Efecto medido en
+    la VM (motor openvino, mismo texto, misma voz, misma semilla 11, 6 pasos):
+
+        A1  827c4228...      <- cada una arranca donde acabo la de antes
+        A2  675d3c46...
+        A3  18df1982...
+        A4  f981fc55...      <- y a partir de aqui converge a un punto fijo
+        A5  f981fc55...
+        A6  f981fc55...
+        B   (otro texto)
+        A7  3b33e3fd...      <- B ensucia el estado y vuelve a empezar la deriva
+
+    Los 121600 bytes eran SIEMPRE los mismos: el ruido de la difusion si estaba
+    bien sembrado -- torch.manual_seed() lo gobierna, porque sample_speech_tokens
+    sigue siendo la de torch --, y lo que cambiaba era solo el contexto del que
+    partia este decodificador. Convergir a un punto fijo es justo la firma de una
+    memoria convolucional que se desvanece; ruido sin semilla no convergeria
+    nunca.
+
+    EL ARREGLO: EL ESTADO SIGUE AL `cache` QUE LO PIDE
+    generate() crea un VibeVoiceTokenizerStreamingCache NUEVO por llamada
+    (modeling_vibevoice_streaming_inference.py, linea 661) y lo pasa en cada
+    decode(). Ese objeto es, por tanto, la identidad de la corriente. Aqui se
+    mira: si el que llega no es el dueño del estado que hay puesto, se le hace
+    una foto al estado, se le cuelga al dueño anterior, y se carga la del nuevo
+    (ceros si nunca ha hablado). Asi cada generate() tiene su propio hilo de
+    estado acustico, igual que en torch, sin tocar upstream.
+
+    POR QUE ASI Y NO RESETEANDO AL EMPEZAR CADA SINTESIS
+    Un reset por sintesis arregla /tts/stream, pero NO las sesiones vivas: una
+    sesion suelta el candado del modelo en cada pausa y otra se cuela en mitad de
+    su locucion, con su propia generate() y su propio cache. Con reset a secas la
+    primera reanudaria con el estado de la segunda. Siguiendo al cache, cada una
+    recupera EL SUYO, que es lo que hace que dos sesiones concurrentes con la
+    misma semilla den el mismo audio -- la misma garantia que el RNG por sesion
+    de SesionViva._pausar en voz_stream.py.
+
+    POR QUE UNA FOTO Y NO UN InferRequest POR CORRIENTE
+    Un InferRequest por sintesis se llevaria tambien los tensores intermedios del
+    grafo, y esto corre en una VM de 5 GB. La foto son 711 KB y cuesta 1,4 ms
+    medidos (foto + reposicion), contra 52 ms de UN solo decode de los ~40 que
+    lleva una frase. Ademas la foto es fiel bit a bit: comprobado que reponerla y
+    seguir da exactamente el mismo audio que no haber parado.
+
+    CEBADO
+    El decodificador es causal: en frio no tiene contexto por la izquierda y la
+    primera muestra sale con un salto. Es el mismo problema que cebar_decoder_
+    acustico() resuelve en el camino torch, y que aqui no se aplicaba porque
+    cargar_modelo() no llega a esa parte cuando el motor es openvino. Medido con
+    este IR: primera muestra -2,88e-05 en frio, -3,52e-07 tras cebar con un
+    latente nulo. Cuesta un decode (52 ms) por sintesis, no por fotograma.
     """
 
     def __init__(self, ruta_xml, hilos):
@@ -163,19 +235,61 @@ class AcusticoOV:
         for est in self.pet.query_state():
             c, l = formas[int(re.search(r"est\.(\d+)\.", est.name).group(1))]
             self._ceros[est.name] = np.zeros((1, c, l), dtype=np.float32)
+        # weakref: el dueño es un objeto de generate(), y cuando esa generate()
+        # muere su estado sobra. Con una referencia normal lo mantendriamos vivo
+        # -- a el y a sus 711 KB -- hasta la sintesis siguiente.
+        self._duenno = None
         self.nueva_sesion()
 
-    def nueva_sesion(self):
-        self.pet.reset_state()
+    # ---- estado: leerlo, ponerlo, y cambiar de corriente ----
+    def _foto(self):
+        # copy=True de verdad: .data es una VISTA de la memoria de OV, que la
+        # siguiente infer() sobrescribe.
+        return {est.name: np.array(est.state.data, copy=True)
+                for est in self.pet.query_state()}
+
+    def _poner(self, estados):
         for est in self.pet.query_state():
-            est.state = self._ov.Tensor(self._ceros[est.name])
+            # .copy() para no entregarle a OV la misma memoria que guardamos:
+            # si la compartiera, la foto dejaria de ser una foto.
+            est.state = self._ov.Tensor(
+                np.ascontiguousarray(estados[est.name], dtype=np.float32).copy())
+
+    def nueva_sesion(self):
+        """Estado a cero == cache vacia del original. Suelta al dueño actual."""
+        self.pet.reset_state()
+        self._poner(self._ceros)
+        self._duenno = None
+
+    def _cambiar_a(self, cache):
+        """Deja puesto el estado de `cache`. Devuelve True si estrena (venia
+        de ceros y por tanto toca cebar)."""
+        viejo = self._duenno() if self._duenno is not None else None
+        if cache is not None and viejo is cache:
+            return False                      # sigue la misma generate()
+        if viejo is not None:
+            viejo._estado_ov = self._foto()
+        # cache=None es use_cache=False del original: cada llamada, en frio.
+        guardado = getattr(cache, "_estado_ov", None) if cache is not None else None
+        if guardado is None:
+            self.pet.reset_state()
+            self._poner(self._ceros)
+        else:
+            self._poner(guardado)
+        self._duenno = _referencia(cache)
+        return guardado is None
 
     def decode(self, latents, cache=None, sample_indices=None, use_cache=True, debug=False):
         lat = latents.detach().float()
         if lat.shape[1] != 64:          # [1,1,64] -> [1,64,1]
             lat = lat.permute(0, 2, 1)
-        res = self.pet.infer({"lat": np.ascontiguousarray(lat.numpy())},
-                             share_inputs=True, share_outputs=True)
+        lat = np.ascontiguousarray(lat.numpy())
+        if self._cambiar_a(cache):
+            # cebado: un fotograma de silencio para que la primera muestra real
+            # no salte desde la nada. Se tira la salida.
+            self.pet.infer({"lat": np.zeros_like(lat)},
+                           share_inputs=True, share_outputs=True)
+        res = self.pet.infer({"lat": lat}, share_inputs=True, share_outputs=True)
         return torch.from_numpy(np.array(res[self.comp.output("audio")]))
 
 

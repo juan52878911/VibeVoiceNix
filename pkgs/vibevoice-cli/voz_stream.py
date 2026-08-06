@@ -192,6 +192,14 @@ _candado = asyncio.Lock()
 # medio, asi que su estado por solve -- step_index, model_outputs -- nunca cruza
 # una pausa. Lo que si sigue haciendo falta es el candado: dos generaciones A LA
 # VEZ si se lo corromperian.
+#
+# CON EL MOTOR OPENVINO HAY UN TERCER ESTADO, Y SE ARREGLA EN OTRO SITIO
+# El decodificador acustico compilado guarda las colas de sus convoluciones
+# dentro del IR, que es UNO para todo el proceso: no solo cruza las pausas, es
+# que cruzaba peticiones enteras. No se cubre desde aqui porque este fichero no
+# conoce el motor; lo hace AcusticoOV (pkgs/vibevoice-ov/motor.py) atando el
+# estado al objeto cache que generate() crea en cada llamada, que es justo la
+# misma unidad de aislamiento que el RNG de aqui.
 _candado_modelo = threading.Lock()
 _bearer = HTTPBearer(auto_error=False)
 
@@ -1418,6 +1426,16 @@ class PeticionTTS(BaseModel):
     # Casi siempre suena bien, pero de vez en cuando el sorteo cae mal y sale
     # un clip que ni whisper entiende. Con semilla fija eso deja de ser una
     # loteria: la misma peticion da exactamente el mismo audio.
+    #
+    # LA SEMILLA NO ES LO UNICO QUE HAY QUE FIJAR PARA QUE ESO SE CUMPLA
+    # El ruido es el unico sorteo, pero no el unico estado que arrastra una
+    # sintesis. El decodificador acustico es causal y en streaming, asi que el
+    # audio depende TAMBIEN de las colas de sus convoluciones al empezar. En
+    # torch eso no da problema -- generate() crea una cache nueva por llamada --,
+    # pero con el motor openvino ese estado vive en el IR compilado, que es uno
+    # para todo el proceso, y se colaba de una peticion a la siguiente: misma
+    # semilla y md5 distinto. Lo arregla AcusticoOV en pkgs/vibevoice-ov/motor.py
+    # haciendo que el estado siga al objeto cache de cada generate().
     semilla: Optional[int] = Field(None, ge=0, lt=2**31,
                                    description="fija el ruido de la difusion; "
                                                "misma semilla = mismo audio")
