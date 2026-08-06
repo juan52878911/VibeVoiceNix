@@ -119,7 +119,7 @@ lo que tarda el modelo de lenguaje de lo que tarda la voz.</p></header>
       <label>Voz <select id="voz"></select></label>
       <label>Expresividad <input type="range" id="cfg" min="1.5" max="4.5" step="0.1" value="4.5">
         <b id="vcfg">4.5</b>
-        <i>Más alta = dicción marcada y fiel. Medido: a 1,5 el WER es 13,6 %; a 3,0 baja a 3,6 %.</i></label>
+        <i>Más alta suena más marcada, pero pasado 3,0 empieza a costar fidelidad: medido, el WER sube de 9,7 % a 16,7 % al ir de 3,0 a 4,5.</i></label>
       <label>Velocidad <input type="range" id="vel" min="0.85" max="1.20" step="0.01" value="1.00">
         <b id="vvel">1.00</b>
         <i>El modelo no tiene control de ritmo: esto reproduce a otro muestreo, así que el tono sube o baja con ella.</i></label>
@@ -469,7 +469,7 @@ def main():
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
     ap.add_argument("--cfg", type=float, default=4.5,
-                    help="guia CFG; 3.0 es el minimo fiable, 4.5 el mas marcado")
+                    help="guia CFG. 4.5 suena mas marcado y es el defecto por\n                         gusto, pero CUESTA fidelidad: medido sobre 6 clips,\n                         WER medio 9,7 % a 3.0 frente a 16,7 % a 4.5, y el\n                         peor caso de 11,1 % a 33,3 %")
     ap.add_argument("--arranque", type=int, default=15)
     ap.add_argument("--sistema", default="Responde en español, breve y natural, "
                                          "en frases cortas. Sin listas ni markdown.")

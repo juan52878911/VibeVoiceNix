@@ -164,7 +164,7 @@ def main():
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
     ap.add_argument("--cfg", type=float, default=4.5,
-                    help="guia CFG; 3.0 es el minimo fiable, 4.5 el mas marcado")
+                    help="guia CFG. 4.5 suena mas marcado y es el defecto por\n                         gusto, pero CUESTA fidelidad: medido sobre 6 clips,\n                         WER medio 9,7 % a 3.0 frente a 16,7 % a 4.5, y el\n                         peor caso de 11,1 % a 33,3 %")
     ap.add_argument("--salida", help="escribir a un WAV en vez de reproducir")
     ap.add_argument("--bufer", type=float, default=1.5,
                     help="segundos de audio a acumular antes de empezar a sonar "
