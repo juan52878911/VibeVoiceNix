@@ -1051,6 +1051,12 @@ class SesionViva:
         # Exactamente como lo tokeniza el procesador para una peticion normal
         # (process_input_with_cached_prompt: text.strip() + "\n"), asi que una
         # frase por sesion produce los mismos tokens que esa frase suelta.
+        # VERIFICADO: alimentar frase a frase da audio IDENTICO BIT A BIT al de
+        # mandar el texto entero en una sola llamada -- siempre que se compare
+        # contra el texto unido con SALTOS DE LINEA, no con espacios. Unir con
+        # espacios da otro audio (5,33 s frente a 6,80 s) porque es otro texto,
+        # no porque la sesion haga nada raro. Comparar contra la referencia
+        # equivocada costo media investigacion.
         ids = _estado["procesador"].tokenizer.encode(
             texto.strip() + "\n", add_special_tokens=False)
         self.visto = time.time()
