@@ -163,24 +163,35 @@ _candado = asyncio.Lock()
 # model_outputs --, asi que dos generaciones a la vez se corrompen la una a la
 # otra. Sin sesiones vivas nadie lo disputa y tomarlo cuesta nanosegundos.
 #
-# LO QUE ESTE CANDADO NO CUBRE: DOS SESIONES VIVAS A LA VEZ
+# LO QUE ESTE CANDADO NO CUBRE POR SI SOLO: DOS SESIONES VIVAS A LA VEZ
 # Una sesion SUELTA el candado mientras espera texto (TextoEnCurso._esperar),
 # que es lo correcto -- callada no debe secuestrar la CPU de nadie --, pero
-# significa que otra puede colarse EN MITAD de su locucion. Y ahi ya no hay
-# exclusion: la que entra hace torch.manual_seed() y toca el noise_scheduler
-# compartido, asi que la primera reanuda con otro ruido del que tenia.
+# significa que otra puede colarse EN MITAD de su locucion. Y la que entra hace
+# torch.manual_seed() y consume el RNG GLOBAL, asi que la primera reanudaba con
+# otro ruido del que le tocaba.
 #
-# MEDIDO, mismas 2 frases y misma semilla (11), alimentando frase a frase:
+# MEDIDO ANTES DEL ARREGLO, mismas 2 frases y misma semilla (11), alimentando
+# frase a frase y esperando la pausa entre ellas:
 #   una sola sesion         4,00 s  md5 34b42c3e...
 #   dos a la vez, la 1a     4,00 s  md5 34b42c3e...   (igual)
 #   dos a la vez, la 2a     4,00 s  md5 b0bfd38b...   (DISTINTO)
-# Da igual el transporte: sale lo mismo por HTTP y por websocket, porque el
-# codigo de la sesion es el mismo. Alimentando de golpe, sin pausa, no pasa:
-# ninguna suelta el candado a mitad y las dos salen identicas.
+# Daba igual el transporte -- HTTP y websocket comparten el codigo de sesion --
+# y alimentando de golpe no pasaba: sin pausa nadie suelta el candado a mitad.
 #
-# No es corrupcion -- el audio suena bien --, pero deja de ser reproducible.
-# Si algun dia hace falta que lo sea con varias sesiones, el arreglo es un
-# generador de ruido POR SESION en vez del RNG global de torch.
+# No era corrupcion -- el audio sonaba bien --, pero dejaba de cumplirse "misma
+# semilla = mismo audio", que es justo lo que promete el campo `semilla`.
+#
+# EL ARREGLO: CADA SESION SE LLEVA SU RNG PUESTO
+# SesionViva._pausar/_reanudar fotografian el RNG global antes de soltar el
+# candado y lo reponen despues de recuperarlo, de modo que cada sesion tiene su
+# PROPIO hilo de ruido aunque el generador sea un objeto compartido. Alli esta
+# el detalle de por que asi y no pasando un torch.Generator al modelo.
+#
+# El noise_scheduler, en cambio, no necesita nada: sample_speech_tokens() lo
+# reinicia con set_timesteps() al empezar cada latente y no suelta el candado en
+# medio, asi que su estado por solve -- step_index, model_outputs -- nunca cruza
+# una pausa. Lo que si sigue haciendo falta es el candado: dos generaciones A LA
+# VEZ si se lo corromperian.
 _candado_modelo = threading.Lock()
 _bearer = HTTPBearer(auto_error=False)
 
@@ -1086,6 +1097,7 @@ class SesionViva:
         self._audio = None        # el ColaAudioSesion de la generate() en curso
         self._arrancado = False
         self._entre_locuciones = False   # parado, pero no dentro de generate()
+        self._rng = None          # foto del RNG global mientras esta parada
         self._cond = threading.Condition()
         self._hilo = threading.Thread(target=self._correr, daemon=True,
                                       name=f"sesion-{nombre}")
@@ -1209,8 +1221,8 @@ class SesionViva:
                     ids, self._pendiente = self._pendiente, []
                     al = TextoEnCurso(
                         ids, DISPOSITIVO, ESPERA_TEXTO,
-                        al_pausar=_candado_modelo.release,
-                        al_reanudar=_candado_modelo.acquire,
+                        al_pausar=self._pausar,
+                        al_reanudar=self._reanudar,
                         tope=TOPE_CACHE,
                     )
                     if self.cerrada:
@@ -1255,6 +1267,47 @@ class SesionViva:
             self.lazo.call_soon_threadsafe(self.cola.put_nowait, _FIN)
             devolver_memoria()
 
+    # ---- el ruido de ESTA sesion, y de ninguna otra ----
+    # Lo que se le pasa a TextoEnCurso como al_pausar/al_reanudar. Ademas de
+    # soltar y recuperar el candado del modelo, se llevan y traen el RNG.
+    #
+    # POR QUE HACE FALTA
+    # El RNG de torch es GLOBAL y el candado se suelta en cada pausa, asi que la
+    # sesion que se cuela en medio -- que hace su torch.manual_seed() y consume
+    # ruido -- dejaba a la primera reanudando con un ruido que no era el suyo.
+    # Ver el bloque de _candado_modelo, con la medida.
+    #
+    # POR QUE ASI Y NO CON UN torch.Generator PROPIO
+    # Un generador por sesion habria que METERLO donde se sortea, y ahi solo se
+    # llega parcheando a Microsoft: sample_speech_tokens() llama a torch.randn()
+    # sin admitir `generator`. Fotografiar y reponer el estado global consigue lo
+    # mismo -- un hilo de ruido por sesion -- sin tocar upstream, y ademas cubre
+    # CUALQUIER punto que sortee, no solo el unico que hoy se conoce.
+    #
+    # EL ORDEN IMPORTA EN LOS DOS SENTIDOS
+    # La foto ANTES de soltar (si no, otra sesion podria avanzar el RNG antes de
+    # que se mire) y la reposicion DESPUES de recuperar el candado (si no, se
+    # pisaria con la que todavia esta generando).
+    #
+    # SOLO EL RNG DE CPU
+    # El ruido de la difusion sale de un torch.randn(...) SIN device en
+    # sample_speech_tokens() y se mueve despues con .to(condition), asi que quien
+    # lo sortea es el generador de CPU aunque el modelo corra en mps o cuda.
+    # COMPROBADO: tras un torch.randn(4, 64).to("mps") cambia el estado de CPU y
+    # NO el de MPS. Si algun dia upstream crea el ruido ya en el dispositivo,
+    # aqui hay que guardar tambien torch.mps/cuda.get_rng_state().
+    #
+    # Cuesta 1,5 us por pausa (5056 bytes de estado), y las pausas son una por
+    # frase: al lado de los segundos que dura una locucion, nada.
+    def _pausar(self) -> None:
+        self._rng = torch.get_rng_state()
+        _candado_modelo.release()
+
+    def _reanudar(self) -> None:
+        _candado_modelo.acquire()
+        if self._rng is not None:
+            torch.set_rng_state(self._rng)
+
     def _generar(self, al: TextoEnCurso):
         procesador = _estado["procesador"]
         base = prefijo_voz(self.voz)
@@ -1270,6 +1323,12 @@ class SesionViva:
         try:
             _ajustar_pasos(self.pasos)
             if self.semilla is not None:
+                # Aqui EMPIEZA el hilo de ruido de esta locucion; de conservarlo
+                # a traves de las pausas se encargan _pausar/_reanudar. Se
+                # siembra en cada generate() y no una sola vez por sesion a
+                # proposito: una sesion larga puede encadenar varias -- al llegar
+                # al tope de caché -- y asi cada una arranca igual que si fuera
+                # la primera, que es lo que hace comparable el audio.
                 torch.manual_seed(self.semilla)
             # text="" porque el texto ya no viene de aqui: lo pone el
             # alimentador. Lo unico que se aprovecha son los input_ids falsos

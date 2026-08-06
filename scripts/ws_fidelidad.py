@@ -4,7 +4,7 @@
     pkgs/vibevoice/.venv/bin/python scripts/ws_fidelidad.py \
         --url http://127.0.0.1:8082 --token "$VOZ_TOKEN"
 
-Tres cosas, y las tres con numeros:
+Cuatro cosas, y las cuatro con numeros:
 
   1. FIDELIDAD. El PCM que baja por el websocket tiene que ser IDENTICO -- md5,
      no "parecido" -- al de la sesion HTTP con las mismas frases, la misma voz
@@ -21,7 +21,15 @@ Tres cosas, y las tres con numeros:
 
   2. EVENTOS. Que lleguen, y en el orden que promete el protocolo.
 
-  3. LIMPIEZA. Al cortar el websocket a mitad de la locucion, la sesion tiene
+  3. CONCURRENCIA. Dos sesiones A LA VEZ con la misma semilla tienen que dar el
+     mismo md5, y ademas el mismo que una sesion a solas. Es la parte que el
+     candado del modelo no cubre por si sola -- cada sesion lo suelta en sus
+     pausas y la otra se cuela en mitad de su locucion --, y lo que la hace
+     cumplirse es que cada sesion se lleve su RNG puesto (SesionViva._pausar).
+     Se comprueba tambien que de verdad coexistieron: si no, la prueba pasaria
+     por no haber probado nada.
+
+  4. LIMPIEZA. Al cortar el websocket a mitad de la locucion, la sesion tiene
      que desaparecer: GET /tts/sesion/{id} da 404 y el candado del modelo queda
      libre para la peticion siguiente.
 
@@ -259,7 +267,8 @@ def main():
     ap.add_argument("--cfg", type=float, default=4.5)
     ap.add_argument("--semilla", type=int, default=11)
     ap.add_argument("--pasos", type=int, default=6)
-    ap.add_argument("--pruebas", default="fidelidad,eventos,corte,errores,auth")
+    ap.add_argument("--pruebas",
+                    default="fidelidad,eventos,concurrencia,corte,errores,auth")
     a = ap.parse_args()
     pruebas = a.pruebas.split(",")
     fallos = []
@@ -312,7 +321,83 @@ def main():
         else:
             print(f"  OK  {len(eventos)} eventos en el orden esperado")
 
-    # ------------------------------------------- 3) corte a mitad y limpieza --
+    # ------------------------------------------ 3) dos sesiones a la vez --
+    # LA GARANTIA QUE SE PRUEBA AQUI es "misma semilla = mismo audio" mientras
+    # OTRA sesion habla encima. Es justo lo que el candado del modelo no cubre
+    # por si solo: una sesion lo SUELTA en cada pausa -- callada no debe
+    # secuestrar la CPU de nadie -- y la otra se cuela en mitad de su locucion.
+    #
+    # Las dos se alimentan por el camino dificil, frase a frase esperando el
+    # evento esperando=true, que es precisamente el que provoca las pausas.
+    # Mandando el texto de golpe esto no probaria nada: sin pausa nadie suelta
+    # el candado a mitad y las dos saldrian identicas aunque el fallo siguiera.
+    #
+    # Se comprueba ADEMAS que de verdad coexistieron, mirando /health mientras
+    # corren. Sin ese dato una pasada verde no distinguiria "no interfieren" de
+    # "se ejecutaron una detras de otra", que es un aprobado por la puerta de
+    # atras.
+    if "concurrencia" in pruebas:
+        print("\n[dos sesiones a la vez]")
+
+        t = time.time()
+        pcm_sola, _, n_sola = asyncio.run(ws_sesion(
+            a.url, a.token, FRASES, a.voz, a.cfg, a.semilla, a.pasos))
+        print(f"  sola  {dur(pcm_sola):5.2f} s · {len(pcm_sola)} bytes · "
+              f"md5 {md5(pcm_sola)} · en {time.time()-t:.1f} s")
+
+        async def dos_a_la_vez():
+            """Las dos sesiones, y un vigilante que cuenta cuantas hay vivas."""
+            maximo = [0]
+            parar = asyncio.Event()
+
+            async def vigilar():
+                while not parar.is_set():
+                    try:
+                        salud = json.load(pedir(f"{a.url}/health", a.token))
+                        maximo[0] = max(maximo[0],
+                                        len(salud["sesiones"]["abiertas"]))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.2)
+
+            ojo = asyncio.create_task(vigilar())
+            try:
+                res = await asyncio.gather(*[
+                    ws_sesion(a.url, a.token, FRASES, a.voz, a.cfg, a.semilla,
+                              a.pasos)
+                    for _ in range(2)])
+            finally:
+                parar.set()
+                await ojo
+            return res, maximo[0]
+
+        t = time.time()
+        (uno, dos), a_la_vez = asyncio.run(dos_a_la_vez())
+        print(f"  las dos en {time.time()-t:.1f} s · maximo de sesiones vivas "
+              f"a la vez segun /health: {a_la_vez}")
+        for etiqueta, (pcm, _, nombre) in (("1a", uno), ("2a", dos)):
+            marca = "==" if md5(pcm) == md5(pcm_sola) else "!="
+            print(f"  {etiqueta}    {dur(pcm):5.2f} s · {len(pcm)} bytes · "
+                  f"md5 {md5(pcm)} {marca} sola · sesion {nombre}")
+
+        if a_la_vez < 2:
+            fallos.append("las dos sesiones no llegaron a coexistir: la prueba "
+                          "de concurrencia no probo nada")
+            print("  FALLO /health nunca vio dos sesiones vivas a la vez")
+        else:
+            print("  OK  coexistieron de verdad")
+
+        for etiqueta, (pcm, _, _) in (("1a", uno), ("2a", dos)):
+            if md5(pcm) == md5(pcm_sola):
+                print(f"  OK  la {etiqueta} == sesion a solas: identica bit a bit")
+            else:
+                n = min(len(pcm), len(pcm_sola))
+                iguales = next((i for i in range(n) if pcm[i] != pcm_sola[i]), n)
+                fallos.append(f"concurrencia: la {etiqueta} != sesion a solas")
+                print(f"  FALLO la {etiqueta} != sesion a solas: {len(pcm)} vs "
+                      f"{len(pcm_sola)} bytes, primer byte distinto en {iguales}")
+
+    # ----------------------------------- 4) corte a mitad y limpieza --
     if "corte" in pruebas:
         print("\n[corte a mitad]")
         antes = json.load(pedir(f"{a.url}/health", a.token))["sesiones"]["abiertas"]
@@ -385,7 +470,7 @@ def main():
         print(f"  OK  el modelo vuelve a generar: {dur(prueba):.2f} s de audio "
               f"en {time.time()-t:.1f} s")
 
-    # ---------------------------------------------- 4) errores del protocolo --
+    # ---------------------------------------------- 5) errores del protocolo --
     if "errores" in pruebas:
         print("\n[errores del protocolo]")
 
@@ -430,7 +515,7 @@ def main():
             print(f"  {'OK ' if ok else 'FALLO'} {etiqueta:26s} -> "
                   f"{str(ev.get('texto', ev))[:90]}")
 
-    # ------------------------------------------------------------- 5) auth --
+    # ------------------------------------------------------------- 6) auth --
     if "auth" in pruebas and a.token:
         print("\n[autenticacion]")
         for etiqueta, tok, cab in (("sin token", "", True),
