@@ -49,6 +49,9 @@ from typing import Optional
 
 import numpy as np
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from estirar import estirar  # noqa: E402
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -944,9 +947,12 @@ def voces(_=Depends(autorizar)):
 @app.post("/tts/stream")
 async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingResponse:
     prefijo_voz(pet.voz)  # valida ANTES de enviar cabeceras, para dar un 404 limpio
-    # Toda la velocidad vive aqui: se declara otro ritmo y el reproductor hace
-    # el resto. Las muestras salen intactas.
-    ritmo = int(round(RITMO * pet.velocidad))
+    # La velocidad NO se hace remuestreando. Remuestrear mueve el tono junto
+    # con la duracion, y a +-15% lo que se oye es "mas agudo", no "mas rapido".
+    # Aqui se estira el tiempo de verdad (WSOLA, ver estirar.py) y el ritmo de
+    # salida no cambia nunca.
+    ritmo = RITMO
+    estirando = abs(pet.velocidad - 1.0) > 1e-3
 
     async def generador():
         # El candado se toma DENTRO del generador: si hay otra sintesis en
@@ -961,8 +967,23 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             )
             try:
                 yield cabecera_wav_flujo(ritmo)
-                async for trozo in streamer.flujo():
-                    yield a_pcm16(trozo)  # ~133 ms de audio por trozo
+                if not estirando:
+                    async for trozo in streamer.flujo():
+                        yield a_pcm16(trozo)  # ~133 ms de audio por trozo
+                else:
+                    # A velocidad distinta de 1 se acumula la frase ENTERA y se
+                    # estira de una vez. Estirar cada trozo de 133 ms por su
+                    # cuenta dejaria una costura audible en cada empalme, y
+                    # arrastrar el estado de WSOLA entre trozos es mas maquinaria
+                    # de la que merece: una frase dura unos segundos, asi que lo
+                    # unico que se pierde es la reproduccion progresiva DENTRO de
+                    # la frase. Al narrar por frases encadenadas ni se nota.
+                    trozos = []
+                    async for trozo in streamer.flujo():
+                        trozos.append(trozo.detach().float().cpu().numpy().reshape(-1))
+                    if trozos:
+                        entero = np.concatenate(trozos)
+                        yield a_pcm16(torch.from_numpy(estirar(entero, pet.velocidad)))
             finally:
                 # Cliente desconectado o flujo terminado: marcamos cancelado
                 # (inofensivo si ya acabo) y esperamos al hilo, para no solapar
