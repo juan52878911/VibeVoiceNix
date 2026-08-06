@@ -572,8 +572,16 @@ curl -s -X POST http://voz:8080/tts -H "Authorization: Bearer $TOKEN" -H 'Conten
 python scripts/fidelidad.py      # banco: texto -> voz -> whisper -> texto, mide WER
 python scripts/narrador.py       # pone voz a un LLM según escribe
 python scripts/asistente.py      # Ollama -> voz, en la terminal
-python scripts/asistente_web.py  # lo mismo, con página en el navegador
+
+# El de la página habla por la sesión de WebSocket, así que necesita el
+# paquete `websockets`: hay que arrancarlo con el venv, no con el python suelto.
+pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py
 ```
+
+La página manda **cada frase a la misma sesión** en vez de una petición por
+frase, así que la respuesta entera es una sola locución. La velocidad distinta
+de 1 no viaja al servidor —el WebSocket la rechaza a propósito—: la aplica el
+navegador al reproducir, y eso mueve el tono. La página lo dice.
 
 **Medido con el asistente** (qwen3:1.7b contra la VM):
 
