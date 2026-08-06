@@ -1,21 +1,35 @@
 #!/usr/bin/env python
 """Asistente de voz en el navegador: escribes, responde hablando.
 
-FALLO ABIERTO: SE CUELGA CON RESPUESTAS LARGAS
-Con respuestas cortas funciona (medido contra la VM: primer sonido 1,77 s,
-9,33 s de audio, eventos en orden y sin sesion colgada al terminar). Pero al
-pedir ~15 frases el puente MUERE y la peticion nunca termina; reproducido dos
-veces, con 9 minutos de espera.
+EL "CUELGUE CON RESPUESTAS LARGAS", RESUELTO -- Y NO ERA LO QUE PARECIA
+La peticion larga que "no terminaba en 9 minutos" no era este bucle ni la
+sonda, y el servicio de voz SI era el culpable: el registro de la VM lo dejo
+escrito (2026-08-05, sesion ws-8247c2d0). El modelo agoto el texto de la
+respuesta y su EOS nunca llego: siguio generando audio sin texto detras
+-- llevaba 766 posiciones de mas cuando salto el tope de cache ("-766 tokens
+pendientes" en el journal) y seis minutos despues seguia, hasta que la
+desconexion del cliente lo aborto. Sellar el texto (lo unico que hacia el
+tope) no frena eso: las lecturas ya devolvian vacio. Sin 'hecho' del
+servidor, este puente retransmitia el chorro para siempre y la peticion no
+acababa nunca. Es un descarrile del modelo y no pasa siempre; por eso las
+mismas ~15 frases otras veces terminan en ~95 s con su 'hecho'.
 
-El servicio de voz NO es el culpable: tras el cuelgue la VM queda limpia
--- `ocupado: false` y `abiertas: []` --, asi que la sesion se cerro bien y lo
-que se cae es este proceso. Sospechas por orden: el bucle que alterna
-`ws.recv(timeout=0.02)` con el drenado de la cola cuando el LLM va por
-delante durante mucho rato, y la sonda de `pendientes` cada 200 ms.
+La VM quedaba "limpia" tras cada intento (`ocupado: false`, `abiertas: []`)
+no porque la sesion terminara bien, sino porque al morir el CLIENTE de prueba
+el websocket se caia y abortar() la desmontaba. Y el "proceso muerto": el
+puente de la primera reproduccion ya estaba muerto ANTES de la peticion larga
+(el cliente recibio 'Connection refused' al instante; el arranque en segundo
+plano de esa prueba murio sin dejar traza), y el de la segunda seguia VIVO
+tras el cuelgue. No hay ningun cuelgue del proceso reproducible.
 
-Hasta que se arregle, este puente sirve para respuestas cortas. El camino
-HTTP por frase que habia antes esta en el historial (commit anterior a
-a7f1072) si hace falta volver a el.
+El arreglo esta en las dos puntas:
+  - voz_stream.py (LocucionDescarrilada): si generate() sigue pidiendo
+    ventanas MARGEN_EOS posiciones mas alla del texto sellado, se corta la
+    locucion con 'error' + 'hecho' y la sesion muere limpia.
+  - aqui (TOPE_AUDIO_BASE/TOPE_AUDIO_POR_TOKEN): si baja bastante mas audio
+    del que el texto entregado puede justificar, se corta con error en vez de
+    retransmitir parloteo. Cinturon por si el servidor desplegado no lleva aun
+    el freno, o por si descarrila de otra forma.
 
     pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py
     # y abre http://127.0.0.1:8090
@@ -99,6 +113,15 @@ CFG = {}
 # es a proposito: el servicio deja de emitir mientras espera texto -- hasta
 # VIBEVOICE_ESPERA_TEXTO, 20 s por defecto -- y eso es normal, no una averia.
 SILENCIO_MAXIMO = 90.0
+
+# Tope de audio por texto entregado: el freno contra una locucion descarrilada
+# (EOS que no llega y el modelo parloteando sin texto detras; ver la cabecera).
+# El silencio lo cubre SILENCIO_MAXIMO, pero un descarrile no calla: emite.
+# Medido en castellano: ~0,27 s de audio por token del sintetizador (334
+# tokens ~ 90 s). El doble de eso mas una base holgada nunca corta una
+# locucion legitima, y a un descarrile le deja como mucho medio minuto largo.
+TOPE_AUDIO_BASE = 30.0        # segundos de gracia, cubre arranques y colas
+TOPE_AUDIO_POR_TOKEN = 0.6    # segundos de audio admitidos por token acusado
 
 # CUANTO VA EL TEXTO POR DELANTE DEL AUDIO, EN TOKENS.
 # generate() lee la ventana en curso Y LA SIGUIENTE -- el lookahead con el que
@@ -565,6 +588,7 @@ class Puente(BaseHTTPRequestHandler):
         consumido = 0       # tokens que el modelo ya se comio, segun la sonda
         cabeza = 0          # indice en `entregados` del trozo que se esta diciendo
         suena = False       # ya bajo algo de PCM
+        seg_pcm = 0.0       # segundos de audio retransmitidos (24 kHz, s16 mono)
 
         def marcar(idx, tipo):
             if estado.get(idx) != tipo:
@@ -643,8 +667,9 @@ class Puente(BaseHTTPRequestHandler):
         terminado = False
 
         def al_pcm(carga):
-            nonlocal suena
+            nonlocal suena, seg_pcm
             marco(0, carga)
+            seg_pcm += len(carga) / 2 / 24000
             if not suena:
                 suena = True
                 avanzar()       # ya se oye algo: repartir lo que sepa la sonda
@@ -757,6 +782,16 @@ class Puente(BaseHTTPRequestHandler):
                     evento(tipo="error",
                            texto=f"la sesion de voz lleva {SILENCIO_MAXIMO:.0f} s "
                                  f"sin decir nada; se corta")
+                    break
+                # El descarrile no calla: emite. Si baja bastante mas audio del
+                # que el texto acusado puede justificar, la locucion perdio su
+                # EOS y no va a terminar sola; cortar aqui cierra el websocket
+                # y abortar() la desmonta en el servidor.
+                if seg_pcm > TOPE_AUDIO_BASE + TOPE_AUDIO_POR_TOKEN * acusados:
+                    evento(tipo="error",
+                           texto=f"{seg_pcm:.0f} s de audio para {acusados} "
+                                 f"tokens de texto: la locucion descarrilo y se "
+                                 f"corta")
                     break
             drenar_texto()
             for idx in emitidos:            # lo que quede a medias, cerrado

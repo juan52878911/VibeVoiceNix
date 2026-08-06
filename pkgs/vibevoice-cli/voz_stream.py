@@ -208,6 +208,19 @@ class GeneracionCancelada(Exception):
     """Senal interna: el cliente se fue, aborta generate()."""
 
 
+class LocucionDescarrilada(Exception):
+    """El modelo agoto el texto sellado y NO emitio su EOS: sigue pidiendo
+    ventanas y generando audio sin texto detras. Se corta la locucion.
+
+    Visto en produccion (2026-08-05 23:31, sesion ws-8247c2d0): una respuesta
+    normal de ~330 tokens termino de leerse y el modelo siguio generando; al
+    saltar el tope de cache llevaba 766 posiciones de mas ("-766 tokens
+    pendientes" en el registro) y aun asi siguio seis minutos, hasta que el
+    cliente se desconecto. El tope no podia frenarlo: sellar solo hace que las
+    lecturas devuelvan vacio, que es justo lo que ya pasaba. Esta excepcion es
+    el freno que faltaba: desmonta generate() desde la lectura de texto."""
+
+
 def devolver_memoria() -> None:
     """Libera lo suelto y DEVUELVE la memoria al sistema operativo.
 
@@ -868,6 +881,13 @@ CADUCIDAD_SESION = float(os.environ.get("VIBEVOICE_CADUCIDAD_SESION", "300"))
 # locucion por terminada. Es el margen que tiene el LLM de arriba para producir
 # la frase siguiente sin que se cierre la locucion.
 ESPERA_TEXTO = float(os.environ.get("VIBEVOICE_ESPERA_TEXTO", "20"))
+# Cuantas posiciones puede seguir pidiendo generate() MAS ALLA del final del
+# texto sellado antes de darlo por descarrilado (EOS que no llega). El margen
+# legitimo medido es pequeno -- el lookahead son 2 ventanas, 10 posiciones, y
+# el EOS sale normalmente en las primeras vueltas tras agotar el texto --, asi
+# que 100 (20 ventanas, ~16 s de audio de gracia) es diez veces holgado sin
+# dejar que un descarrile se coma minutos de CPU y de oyente.
+MARGEN_EOS = int(os.environ.get("VIBEVOICE_MARGEN_EOS", "100"))
 
 _SESIONES: dict = {}
 _FIN = object()   # centinela: se acabo el audio de la sesion
@@ -998,6 +1018,23 @@ class TextoEnCurso:
             self.consumidos = ini + len(trozo)
             self.ventanas += 1
             with self._cond:
+                # EL FRENO DE VERDAD contra un EOS que no llega. Tras sellar,
+                # las lecturas mas alla del texto devuelven vacio y el contrato
+                # es que el modelo cierre con su EOS en unas pocas vueltas. Si
+                # en vez de eso sigue pidiendo ventanas -- consumidos crece por
+                # encima de len(_ids) --, esta generando audio sin texto detras
+                # y no va a parar solo: se desmonta desde aqui. Sellar otra vez
+                # (que es lo unico que hacia el tope) no frena nada, porque las
+                # lecturas YA devolvian vacio.
+                exceso = self.consumidos - len(self._ids)
+                if self._sellado and exceso > MARGEN_EOS:
+                    print(f"[sesion] locucion descarrilada: {exceso} posiciones "
+                          f"pedidas tras el final del texto ({len(self._ids)} "
+                          f"tokens) sin EOS; se corta", flush=True)
+                    raise LocucionDescarrilada(
+                        f"el modelo agoto el texto ({len(self._ids)} tokens) y "
+                        f"no cerro con su EOS tras {exceso} posiciones de mas; "
+                        f"se corta la locucion")
                 if self.posicion() > self.tope and self._corte is None:
                     # No cabe mas en esta locucion. Se corta AQUI, en el borde
                     # de una ventana ya servida: el siguiente vistazo devuelve 0
@@ -1264,6 +1301,11 @@ class SesionViva:
             # NO es un fallo: no se guarda en self.error ni se imprime traza.
             print(f"[sesion] {self.nombre}: generacion abortada, el cliente se fue",
                   flush=True)
+        except LocucionDescarrilada as e:
+            # EOS que no llego: ya esta contado en el print del guardia. Se
+            # registra como error para que el websocket lo cuente al cliente
+            # antes del 'hecho', sin traza -- no hay pila que investigar.
+            self.error = str(e)
         except Exception as e:
             import traceback
             self.error = f"{type(e).__name__}: {e}"
