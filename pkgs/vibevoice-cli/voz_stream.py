@@ -610,13 +610,28 @@ class StreamerCancelable:
         from vibevoice.modular import AsyncAudioStreamer
         self.interno = AsyncAudioStreamer(batch_size=1, stop_signal=None)
         self.cancelado = False
+        # generate() ya cerro el flujo por su cuenta. Lo que llegue despues
+        # sobra, pero NO es que el cliente se haya ido.
+        self.terminado = False
 
     def put(self, trozos, indices):
-        if self.cancelado:
+        # Solo aborta si el que se fue es el CLIENTE.
+        #
+        # Cuando el clasificador predice EOS a mitad de una ventana acustica,
+        # generate() llama a end() pero NO sale del bucle de 6 latentes: sigue
+        # llamando a put() con los que quedan. Para entonces el consumidor ya
+        # vio el fin del flujo y su `finally` puso cancelado=True, asi que
+        # abortabamos la generacion en las ultimas milesimas -- justo antes de
+        # guardar el estado de la sesion, que por eso nunca se guardaba.
+        #
+        # Solo se salvaba el caso de que el numero de latentes fuera multiplo
+        # de 6, que es 1 de cada 6. De ahi que pareciera aleatorio.
+        if self.cancelado and not self.terminado:
             raise GeneracionCancelada()
         self.interno.put(trozos, indices)
 
     def end(self, indices=None):
+        self.terminado = True
         self.interno.end(indices)
 
     def flujo(self):
@@ -666,11 +681,27 @@ def capturar_estados(modelo) -> None:
 # last_hidden_state viejo, las longitudes no cuadran y sale ruido.
 #
 # Por eso la continuacion se fabrica: last_hidden_state pasa a tener la
-# longitud de la caché, con el estado final de verdad en la ultima posicion,
-# que es la unica que generate() lee (`last_hidden_state[..., -1, :]`).
+# longitud de la caché. Sus VALORES no importan -- generate() reasigna
+# `outputs` y `tts_lm_outputs` con sus propios forward antes de leerlos, asi
+# que del prefijo solo se aprovecha la longitud. Se copia igualmente el ultimo
+# estado en la ultima fila por fidelidad, no porque haga falta.
 #
 # La rama negativa (neg_lm/neg_tts_lm) vuelve al pristino a proposito: es la
 # condicion nula del CFG, no debe arrastrar contexto.
+# NO FUNCIONA TODAVIA, y por eso viene apagado.
+# Encadenar deja de romperse desde que se arreglo StreamerCancelable, pero el
+# audio DEGRADA frase a frase. Medido con tres frases y semilla fija:
+#
+#            volumen por frase           WER medio
+#   suelta       0,077  0,074  0,057        5,6 %
+#   encadenada   0,077  0,056  0,000       38,9 %
+#
+# La tercera sale muda y whisper la transcribe como "[MUSICA]", que es lo que
+# devuelve ante audio que no es habla. Falta averiguar por que: la caché crece
+# bien y las longitudes cuadran, asi que la sospecha esta en que el
+# last_hidden_state de ceros SI se lee en algun sitio, o en que la rama
+# negativa deba crecer con la positiva y no lo haga.
+SESIONES_ACTIVAS = os.environ.get("VIBEVOICE_SESIONES", "") == "1"
 _SESIONES = {}
 # Tope de la caché. Al pasarse, la sesion se reinicia al pristino: se pierde
 # la continuidad pero no la voz. Recortar por delante no vale, porque lo que
@@ -730,6 +761,7 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, sesion=None,
 
     ahora = time.time()
     partida, motivo = base, ""
+    sesion = sesion if SESIONES_ACTIVAS else None
     if sesion:
         _caducar_sesiones(ahora)
         d = _SESIONES.get(sesion)
@@ -778,7 +810,9 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, sesion=None,
                     print(f"[sesion {sesion}] {motivo}", flush=True)
     except GeneracionCancelada:
         # El cliente corto: la sesion se tira, porque el estado quedo a medias.
+        # Se avisa: cuando esto salta por error, callarlo cuesta horas.
         _SESIONES.pop(sesion, None)
+        print("[aviso] generacion cancelada por el cliente", flush=True)
     except Exception:
         # El futuro del executor no lo espera nadie, asi que sin esto un fallo
         # aqui desaparece sin dejar rastro y el cliente recibe silencio.
@@ -864,9 +898,11 @@ class PeticionTTS(BaseModel):
     # Frases de la misma sesion se encadenan: cada una empieza donde acabo la
     # anterior en vez de volver al prefijo pristino. Sin sesion, se comporta
     # igual que siempre.
+    # EXPERIMENTAL y apagado salvo VIBEVOICE_SESIONES=1: ver el bloque
+    # SESIONES. Encadenar degrada el audio y la tercera frase sale muda.
     sesion: Optional[str] = Field(None, min_length=1, max_length=64,
-                                  description="enlaza esta frase con las "
-                                              "anteriores de la misma sesion")
+                                  description="EXPERIMENTAL, requiere "
+                                              "VIBEVOICE_SESIONES=1")
 
 
 @app.get("/", response_class=HTMLResponse)
