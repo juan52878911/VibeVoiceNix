@@ -1,8 +1,10 @@
 # Rendimiento
 
-Las mediciones que explican por qué el stack está montado así: por qué Piper sirve la producción y
-VibeVoice no, por qué whisper usa `small` y no `base`, y por qué todo corre en CPU teniendo una GPU
-integrada delante.
+Las mediciones que explican por qué el stack está montado así: qué papel juega cada motor, por qué whisper
+usa `small` y no `base`, y por qué todo corre en CPU teniendo una GPU integrada delante.
+
+> El **viaje de optimización de VibeVoice** —de RTF 5,39 a 0,75, con todo lo que se probó y no funcionó—
+> tiene su propio documento: [optimizacion.md](optimizacion.md).
 
 - [El banco de pruebas](#el-banco-de-pruebas)
 - [Lo que cuesta cada motor](#lo-que-cuesta-cada-motor)
@@ -39,13 +41,13 @@ Segundos de cómputo por **cada 10 segundos de audio**. Cada bloque es un segund
 
 ```
 Piper · TTS            0,4 s   ▐
-whisper base · STT     2,0 s   ██
 whisper small · STT    6,7 s   ███████
-VibeVoice · TTS       39,2 s   ███████████████████████████████████████
+VibeVoice · TTS        7,5 s   ████████        <- hoy
+VibeVoice · al empezar 53,9 s  ██████████████████████████████████████████████████████
 ```
 
-Esa última fila es toda la explicación de por qué el repositorio se llama VibeVoiceNix pero la producción
-la sirve Piper.
+La última fila es de dónde se partía. VibeVoice pasó de **RTF 5,39 a 0,75** —7,2× más rápido— y ese viaje
+tiene su propio documento: [optimizacion.md](optimizacion.md).
 
 ---
 
@@ -53,32 +55,35 @@ la sirve Piper.
 
 | | **Piper** | **VibeVoice-Realtime-0.5B** |
 |---|---|---|
-| RTF | **0,042** (voz ya en memoria) | **3,92** (8 núcleos) |
-| Pico de RAM | decenas de MB | **3,9 GB** |
+| RTF | **0,042** (voz ya en memoria) | **0,75** (tras optimizar; 5,39 de partida) |
+| Primer sonido | inmediato | **0,20 s** con streaming |
+| RAM residente | decenas de MB | **~2,8 GB** |
 | Tamaño del modelo | 61–109 MB por voz | 1,9 GB en fp32 |
 | Español | sí, cinco voces | experimental, dos voces |
-| Papel en el proyecto | **producción** | laboratorio |
+| Papel en el proyecto | notas de voz rápidas | **voz expresiva en streaming** |
 
-La diferencia es de **casi 100×**. No es un ajuste que se pueda cerrar afinando parámetros: son dos
-familias de modelos distintas. Piper es un modelo VITS pequeño que se ejecuta de una pasada sobre ONNX
-Runtime; VibeVoice es un modelo de difusión que hace decenas de pasos iterativos, y en CPU cada paso se
-paga entero.
+Piper sigue siendo **~18× más rápido** y pesa 100 MB en vez de 2,3 GB, así que es lo que responde una nota
+de voz. Son dos familias de modelos distintas: Piper es un VITS pequeño que se ejecuta de una pasada sobre
+ONNX Runtime; VibeVoice es difusión, con decenas de pasos iterativos.
 
-**Por eso VibeVoice no es un servicio.** El módulo instala una orden que se lanza a mano, y una aserción
-exige que el sistema tenga swap declarada. Un servicio que escuchara peticiones competiría por la RAM con
-`voz-api` y empujaría la VM a swap justo cuando hay que responder.
+**Lo que cambió el papel de VibeVoice** fue bajar de 5,39 a 0,75 y, sobre todo, el streaming: con el primer
+sonido en 0,20 s la espera deja de notarse aunque el RTF total sea mayor. Cada paso de ese camino, con lo
+que funcionó y lo que no, está en [optimizacion.md](optimizacion.md).
 
-### El único lever real fueron los núcleos
+**Sigue sin ser un servicio de la misma clase:** `voz-stream` va aparte de `voz-api` porque carga 2,3 GB, y
+una aserción exige que el sistema tenga swap declarada.
 
-Se probaron varias cosas para acelerarlo. **La única que movió la aguja fue dar más CPU:**
+### Los hilos: más no es mejor
 
-| Núcleos | RTF |
+| Hilos | RTF |
 |---|---|
-| 4 | 4,80 |
-| 8 | **3,92** (−18%) |
+| 2 | 4,19 |
+| **6, anclados** | **4,04** ← el óptimo |
+| 8 | 4,31 |
+| 12 | **5,18** (24 % peor) |
 
-Por eso el Terraform pide **8 núcleos** por defecto. Medido dentro del entorno de Nix construido desde el
-store, el resultado es del mismo orden: **RTF 4,24**.
+Contraintuitivo hasta que se sabe que el cuello es el **ancho de banda de memoria**: más hilos compiten por
+el mismo bus y añaden contención, no trabajo útil.
 
 ### `cfgScale` no acelera: se midió
 
@@ -96,11 +101,14 @@ e incondicional en un mismo batch **siempre**, sin ninguna rama que se salte la 
 saltársela con `cfg_scale == 1.0` y tampoco sirvió — **RTF 3,90**, dentro del ruido.
 
 La explicación es que con dimensión 896 y batch 2, **el cuello es el ancho de banda de memoria, no los
-FLOPs**: la segunda mitad del batch sale casi gratis, así que eliminarla no ahorra nada. Déjalo en `1.5`,
-que es donde da mejor calidad.
+FLOPs**: la segunda mitad del batch sale casi gratis, así que eliminarla no ahorra nada.
 
 Es el tipo de resultado que solo aparece midiendo: la explicación teórica era impecable y la realidad dijo
 que no.
+
+**Pero sí conviene subirlo, por calidad.** Un banco de fidelidad posterior midió que **3,0 baja el WER
+medio del 13,6 % al 3,6 %**, y sigue sin costar tiempo. Ver
+[optimizacion.md](optimizacion.md#lo-que-funcionó).
 
 ### Sobre el español en VibeVoice
 
@@ -168,7 +176,7 @@ Las consecuencias recorren todo el repositorio:
 - El módulo de whisper **no tiene opción de GPU**. No es un olvido: no habría razón para usarla.
 - `torch` se instala desde el índice `pytorch-cpu`. La rueda de CUDA pesa ~2,5 GB y no hay GPU NVIDIA en
   esta máquina.
-- La orden `vibevoice` fuerza `--device cpu`.
+- En la VM se corre en CPU. El dispositivo se elige solo (`cuda` → `mps` → `cpu`), y aquí solo hay CPU.
 - El Terraform no hace *passthrough* de GPU: no habría a quién pasársela.
 
 Con una GPU NVIDIA la conclusión sería otra, y VibeVoice podría dejar de ser un laboratorio. Con esta, no.
@@ -206,10 +214,14 @@ calidad disponible sin pagar por ella.
 |---|---|
 | `voz-api` con las voces cargadas | decenas de MB |
 | `whisper-server` con `small` | ~500 MB residentes |
-| **VibeVoice durante una generación** | **pico de 3,9 GB** |
+| **VibeVoice cargado** | **~2,8 GB** residentes (eran 3,7 antes de soltar peso muerto) |
 
-El modelo de VibeVoice son 1,9 GB en fp32 y **en CPU no baja de ahí**: no hay cuantización en este camino.
-Por debajo de 6 GB de RAM el sistema se va a swap y el RTF, que ya era malo, se vuelve inservible.
+El modelo son 1,9 GB en fp32. La cuantización int8 y soltar dos pesos muertos —el codificador acústico y
+una tabla de embeddings duplicada— bajaron el residente de **3718 a 2832 MB**; el detalle está en
+[optimizacion.md](optimizacion.md#lo-que-funcionó).
+
+Y un dato que ahorra depuración: **generar** cuesta ~166 MB, no gigas. El pico que mata contenedores es
+**la carga**.
 
 De ahí salen dos decisiones del repositorio: el **fichero de intercambio de 4 GB** que declara
 [`nix/disko.nix`](../nix/disko.nix) como red de seguridad, y una **aserción** en el módulo de VibeVoice que
@@ -243,9 +255,9 @@ El caso real: un agente recibe una nota de voz de 10 segundos, la entiende y con
                      STT      TTS
                      6,7 s    0,4 s   (+ lo que tarde el agente en pensar)
 
-  SI EL TTS FUERA    ███████▓▓████████████████████████████████          46,7 s
-  VIBEVOICE          STT      TTS · VibeVoice
-                     6,7 s    39,2 s
+  CON VIBEVOICE      ███████▓▓████████                                  15,2 s
+  (voz expresiva)    STT      TTS · VibeVoice
+                     6,7 s    7,5 s   — y el primer sonido, a los 0,20 s
 ```
 
 Con el stack tal como está, el usuario espera **menos de diez segundos** y la mayor parte es la
@@ -256,7 +268,7 @@ Otras referencias rápidas:
 
 - **Una nota de voz de 10 s sintetizada con Piper:** ~0,4 s. Menos de lo que tarda en llegar por la red.
 - **Transcribir un audio de un minuto:** ~40 s con `small`, ~12 s con `base`.
-- **Un párrafo de 30 s leído por VibeVoice:** ~2 minutos de cómputo.
+- **Un párrafo de 30 s leído por VibeVoice:** ~23 s de cómputo, con el primer sonido en 0,20 s.
 
 ---
 

@@ -277,6 +277,37 @@ assertion = cfg.abrirCortafuegos -> cfg.ficheroToken != null;
 La segunda es la importante: **abrir el puerto en la LAN sin token deja el TTS y el STT accesibles a
 cualquiera de la red**, y es el tipo de error que no se nota hasta que importa.
 
+### `services.voz-stream`
+
+El TTS expresivo **en streaming**, en el puerto 8082. Emite el audio según se genera: el primer sonido
+llega en **0,20 s** en vez de esperar los 23 s de la síntesis completa, y el resultado es **bit a bit
+idéntico** (mismo md5) al de la generación normal.
+
+Va **aparte de `voz-api` a propósito**: carga VibeVoice (~2,3 GB) frente a los ~100 MB de las voces de
+Piper, así que juntarlos haría que una síntesis pesada bloqueara las notas de voz rápidas. Hereda de
+`services.vibevoice` el modelo, las voces y los pasos de difusión, para no tener dos sitios donde ajustar
+lo mismo.
+
+### `services.vibevoice-ov`
+
+Un `oneshot` que convierte el modelo a grafos **OpenVINO** en `/var/lib/voz/ov`.
+
+**Es la única cosa del proyecto que no es una derivación de Nix**, y hay una razón medida: generar los IR
+pica **4,6 GB** y el contenedor constructor tiene 2560 MB. Se generan en la VM desde entradas fijadas
+—modelo con hash, scripts versionados, `openvino` y `nncf` a versión exacta—, así que es reproducible **el
+resultado**, no el momento.
+
+Si no llegan a generarse, `voz-stream` **cae a torch en silencio**: RTF 2,2 en vez de 1,09, que se nota
+como cortes en el streaming.
+
+### `homelab.tunel`
+
+WireGuard hacia un edge en Oracle. La casa está tras **CGNAT**, así que **la VM abre el túnel hacia
+fuera** y el edge hace de punto de encuentro; un móvil conectado al edge alcanza la VM por `10.10.10.5`.
+
+No expone nada a internet: la API sigue escuchando solo en la LAN y en la red del túnel. La clave privada
+vive en `/var/lib/wireguard` con permisos `600`, **fuera del store** — por el mismo motivo que el token.
+
 ### `services.vibevoice`
 
 No levanta ningún servicio. Instala una orden `vibevoice` construida con `writeShellApplication` que es un
@@ -285,7 +316,7 @@ le pasa el modelo como ruta del store. No prepara ningún directorio de trabajo,
 la ruta de las voces sustituida en su propia derivación.
 
 Y trae una aserción: **el sistema no construye si no hay `swapDevices` declarada**. VibeVoice hace pico de
-~3,9 GB y, sin swap, una generación en una VM justa se lleva por delante al primero que pida memoria.
+~2,8 GB residentes —y más al cargar— así que sin swap una VM justa se lleva por delante al primero que pida memoria.
 
 ---
 
@@ -413,7 +444,7 @@ Un resumen de todo lo anterior, con el porqué en una línea.
 | Modelos por `fetchurl` con hash fijo | si el origen sirve otra cosa, falla la compilación en vez de instalarla |
 | `sourcePreference = "wheel"` | compilar PyTorch en la caja de arena de Nix no es viable en este hardware |
 | Un solo intérprete, `python312` | es el solape de los `requires-python` de ambos workspaces |
-| VibeVoice como orden, no como servicio | ~3,9 GB de pico de RAM; no debe competir con la API |
+| VibeVoice aparte de `voz-api` | carga ~2,8 GB frente a ~100 MB; una síntesis pesada bloquearía las notas de voz |
 | Ansible no configura el sistema, solo encadena | dos fuentes de verdad romperían la reproducibilidad |
 | `cfgScale` se queda en 1.5 | bajarlo no acelera —está medido— y además el modelo divaga |
 | Sin LVM ni cifrado en el disco | la VM se reconstruye desde el flake, no se repara |

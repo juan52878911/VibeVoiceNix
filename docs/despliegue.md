@@ -44,8 +44,8 @@ Con los valores por defecto de [`terraform/variables.tf`](../terraform/variables
 | | |
 |---|---|
 | VM | id `210`, nombre `voz`, en el nodo `pve` |
-| CPU | 8 núcleos, tipo `host` — [8 núcleos bajan el RTF de VibeVoice un 18%](rendimiento.md#el-único-lever-real-fueron-los-núcleos) |
-| RAM | 6144 MB — valida que no bajes de 4 GB, porque VibeVoice hace pico de 3,9 GB |
+| CPU | 8 núcleos, tipo `host` — [el óptimo medido son 6 hilos anclados; más empeora](rendimiento.md#los-hilos-más-no-es-mejor) |
+| RAM | 6144 MB — valida que no bajes de 4 GB. VibeVoice queda en ~2,8 GB residentes, pero **el pico es la carga** |
 | Disco | 40 GB en `local-lvm`, interfaz `scsi0` → **`/dev/sda`** |
 | Red | VirtIO en `vmbr0`, con agente QEMU |
 | Imagen base | Debian 12 *genericcloud*, sobre la que `nixos-anywhere` hace `kexec` |
@@ -185,12 +185,20 @@ Las cabeceras `X-Duracion-S`, `X-Proceso-S` y `X-RTF` te dan la medición de esa
 curl -X POST http://IP-DE-LA-VM:8080/stt -H "Authorization: Bearer TU_TOKEN" -F "archivo=@saludo.ogg" -F "idioma=es" | jq
 ```
 
-**Prueba el laboratorio** (opcional, y tarda: RTF ~3,9, unos 39 s de cómputo por cada 10 s de audio):
+**Prueba VibeVoice** (RTF 0,75 tras optimizar; la primera carga tarda ~2 min):
 
 ```bash
 ssh juan@IP-DE-LA-VM
-vibevoice --txt_path guion.txt --speaker_names sp-Spk0_woman
+vibevoice --texto "Esto lo dice el modelo expresivo." --salida prueba.wav
 ```
+
+**Y el streaming**, que es donde se nota — primer sonido en 0,20 s:
+
+```bash
+curl -sN -X POST http://IP-DE-LA-VM:8082/tts -H "Authorization: Bearer TU_TOKEN" -H "Content-Type: application/json" -d '{"texto":"Se oye según se genera."}' | ffplay -autoexit -nodisp -
+```
+
+O abre la consola en `http://IP-DE-LA-VM:8080/`, que muestra el pipeline por estados y colores.
 
 La referencia completa de la API está en [api.md](api.md).
 
@@ -268,7 +276,7 @@ arranque genera uno nuevo y hay que actualizar los clientes.
 | `/health` dice `"disponible": false` | `whisper-server` no está levantado: `journalctl -u homelab-whisper -e`. |
 | `400 no pude decodificar el audio` | `ffmpeg` no reconoce el fichero. El mensaje incluye su salida de error. |
 | El STT transcribe mal la jerga | Ajusta `services.voz-api.promptSTT` con tu vocabulario; es el parámetro que más cambia el resultado. |
-| VibeVoice se va a swap | Necesita ~3,9 GB. No lo lances mientras `voz-api` sirve si la VM va justa de RAM. |
+| VibeVoice se va a swap | Queda en ~2,8 GB residentes, pero **cargar** pica más. No lo lances mientras `voz-api` sirve si la VM va justa. |
 
 **Dónde mirar cuando nada de lo anterior encaja:**
 
