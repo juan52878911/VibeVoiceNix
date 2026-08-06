@@ -1,6 +1,22 @@
 #!/usr/bin/env python
 """Asistente de voz en el navegador: escribes, responde hablando.
 
+FALLO ABIERTO: SE CUELGA CON RESPUESTAS LARGAS
+Con respuestas cortas funciona (medido contra la VM: primer sonido 1,77 s,
+9,33 s de audio, eventos en orden y sin sesion colgada al terminar). Pero al
+pedir ~15 frases el puente MUERE y la peticion nunca termina; reproducido dos
+veces, con 9 minutos de espera.
+
+El servicio de voz NO es el culpable: tras el cuelgue la VM queda limpia
+-- `ocupado: false` y `abiertas: []` --, asi que la sesion se cerro bien y lo
+que se cae es este proceso. Sospechas por orden: el bucle que alterna
+`ws.recv(timeout=0.02)` con el drenado de la cola cuando el LLM va por
+delante durante mucho rato, y la sonda de `pendientes` cada 200 ms.
+
+Hasta que se arregle, este puente sirve para respuestas cortas. El camino
+HTTP por frase que habia antes esta en el historial (commit anterior a
+a7f1072) si hace falta volver a el.
+
     pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py
     # y abre http://127.0.0.1:8090
 
