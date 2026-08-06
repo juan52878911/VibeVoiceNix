@@ -75,6 +75,18 @@ media (6 pasadas), y de esos solo ~0,3 s son la voz: el resto es el LLM
 terminando la frase. Por eso la pagina los separa: para que se vea donde esta el
 tiempo de verdad.
 
+ADEMAS, DESDE LA PAGINA
+  - La instruccion de sistema del LLM se edita en un panel plegable y viaja con
+    cada pregunta; persiste en localStorage del navegador y, vacia, vuelve a la
+    de serie (--sistema). El sufijo /no_think sigue siendo cosa SOLO de Ollama.
+  - Un boton de microfono graba (getUserMedia + MediaRecorder), manda el audio
+    a POST /stt de este puente, que lo reenvia al /stt de la API de voz
+    (whisper; --api-url o VOZ_API_URL, el 8080 local por defecto) y deja la
+    transcripcion en el cuadro de la pregunta PARA REVISARLA, no la pregunta
+    sola. getUserMedia exige contexto seguro: HTTPS, salvo en localhost. En
+    http://127.0.0.1:8090 funciona; desde otra maquina de la red, no, y el
+    boton sale deshabilitado explicando por que.
+
 DEPENDENCIA: el cliente de websocket (`websockets`, el mismo que usa
 scripts/ws_fidelidad.py). Esta en pkgs/vibevoice/.venv, que es con lo que hay
 que arrancar esto:
@@ -92,6 +104,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -160,6 +173,9 @@ button{background:var(--a);color:#1a1206;border:0;border-radius:7px;
  padding:.6rem 1.3rem;font:600 .95rem/1 inherit;cursor:pointer}
 button:disabled{opacity:.45;cursor:default}
 button.sec{background:transparent;color:var(--s);border:1px solid var(--b)}
+button.rec{background:#8f3227;color:#f6d9d3;border-color:#8f3227;
+ animation:latir 1.1s ease-in-out infinite}
+.nota{margin:.6rem 0 0;font-size:.75rem;color:#6b7280}
 select{background:var(--f);color:var(--t);border:1px solid var(--b);
  border-radius:7px;padding:.5rem}
 .hitos{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.75rem;margin-top:1rem}
@@ -208,12 +224,29 @@ a otra en vez de reiniciarse en cada punto.</p></header>
   <textarea id="q" placeholder="¿Cómo va el despliegue de anoche?">¿Cómo va el despliegue de anoche?</textarea>
   <div class="fila">
     <button id="ir">Preguntar</button>
+    <button id="mic" class="sec">Hablar</button>
     <button id="parar" class="sec" hidden>Parar</button>
     <select id="modelo"></select>
     <label style="color:var(--s);font-size:.88rem">
       <input type="checkbox" id="pensar"> dejar que razone
     </label>
   </div>
+  <p class="nota">«Hablar» graba del micrófono, lo transcribe con whisper y deja
+  el texto en el cuadro de arriba <b>para revisarlo</b> antes de preguntar.
+  Ojo: solo funciona abriendo la página en esta máquina
+  (<code>127.0.0.1</code>): el navegador exige HTTPS para dar micrófono, con la
+  única excepción de localhost, y esta página se sirve por HTTP. Desde otra
+  máquina de la red el botón saldrá deshabilitado.</p>
+  <details class="ajustes"><summary>Instrucción para el modelo</summary>
+    <textarea id="sistema" style="margin-top:.9rem;min-height:4.5rem"
+      placeholder="vacía, vale la de serie"></textarea>
+    <div class="fila">
+      <button id="sisdef" class="sec">Volver a la de serie</button>
+      <span style="font-size:.75rem;color:#6b7280">Se manda con cada pregunta y
+      se guarda en este navegador (localStorage), así que sobrevive a recargas.
+      Vacía, el puente usa la de serie.</span>
+    </div>
+  </details>
   <details class="ajustes"><summary>Ajustar la voz</summary>
     <div class="rej">
       <label>Voz <select id="voz"></select></label>
@@ -257,15 +290,85 @@ for(const [r,v] of [["cfg","vcfg"],["vel","vvel"],["pasos","vpasos"]]){
     r==="pasos"?e.value:(+e.value).toFixed(2));
 }
 fetch("/voces").then(r=>r.json()).then(v=>{
-  // Las españolas primero: son las unicas que pronuncian bien el castellano.
-  $("voz").innerHTML=v.map(x=>`<option${x.startsWith("sp-")?"":" "}>${x}</option>`).join("");
-  const es=[...$("voz").options].find(o=>o.value.startsWith("sp-"));
-  if(es) es.selected=true;
+  $("voz").innerHTML=v.map(x=>`<option>${x}</option>`).join("");
+  // sp-Spk1_man por defecto, y es eleccion MEDIDA, no gusto: con la misma
+  // semilla las tres voces masculinas españolas transcriben limpio (WER 8,3 %)
+  // y las femeninas fallan entre el 25 % y el 66,7 %. De las tres masculinas
+  // se queda Spk1 porque es ademas la voz por defecto del resto del stack
+  // (VIBEVOICE_VOZ en voz-stream, narrador y compose), asi que pagina y
+  // servicio dicen lo mismo. Si faltara, otra masculina española; en ultimo
+  // caso, la primera española: son las unicas que pronuncian bien castellano.
+  const ops=[...$("voz").options];
+  const el=ops.find(o=>o.value==="sp-Spk1_man")
+    ||ops.find(o=>o.value.startsWith("sp-")&&o.value.endsWith("_man"))
+    ||ops.find(o=>o.value.startsWith("sp-"));
+  if(el) el.selected=true;
 });
 fetch("/modelos").then(r=>r.json()).then(m=>{
   $("modelo").innerHTML=m.map((x,i)=>`<option${i===0?" selected":""}>${x}</option>`).join("");
 });
 function di(t,e){$("est").className="est"+(e?" err":"");$("est").textContent=t}
+
+// ---- instruccion de sistema -------------------------------------------
+// Vive en el NAVEGADOR (localStorage), no en el puente: asi cada navegador
+// conserva la suya entre preguntas y recargas sin reiniciar el servidor.
+// El puente inyecta la de serie al servir la pagina; vacia o en blanco, se
+// vuelve a ella. El sufijo /no_think para Ollama lo pone el puente aparte.
+const SISTEMA_DEFECTO=__SISTEMA_DEFECTO__;
+$("sistema").value=localStorage.getItem("asistente_sistema")??SISTEMA_DEFECTO;
+$("sistema").addEventListener("input",()=>
+  localStorage.setItem("asistente_sistema",$("sistema").value));
+$("sisdef").addEventListener("click",()=>{
+  $("sistema").value=SISTEMA_DEFECTO;
+  localStorage.removeItem("asistente_sistema");
+  di("instrucción de serie restaurada.");
+});
+
+// ---- microfono -> whisper ---------------------------------------------
+// Graba con MediaRecorder y manda el blob TAL CUAL al puente: voz-api pasa
+// lo que llegue por ffmpeg a WAV 16k mono, asi que da igual que Chrome
+// grabe webm/opus y Safari mp4/aac. El texto transcrito NO se pregunta
+// solo: cae en el cuadro para poder corregirlo si whisper oyo mal.
+//
+// getUserMedia solo existe en contextos seguros: HTTPS o localhost. Servida
+// en http://127.0.0.1 funciona; desde otra maquina de la red, no -- y se
+// deshabilita el boton con el porque, para que no parezca averia.
+if(!window.isSecureContext||!navigator.mediaDevices){
+  $("mic").disabled=true;
+  $("mic").title="el navegador solo da micrófono en HTTPS o en localhost; "+
+    "desde otra máquina esta página va por HTTP y no puede grabar";
+}
+let grab=null,tomas=[];
+$("mic").addEventListener("click",async()=>{
+  if(grab&&grab.state==="recording"){grab.stop();return}
+  let flujo;
+  try{flujo=await navigator.mediaDevices.getUserMedia({audio:true})}
+  catch(e){return di(e.name==="NotAllowedError"||e.name==="SecurityError"
+    ?"micrófono denegado: dale permiso a la página en el navegador"
+    :"micrófono: "+e.message,true)}
+  tomas=[];grab=new MediaRecorder(flujo);
+  grab.ondataavailable=e=>{if(e.data.size)tomas.push(e.data)};
+  grab.onstop=async()=>{
+    flujo.getTracks().forEach(t=>t.stop());
+    $("mic").textContent="Hablar";$("mic").classList.remove("rec");
+    di("transcribiendo…");
+    try{
+      const blob=new Blob(tomas,{type:grab.mimeType||"audio/webm"});
+      if(blob.size<200) throw new Error("no se grabó nada");
+      const r=await fetch("/stt",{method:"POST",
+        headers:{"content-type":blob.type||"application/octet-stream"},body:blob});
+      const d=await r.json().catch(()=>({}));
+      if(!r.ok) throw new Error(d.error||("HTTP "+r.status));
+      const texto=(d.texto||"").trim();
+      if(!texto) return di("whisper no entendió nada; prueba otra vez",true);
+      $("q").value=texto;$("q").focus();
+      di("transcrito. revísalo y pulsa Preguntar.");
+    }catch(e){di("transcripción: "+e.message,true)}
+  };
+  grab.start();
+  $("mic").textContent="Parar y transcribir";$("mic").classList.add("rec");
+  di("grabando… pulsa otra vez para parar");
+});
 
 let trozos=[], pendiente="";
 // Se repinta entero en vez de ir parcheando nodos: son unas pocas decenas de
@@ -304,6 +407,7 @@ $("ir").addEventListener("click",async()=>{
     const r=await fetch("/preguntar",{method:"POST",signal:aborto.signal,
       headers:{"content-type":"application/json"},
       body:JSON.stringify({texto:q,modelo:$("modelo").value,pensar:$("pensar").checked,
+        sistema:$("sistema").value,
         voz:$("voz").value, cfg:+$("cfg").value,
         pasos:+$("pasos").value,
         semilla:$("semilla").value===""?null:+$("semilla").value})});
@@ -405,7 +509,13 @@ class Puente(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            cuerpo = PAGINA.encode()
+            # Lo unico del servidor que la pagina necesita de serie es la
+            # instruccion de sistema por defecto (para arrancar con ella y para
+            # el boton de volver): se inyecta aqui como literal JSON y no hace
+            # falta un endpoint mas ni una segunda copia del texto.
+            cuerpo = PAGINA.replace(
+                "__SISTEMA_DEFECTO__",
+                json.dumps(CFG["sistema"], ensure_ascii=False)).encode()
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("content-length", str(len(cuerpo)))
@@ -449,7 +559,58 @@ class Puente(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def responder_json(self, codigo, obj):
+        cuerpo = json.dumps(obj).encode()
+        self.send_response(codigo)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
+    def transcribir(self):
+        """Reenvia el audio del microfono al /stt de la API de voz (whisper).
+
+        El navegador manda el blob del MediaRecorder tal cual -- webm/opus en
+        Chrome, mp4/aac en Safari -- porque voz-api pasa lo que llegue por
+        ffmpeg a WAV 16k mono antes de darselo a whisper: recodificar aqui
+        seria trabajo repetido. La peticion multipart es calcada a la de
+        transcribir() en scripts/fidelidad.py, que es la referencia probada.
+        """
+        n = int(self.headers.get("content-length", 0))
+        audio = self.rfile.read(n) if n else b""
+        if not audio:
+            return self.responder_json(400, {"error": "sin audio"})
+        tipo = self.headers.get("content-type", "application/octet-stream")
+        # La extension del nombre es cosmetica (ffmpeg huele el contenido),
+        # pero que al menos no mienta para los formatos conocidos.
+        ext = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/mp4": "mp4",
+               "audio/mpeg": "mp3", "audio/ogg": "ogg"}.get(
+            tipo.split(";")[0].strip(), "webm")
+        lim = "----" + uuid.uuid4().hex
+        cuerpo = (f'--{lim}\r\nContent-Disposition: form-data; '
+                  f'name="idioma"\r\n\r\nes\r\n'
+                  f'--{lim}\r\nContent-Disposition: form-data; name="archivo"; '
+                  f'filename="voz.{ext}"\r\nContent-Type: {tipo}\r\n\r\n').encode()
+        cuerpo += audio + f"\r\n--{lim}--\r\n".encode()
+        pet = urllib.request.Request(
+            f"{CFG['voz_api']}/stt", method="POST", data=cuerpo,
+            headers={"content-type": f"multipart/form-data; boundary={lim}",
+                     **({"authorization": f"Bearer {CFG['token']}"}
+                        if CFG["token"] else {})})
+        try:
+            d = json.load(urllib.request.urlopen(pet, timeout=120))
+        except Exception as e:
+            # 502 y el motivo en claro: "whisper no responde" a secas obliga a
+            # ir a mirar el terminal del puente, y el navegador ya esta abierto.
+            return self.responder_json(
+                502, {"error": f"whisper no responde en {CFG['voz_api']}/stt "
+                               f"({type(e).__name__}: {e}); ¿esta levantado? "
+                               f"cd docker && docker compose up -d whisper voz-api"})
+        self.responder_json(200, {"texto": d.get("texto", "")})
+
     def do_POST(self):
+        if self.path == "/stt":
+            return self.transcribir()
         if self.path != "/preguntar":
             return self.send_error(404)
         n = int(self.headers.get("content-length", 0))
@@ -492,9 +653,13 @@ class Puente(BaseHTTPRequestHandler):
             return
 
         modelo = pet.get("modelo") or CFG["modelo"]
-        # "/no_think" es un truco de qwen bajo Ollama. MiniMax manda el
+        # La instruccion de sistema puede venir de la pagina: es la forma de
+        # dirigir al LLM sin reiniciar el puente. Vacia o en blanco, vale la
+        # de serie del arranque (--sistema).
+        sistema = (pet.get("sistema") or "").strip() or CFG["sistema"]
+        # "/no_think" es un truco de qwen bajo Ollama y se añade DESPUES de
+        # elegir la instruccion, venga de donde venga. MiniMax manda el
         # razonamiento en bloques aparte, asi que ahi no pinta nada.
-        sistema = CFG["sistema"]
         if not pet.get("pensar") and not modelo.lower().startswith("minimax"):
             sistema += " /no_think"
         # DOS colas y no una. Con una sola, el bucle principal se quedaba
@@ -823,6 +988,9 @@ def main():
                     help="MiniMax-M3 (por defecto) o cualquier modelo de Ollama")
     ap.add_argument("--ollama", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
     ap.add_argument("--voz-url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
+    ap.add_argument("--api-url", default=os.environ.get("VOZ_API_URL", "http://127.0.0.1:8080"),
+                    help="la API de voz con /stt (whisper), para el microfono. "
+                         "En local: cd docker && docker compose up -d whisper voz-api")
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
     ap.add_argument("--cfg", type=float, default=3.5,
@@ -832,11 +1000,13 @@ def main():
                                          "en frases cortas. Sin listas ni markdown.")
     a = ap.parse_args()
     CFG.update(modelo=a.modelo, ollama=a.ollama, voz_url=a.voz_url, token=a.token,
-               voz=a.voz, arranque=a.arranque, sistema=a.sistema, cfg=a.cfg)
+               voz=a.voz, arranque=a.arranque, sistema=a.sistema, cfg=a.cfg,
+               voz_api=a.api_url)
     print(f"asistente en http://127.0.0.1:{a.puerto}")
     print(f"  LLM : {a.modelo}"
           f"{'' if a.modelo.lower().startswith('minimax') else ' via ' + a.ollama}")
     print(f"  voz : {a.voz_url}/tts/sesion/ws (una sesion por respuesta)")
+    print(f"  stt : {a.api_url}/stt (el microfono de la pagina; whisper)")
     if ws_conectar is None:
         print("  [aviso] falta el paquete 'websockets': el puente sirve la "
               "pagina pero no podra hablar.\n"
