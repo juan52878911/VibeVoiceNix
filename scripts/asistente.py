@@ -144,8 +144,8 @@ def main():
     ap.add_argument("--url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
-    ap.add_argument("--cfg", type=float, default=3.0,
-                    help="guia CFG; 3.0 medido como el mas fiel")
+    ap.add_argument("--cfg", type=float, default=4.5,
+                    help="guia CFG; 3.0 es el minimo fiable, 4.5 el mas marcado")
     ap.add_argument("--arranque", type=int, default=25,
                     help="caracteres minimos de la PRIMERA frase antes de hablar "
                          "(menos = responde antes, peor entonada)")

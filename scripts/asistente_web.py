@@ -117,8 +117,8 @@ lo que tarda el modelo de lenguaje de lo que tarda la voz.</p></header>
   <details class="ajustes"><summary>Ajustar la voz</summary>
     <div class="rej">
       <label>Voz <select id="voz"></select></label>
-      <label>Expresividad <input type="range" id="cfg" min="1.5" max="4.5" step="0.1" value="3.0">
-        <b id="vcfg">3.0</b>
+      <label>Expresividad <input type="range" id="cfg" min="1.5" max="4.5" step="0.1" value="4.5">
+        <b id="vcfg">4.5</b>
         <i>Más alta = dicción marcada y fiel. Medido: a 1,5 el WER es 13,6 %; a 3,0 baja a 3,6 %.</i></label>
       <label>Velocidad <input type="range" id="vel" min="0.85" max="1.20" step="0.01" value="1.00">
         <b id="vvel">1.00</b>
@@ -468,8 +468,8 @@ def main():
     ap.add_argument("--voz-url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
-    ap.add_argument("--cfg", type=float, default=3.0,
-                    help="guia CFG; 3.0 medido como el mas fiel")
+    ap.add_argument("--cfg", type=float, default=4.5,
+                    help="guia CFG; 3.0 es el minimo fiable, 4.5 el mas marcado")
     ap.add_argument("--arranque", type=int, default=15)
     ap.add_argument("--sistema", default="Responde en español, breve y natural, "
                                          "en frases cortas. Sin listas ni markdown.")
