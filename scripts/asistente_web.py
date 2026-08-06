@@ -217,9 +217,9 @@ a otra en vez de reiniciarse en cada punto.</p></header>
   <details class="ajustes"><summary>Ajustar la voz</summary>
     <div class="rej">
       <label>Voz <select id="voz"></select></label>
-      <label>Expresividad <input type="range" id="cfg" min="1.5" max="4.5" step="0.1" value="3.0">
-        <b id="vcfg">3.0</b>
-        <i>Más alta suena más marcada, pero pasado 3,0 empieza a costar fidelidad (WER de 9,7 % a 16,7 % al ir de 3,0 a 4,5) y, si el servicio no lleva el freno de guía, en locuciones largas el volumen se desboca hasta distorsionar: medido, a 4,5 el RMS sube 15 dB en 20 s y recorta el 1,9 % de las muestras.</i></label>
+      <label>Expresividad <input type="range" id="cfg" min="1.5" max="4.5" step="0.1" value="3.5">
+        <b id="vcfg">3.5</b>
+        <i>Entre 3,0 y 3,5 la fidelidad es la misma; 3,5 entona más y habla algo más despacio. A 4,5 el peor caso se dobla y además aplana la melodía.</i></label>
       <label>Velocidad <input type="range" id="vel" min="0.85" max="1.20" step="0.01" value="1.00">
         <b id="vvel">1.00</b>
         <i>Se aplica AQUÍ, al reproducir, y <b>mueve el tono</b>: más rápido suena más agudo. El servicio se niega a hacerlo bien durante una sesión porque estirar el tiempo sin tocar el tono (WSOLA) necesita la locución entera, y una sesión no tiene final conocido. Déjala en 1,00 si quieres la voz tal cual.</i></label>
@@ -825,8 +825,8 @@ def main():
     ap.add_argument("--voz-url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
-    ap.add_argument("--cfg", type=float, default=3.0,
-                    help="guia CFG. Era 4.5 'por gusto', pero ademas de costar\n                         fidelidad (WER medio 9,7 %% a 3.0 frente a 16,7 %% a\n                         4.5), en una sesion larga contra un servicio SIN el\n                         freno de guia (frenar_guia en voz_stream.py, como la\n                         VM hasta que se redespliegue) el volumen se desboca:\n                         medido, a 4.5 el RMS sube 15 dB en 20 s y recorta el\n                         1,9 %% de las muestras; a 3.0 la subida es mas lenta\n                         (recorta 0,5 %%) y a 1.5 no hay rampa")
+    ap.add_argument("--cfg", type=float, default=3.5,
+                    help="guia CFG. 3.5 por defecto. Entre 3.0 y 3.5 el WER es\n                         IDENTICO (9,7 %% medio, 11,1 %% peor); lo que cambia es\n                         que 3.5 habla un 7 %% mas despacio y recorre 12,1\n                         semitonos frente a 10,4, o sea entona mas. A 4.5 el\n                         peor caso se dobla (22,2 %%) y encima aplana la melodia")
     ap.add_argument("--arranque", type=int, default=15)
     ap.add_argument("--sistema", default="Responde en español, breve y natural, "
                                          "en frases cortas. Sin listas ni markdown.")
