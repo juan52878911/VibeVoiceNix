@@ -648,6 +648,15 @@ class StreamerCancelable:
 #
 # Vale un global porque el servicio ya serializa las generaciones con un
 # cerrojo: nunca hay dos a la vez con las que confundirse.
+#
+# OJO con lo que queda aqui dentro: en cada latente, generate() llama a
+# forward_tts_lm DOS veces, la positiva y la del CFG nulo, y la ultima es la
+# NEGATIVA. Asi que _ULTIMO["tts_lm"] es la rama negativa, con su caché de
+# longitud 1+N, no la positiva de 300 y pico. Comprobado por identidad del
+# objeto past_key_values: 0 de 6 coincidencias con la rama positiva.
+# Da igual, porque _continuacion solo usa ese valor para rellenar una fila que
+# nadie lee (ver el bloque SESIONES), pero si algun dia se usa de verdad, hay
+# que distinguir las dos ramas.
 _ULTIMO = {}
 
 
@@ -684,26 +693,63 @@ def capturar_estados(modelo) -> None:
 # last_hidden_state viejo, las longitudes no cuadran y sale ruido.
 #
 # Por eso la continuacion se fabrica: last_hidden_state pasa a tener la
-# longitud de la caché. Sus VALORES no importan -- generate() reasigna
-# `outputs` y `tts_lm_outputs` con sus propios forward antes de leerlos, asi
-# que del prefijo solo se aprovecha la longitud. Se copia igualmente el ultimo
-# estado en la ultima fila por fidelidad, no porque haga falta.
+# longitud de la caché. Sus VALORES no importan, y esto ya NO es una deduccion
+# de leer el codigo: rellenando ese tensor con ruido gaussiano por cinco (todo
+# menos la ultima fila) el audio sale identico bit a bit en las tres frases.
+# generate() reasigna `outputs` y `tts_lm_outputs` con sus propios forward en
+# la primera vuelta del bucle, antes de leer ningun valor.
 #
 # La rama negativa (neg_lm/neg_tts_lm) vuelve al pristino a proposito: es la
 # condicion nula del CFG, no debe arrastrar contexto.
-# NO FUNCIONA TODAVIA, y por eso viene apagado.
-# Encadenar deja de romperse desde que se arreglo StreamerCancelable, pero el
-# audio DEGRADA frase a frase. Medido con tres frases y semilla fija:
 #
-#            volumen por frase           WER medio
-#   suelta       0,077  0,074  0,057        5,6 %
-#   encadenada   0,077  0,056  0,000       38,9 %
+# ESTO NO FUNCIONA, Y NO ES CUESTION DE AFINARLO. Viene apagado por eso.
 #
-# La tercera sale muda y whisper la transcribe como "[MUSICA]", que es lo que
-# devuelve ante audio que no es habla. Falta averiguar por que: la caché crece
-# bien y las longitudes cuadran, asi que la sospecha esta en que el
-# last_hidden_state de ceros SI se lee en algun sitio, o en que la rama
-# negativa deba crecer con la positiva y no lo haga.
+# Lo que falla NO es la maquinaria. La maquinaria es fiel: recortar la caché a
+# k posiciones da exactamente el mismo audio que haber parado la generacion en
+# el latente k, asi que el estado se transporta bien. Lo que falla es CUAL es
+# el estado que se transporta.
+#
+# Cada llamada termina cuando el clasificador de EOS dice que la locucion se
+# acabo, y despues aun se generan hasta 5 latentes mas (generate() no sale del
+# bucle de 6 hasta acabar la ventana). El estado que se guarda es, por tanto,
+# el de "ya he terminado de hablar". Al reanudar desde ahi y darle texto nuevo,
+# el modelo esta fuera de su distribucion y vuelve a disparar EOS en la primera
+# ventana: la frase sale muda (6 latentes, todos de silencio) y su texto, que
+# quedo pendiente, se cuela al principio de la SIGUIENTE frase. De ahi
+# transcripciones como "El tren llega a Manana por la tarde y vemos al parque".
+#
+# Medido con 6 frases x 4 semillas (11, 7, 3, 23), voz sp-Spk3_man, 6 pasos,
+# cfg 1,5, transcrito con faster-whisper base. "no dicho" es la fraccion de
+# palabras de la referencia que no aparecen (WER con inserciones gratis):
+#
+#                                   WER    no dicho   frases mudas
+#   sueltas                        25,0 %    21,5 %       0 / 24
+#   encadenadas                    50,5 %    42,5 %       7 / 24
+#   encadenadas, cola muda fuera   62,5 %    56,5 %       7 / 24
+#   encadenadas, cola muda + 6     54,7 %    28,0 %       1 / 18
+#
+# Las dos ultimas filas son los intentos de arreglo, y ninguno vale. Recortar
+# solo el silencio final deja al modelo igual de "acabado". Recortar seis
+# latentes mas si le devuelve el hilo -- deja de haber frases mudas -- pero
+# entonces REPITE el final de la frase anterior, porque el texto sigue en su
+# contexto y le ha desaparecido la prueba acustica de haberlo dicho
+# ("interesante. Espero que os guste mucho la explicacion").
+#
+# Las dos sospechas que habia quedan descartadas, las dos por experimento:
+#   1. El last_hidden_state de ceros NO se lee (ver arriba, audio identico con
+#      ruido dentro).
+#   2. La rama negativa NO es la culpable. Con cfg_scale=1,0 el CFG se reduce a
+#      half_eps = cond y la rama negativa no interviene en nada; aun asi
+#      encadenar sigue destrozando el audio (suelta 60,0 % de WER frente a
+#      143,3 % encadenada). Que crezca o no es irrelevante.
+#
+# QUE HARIA FALTA. generate() ya sabe encadenar: consume `tts_text_ids` en
+# ventanas de 5 tokens e intercala 6 latentes, y con las tres frases juntas en
+# UNA llamada el audio sale perfecto. Nunca dispara EOS a mitad porque el texto
+# le llega por delante del habla. Para tener eso por HTTP no vale trasplantar
+# caché entre llamadas: hay que dejar UNA generate() viva por sesion, en su
+# hilo, alimentandola con una cola de texto -- lo que obliga a tocar generate()
+# (hoy `tts_text_ids` es un tensor fijo) o a reimplementar su bucle aqui.
 SESIONES_ACTIVAS = os.environ.get("VIBEVOICE_SESIONES", "") == "1"
 _SESIONES = {}
 # Tope de la caché. Al pasarse, la sesion se reinicia al pristino: se pierde
@@ -730,6 +776,10 @@ def _continuacion(usado, ultimo, base):
         largo = _largo_cache(cache)
         if not largo or k not in ultimo:
             return None
+        # De `ultimo` solo se sacan la forma y el tipo: el contenido no lo lee
+        # nadie (y ademas es el de la rama negativa, ver _ULTIMO). Lo unico que
+        # importa de este tensor es su LONGITUD, que es de donde generate()
+        # deduce los input_ids falsos y las mascaras de atencion.
         fin = ultimo[k].last_hidden_state[:, -1:, :]
         h = torch.zeros(fin.shape[0], largo, fin.shape[2],
                         dtype=fin.dtype, device=fin.device)
@@ -901,10 +951,11 @@ class PeticionTTS(BaseModel):
     # Frases de la misma sesion se encadenan: cada una empieza donde acabo la
     # anterior en vez de volver al prefijo pristino. Sin sesion, se comporta
     # igual que siempre.
-    # EXPERIMENTAL y apagado salvo VIBEVOICE_SESIONES=1: ver el bloque
-    # SESIONES. Encadenar degrada el audio y la tercera frase sale muda.
+    # ROTO y apagado salvo VIBEVOICE_SESIONES=1: encadenar el estado entre
+    # llamadas dobla el WER (25 % -> 50 %) y deja mudas 7 de cada 24 frases.
+    # El bloque SESIONES explica por que no tiene arreglo por esta via.
     sesion: Optional[str] = Field(None, min_length=1, max_length=64,
-                                  description="EXPERIMENTAL, requiere "
+                                  description="ROTO, requiere "
                                               "VIBEVOICE_SESIONES=1")
 
 
