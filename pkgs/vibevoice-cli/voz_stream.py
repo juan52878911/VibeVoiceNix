@@ -284,6 +284,7 @@ def cargar_modelo():
             # torch con este motor (solo cambian los grafos que llama), y la
             # rampa de volumen se midio en LOS DOS motores.
             frenar_guia(modelo)
+            instrumentar_latentes(modelo)
             modelo.set_ddpm_inference_steps(PASOS)
             devolver_memoria()
             _estado["motor"] = "openvino"
@@ -339,6 +340,7 @@ def cargar_modelo():
             )
             _estado["motor"] = "torch-fp32"
 
+    instrumentar_latentes(modelo)
     modelo.set_ddpm_inference_steps(PASOS)
     # Los pesos fp32 que acaban de ser sustituidos siguen ocupando hasta que
     # se recolectan Y se devuelven al sistema.
@@ -458,6 +460,54 @@ def frenar_guia(modelo, freno: float = None) -> None:
     modelo.sample_speech_tokens = types.MethodType(sample_speech_tokens, modelo)
     print(f"[arranque] freno de guia {fi} (una locucion larga ya no se "
           f"desboca de volumen)", flush=True)
+
+
+# ---------------------------------------------------- latentes a examen --
+# Mirilla directa al bucle de realimentacion: el latente que devuelve
+# sample_speech_tokens vuelve al modelo como contexto del paso siguiente
+# (acoustic_connector), y la sospecha de "el audio se degrada segun avanza
+# la locucion" apunta justo ahi. Medir el audio de rebote (RMS, WER por
+# tramos) ya fallo dos veces; esto mira la causa: una fila por fotograma
+# con la norma, la media y la desviacion del propio latente.
+RUTA_LATENTES = os.environ.get("VIBEVOICE_LATENTES_CSV", "")
+
+
+def instrumentar_latentes(modelo) -> None:
+    """Si VIBEVOICE_LATENTES_CSV apunta a un fichero, cada latente acustico
+    deja una fila CSV: generacion, fotograma, norma L2, media, desviacion.
+    Sin la variable no se toca nada -- cero coste en produccion.
+
+    ENVUELVE en vez de editar: sample_speech_tokens puede ser la de upstream
+    O la copia con freno de frenar_guia (con VIBEVOICE_FRENO_GUIA=0 no se
+    sustituye), y asi se miden las dos tal cual son. El contador de
+    generaciones se lleva envolviendo generate(): cada peticion suelta es una
+    generacion nueva, y una sesion larga es UNA (o varias si salta el tope de
+    caché), que es exactamente la distincion que interesa comparar."""
+    if not RUTA_LATENTES:
+        return
+    estado = {"gen": 0, "frame": 0}
+    muestrear = modelo.sample_speech_tokens
+    generar = modelo.generate
+
+    def generate_contado(*a, **kw):
+        estado["gen"] += 1
+        estado["frame"] = 0
+        return generar(*a, **kw)
+
+    def muestrear_medido(condition, neg_condition, cfg_scale=3.0):
+        lat = muestrear(condition, neg_condition, cfg_scale)
+        v = lat.detach().float()
+        estado["frame"] += 1
+        with open(RUTA_LATENTES, "a") as f:
+            f.write(f"{estado['gen']},{estado['frame']},"
+                    f"{float(v.norm()):.6f},{float(v.mean()):.6f},"
+                    f"{float(v.std()):.6f}\n")
+        return lat
+
+    modelo.generate = generate_contado
+    modelo.sample_speech_tokens = muestrear_medido
+    print(f"[arranque] latentes a {RUTA_LATENTES} (norma, media, desviacion "
+          f"por fotograma)", flush=True)
 
 
 class ConvDepthwiseRapida(torch.nn.Module):
@@ -970,11 +1020,34 @@ CADUCIDAD_SESION = float(os.environ.get("VIBEVOICE_CADUCIDAD_SESION", "300"))
 ESPERA_TEXTO = float(os.environ.get("VIBEVOICE_ESPERA_TEXTO", "20"))
 # Cuantas posiciones puede seguir pidiendo generate() MAS ALLA del final del
 # texto sellado antes de darlo por descarrilado (EOS que no llega). El margen
-# legitimo medido es pequeno -- el lookahead son 2 ventanas, 10 posiciones, y
-# el EOS sale normalmente en las primeras vueltas tras agotar el texto --, asi
-# que 100 (20 ventanas, ~16 s de audio de gracia) es diez veces holgado sin
-# dejar que un descarrile se coma minutos de CPU y de oyente.
-MARGEN_EOS = int(os.environ.get("VIBEVOICE_MARGEN_EOS", "100"))
+# es MARGEN_EOS + MARGEN_EOS_FACTOR * (tokens sellados), y la parte
+# proporcional NO es prudencia de mas: es la fisica del bucle.
+#
+# generate() LEE texto a ritmo fijo -- 5 tokens por ventana de 6 latentes,
+# o sea 6,25 tokens por segundo de audio -- pero la voz DICE unos 4,7-5
+# tokens por segundo (medido: 291 tokens en 57,3-63,2 s segun semilla). Si el
+# texto entra mas deprisa de lo que se habla (un LLM rapido, o todo de golpe),
+# la lectura se adelanta y al agotarse el texto quedan por DECIR unos
+# 0,25-0,36 tokens de cada uno: con 291 tokens, el EOS legitimo llego con
+# exceso 67-104 (6 semillas). ESO ERA LO QUE EL MARGEN FIJO DE 100 NO SABIA:
+# guillotinaba locuciones legitimas a mitad de la ultima frase en cuanto el
+# texto pasaba de ~300 tokens o la voz iba algo lenta -- la semilla 1 lo
+# reproduce determinista, cortada en "...hasta la" con el final sin decir, y
+# las transcripciones rellenan el corte con una palabra inventada ("hasta la
+# proxima"), que es justo el sintoma que se achacaba al modelo. Un descarrile
+# de verdad es OTRA escala: 766 posiciones de mas (2,3x el texto) y seguia
+# (2026-08-05). Con margen 30 + 1,0x texto, esa locucion de 330 tokens se
+# corta en el exceso 360 en vez de en el 3000 del tope, y ninguna legitima
+# (maximo medido 0,36x + lookahead) se acerca al umbral.
+MARGEN_EOS = int(os.environ.get("VIBEVOICE_MARGEN_EOS", "30"))
+MARGEN_EOS_FACTOR = float(os.environ.get("VIBEVOICE_MARGEN_EOS_FACTOR", "1.0"))
+# Desde donde se RETIENE el audio en vez de emitirlo (ver ColaAudioSesion):
+# pasado este exceso, un EOS legitimo es ya poco probable (medido: llegan con
+# exceso <= 0,36x el texto) y lo que se genere solo se suelta si el EOS acaba
+# llegando. Por debajo NO se retiene nada: retener desde que el texto se agota
+# seria estrangular el remate legitimo -- esos 0,3x tokens aun por decir son
+# 10-15 s de locucion normal y el oyente los esta escuchando en directo.
+RETENER_FACTOR = float(os.environ.get("VIBEVOICE_RETENER_FACTOR", "0.5"))
 
 # Tramo FINAL de puntuacion de un trozo. Es lo que el pretokenizador de Qwen2
 # puede fundir con un "\n" posterior (".\n" es un token), asi que se retiene
@@ -1067,9 +1140,33 @@ class TextoEnCurso:
             return self._sellado
 
     def restante(self) -> list:
-        """Texto que entro pero que el modelo no llego a decir."""
+        """Texto que entro pero que el modelo no llego a decir.
+
+        El tope con _disponible() importa tras un sellado por tope de caché:
+        mientras el modelo remata con su EOS sigue pidiendo ventanas y
+        `consumidos` avanza en vacio MAS ALLA del corte, asi que contar desde
+        `consumidos` a secas se comia esos tokens -- hasta MARGEN_EOS por cada
+        costura de tope -- y la generate() siguiente arrancaba sin ellos."""
         with self._cond:
-            return self._ids[self.consumidos:]
+            return self._ids[min(self.consumidos, self._disponible()):]
+
+    def en_prorroga(self) -> bool:
+        """Sellado, texto servido entero y ya MAS ALLA del exceso donde los
+        EOS legitimos llegan (medido: <= 0,36x el texto; se retiene desde
+        RETENER_FACTOR = 0,5x). El audio generado a partir de aqui es
+        sospechoso: solo se suelta si el EOS acaba llegando. Es la senal con
+        la que ColaAudioSesion retiene en vez de emitir.
+
+        OJO, no es "texto agotado": entre agotar el texto y la prorroga hay
+        un remate LEGITIMO de ~0,3x tokens aun por decir (el texto se lee a
+        6,25 tokens/s de audio pero se habla a ~4,7-5), y ese remate debe
+        seguir goteando en directo. Una vez cierta no vuelve a ser falsa:
+        sellar congela el buffer y `consumidos` solo crece."""
+        with self._cond:
+            disponible = self._disponible()
+            return (self._sellado and self.consumidos >= disponible
+                    and self.consumidos - disponible
+                        > MARGEN_EOS + RETENER_FACTOR * disponible)
 
     def _disponible(self) -> int:
         """Cuanto texto puede ver el bucle. Solo es menos que todo cuando el
@@ -1112,22 +1209,34 @@ class TextoEnCurso:
             self.ventanas += 1
             with self._cond:
                 # EL FRENO DE VERDAD contra un EOS que no llega. Tras sellar,
-                # las lecturas mas alla del texto devuelven vacio y el contrato
-                # es que el modelo cierre con su EOS en unas pocas vueltas. Si
-                # en vez de eso sigue pidiendo ventanas -- consumidos crece por
-                # encima de len(_ids) --, esta generando audio sin texto detras
-                # y no va a parar solo: se desmonta desde aqui. Sellar otra vez
-                # (que es lo unico que hacia el tope) no frena nada, porque las
-                # lecturas YA devolvian vacio.
-                exceso = self.consumidos - len(self._ids)
-                if self._sellado and exceso > MARGEN_EOS:
+                # las lecturas mas alla del texto devuelven vacio, el modelo
+                # sigue DICIENDO lo que lleva leido de adelanto -- que es un
+                # remate legitimo de hasta ~0,36x el texto, ver MARGEN_EOS --
+                # y el contrato es que cierre con su EOS al acabarselo. Si
+                # sigue pidiendo ventanas mucho mas alla de eso, esta
+                # generando parloteo sin contenido detras y no va a parar
+                # solo: se desmonta desde aqui. Sellar otra vez (que es lo
+                # unico que hacia el tope) no frena nada, porque las lecturas
+                # YA devolvian vacio.
+                #
+                # Contra _disponible() y no contra len(_ids) a proposito: tras
+                # un sellado por tope de caché lo servible acaba en _corte, y
+                # medir contra el buffer entero dejaba al guardia ciego justo
+                # ahi -- con 500 tokens pendientes para la generate() siguiente
+                # habrian hecho falta 500 posiciones de descarrile antes de
+                # saltar. Sin tope, _disponible() ES len(_ids) y no cambia nada.
+                disponible = self._disponible()
+                exceso = self.consumidos - disponible
+                margen = MARGEN_EOS + MARGEN_EOS_FACTOR * disponible
+                if self._sellado and exceso > margen:
                     print(f"[sesion] locucion descarrilada: {exceso} posiciones "
-                          f"pedidas tras el final del texto ({len(self._ids)} "
-                          f"tokens) sin EOS; se corta", flush=True)
+                          f"pedidas tras el final del texto ({disponible} "
+                          f"tokens, margen {margen:.0f}) sin EOS; se corta",
+                          flush=True)
                     raise LocucionDescarrilada(
-                        f"el modelo agoto el texto ({len(self._ids)} tokens) y "
-                        f"no cerro con su EOS tras {exceso} posiciones de mas; "
-                        f"se corta la locucion")
+                        f"el modelo agoto el texto ({disponible} tokens) "
+                        f"y no cerro con su EOS tras {exceso} posiciones de mas "
+                        f"(margen {margen:.0f}); se corta la locucion")
                 if self.posicion() > self.tope and self._corte is None:
                     # No cabe mas en esta locucion. Se corta AQUI, en el borde
                     # de una ventana ya servida: el siguiente vistazo devuelve 0
@@ -1178,12 +1287,47 @@ class ColaAudioSesion:
 
     No cierra la cola de la sesion al terminar: una sesion larga puede encadenar
     varias generate() (al llegar al tope de caché) sobre el MISMO flujo de audio.
+
+    LA PRORROGA SE RETIENE, Y ES EL RECORTE DE VERDAD
+    El guardia de MARGEN_EOS corta un descarrile, pero esto es streaming: para
+    cuando salta, lo emitido ya no se puede desenviar. Asi
+    que el audio generado en la PRORROGA (TextoEnCurso.en_prorroga: pasado el
+    exceso donde los EOS legitimos llegan) no se emite: se retiene aqui.
+
+      - EOS limpio: generate() llama a end() y lo retenido se suelta entero,
+        en orden. No se pierde ni un trozo; el precio es que ese ultimo tramo
+        llega de golpe al final en vez de gotear.
+      - Descarrile: LocucionDescarrilada salta desde la LECTURA de texto y
+        desmonta la pila de generate() SIN pasar por end() -- upstream no lo
+        llama en ningun finally, se comprobo --, asi que lo retenido muere
+        con este objeto y el oyente no lo oye.
+
+    Y el coste durante la locucion es CERO a proposito: mientras quede texto
+    por delante, put() emite exactamente igual que antes, y el remate
+    legitimo tras agotarse el texto -- ~0,3x tokens aun por decir, 10-15 s en
+    una locucion larga alimentada deprisa -- sigue goteando en directo, que
+    para eso el oyente lo esta escuchando. En una locucion normal la
+    prorroga NI EMPIEZA: el EOS llega antes (exceso medido <= 0,36x frente al
+    umbral de 0,5x) y no se retiene ni un trozo. Retener desde que el texto
+    se agota, que fue el primer diseno, estrangulaba justo ese remate: 10-15 s
+    de silencio en mitad de la escucha y el final a chorro.
+
+    Lo que NO promete: en un descarrile de verdad, el parloteo generado ENTRE
+    el final del contenido real y el umbral de prorroga (del orden de 15 s en
+    un texto de 300 tokens) si llega al oyente; lo que se corta es el resto,
+    que con el margen antiguo eran minutos. Para afinar mas haria falta saber
+    POR DONDE VA hablando el modelo, y eso el bucle de generate() no lo
+    cuenta: solo expone el EOS, que es justo lo que falla en un descarrile.
     """
 
-    def __init__(self, lazo, cola):
+    def __init__(self, lazo, cola, texto=None):
         self.lazo, self.cola = lazo, cola
+        # El TextoEnCurso de ESTA generate(): la fuente de la senal de
+        # prorroga. Sin el (None) no se retiene nunca, put() como siempre.
+        self.texto = texto
         self.cerrado = False
         self.trozos = 0
+        self.retenidos = []   # el audio de la prorroga, a la espera del EOS
         # Lo pone SesionViva.abortar() cuando el cliente se larga. Por la via
         # HTTP nadie lo toca nunca, asi que ahi el comportamiento no cambia.
         self.cancelado = False
@@ -1204,11 +1348,30 @@ class ColaAudioSesion:
             if int(idx) != 0:
                 continue
             self.trozos += 1
-            self.lazo.call_soon_threadsafe(
-                self.cola.put_nowait, trozos[i].detach().float().cpu())
+            trozo = trozos[i].detach().float().cpu()
+            if self.texto is not None and self.texto.en_prorroga():
+                self.retenidos.append(trozo)
+            else:
+                self.lazo.call_soon_threadsafe(self.cola.put_nowait, trozo)
 
     def end(self, indices=None):
+        # Aqui SOLO se llega con un cierre legitimo (el EOS del modelo, o el
+        # fin del bucle de generate()): lo retenido era el remate de verdad y
+        # se suelta entero. Mismo hilo y misma via que put(), asi que el orden
+        # con lo ya emitido se conserva. Un descarrile no pasa por aqui.
         self.cerrado = True
+        if self.retenidos:
+            # Que quede en el log: un EOS que llego DESPUES del umbral de
+            # prorroga es raro (los medidos llegan antes) y merece verse.
+            print(f"[sesion] EOS en plena prorroga: se sueltan "
+                  f"{len(self.retenidos)} trozos retenidos "
+                  f"(~{self.segundos_retenidos():.1f} s)", flush=True)
+        for trozo in self.retenidos:
+            self.lazo.call_soon_threadsafe(self.cola.put_nowait, trozo)
+        self.retenidos = []
+
+    def segundos_retenidos(self) -> float:
+        return sum(t.numel() for t in self.retenidos) / RITMO
 
 
 class SesionViva:
@@ -1514,7 +1677,9 @@ class SesionViva:
     def _generar(self, al: TextoEnCurso):
         procesador = _estado["procesador"]
         base = prefijo_voz(self.voz)
-        audio = ColaAudioSesion(self.lazo, self.cola)
+        # Con el alimentador puesto: es quien le dice a la cola cuando la
+        # locucion entra en prorroga y hay que retener (ver ColaAudioSesion).
+        audio = ColaAudioSesion(self.lazo, self.cola, texto=al)
         with self._cond:
             # Bajo el candado y comprobando abortada: si el cliente se fue entre
             # que se armo la cola y que se registra, abortar() no la habria
@@ -1561,6 +1726,17 @@ class SesionViva:
                 )
         finally:
             _candado_modelo.release()
+            if audio.retenidos:
+                # Se llega aqui con retenidos solo cuando NO hubo end(): un
+                # descarrile (o un aborto) desmonto la pila de generate(). Es
+                # EL recorte funcionando -- este audio se genero sin texto
+                # detras y el oyente no lo oye --, y el numero es la medida
+                # de cuanto parloteo se le ahorro.
+                print(f"[sesion] {self.nombre}: se descartan "
+                      f"{len(audio.retenidos)} trozos retenidos "
+                      f"(~{audio.segundos_retenidos():.1f} s) generados en la "
+                      f"prorroga sin EOS", flush=True)
+                audio.retenidos = []
             with self._cond:
                 self._audio = None
 
