@@ -65,6 +65,17 @@ Si el texto deja de llegar, el modelo espera parado (por defecto 20 s,
 `VIBEVOICE_ESPERA_TEXTO`) y cierra la locución bien en vez de dejarla colgada.
 Mientras espera no consume CPU, así que otras peticiones normales pasan.
 
+La misma sesión está también en `WS /tts/sesion/ws`, que es lo cómodo desde un
+navegador: el texto sube como JSON (`{"accion":"abrir"|"texto"|"fin"}`) y bajan
+marcos binarios `[tipo:1][longitud:4 BE][carga]` — tipo 0 PCM de 16 bits a
+24 kHz, tipo 1 evento JSON —, el mismo formato que usa
+`scripts/asistente_web.py`, así que su lector vale tal cual. La ventaja sobre
+HTTP no es el audio, que es **idéntico bit a bit** por los dos caminos, sino que
+el aviso de «el modelo se quedó sin texto» llega empujado en vez de por sondeo,
+y que al caerse el socket la sesión se aborta y libera el modelo sola. El HTTP
+se queda como está: es lo que se prueba con `curl`. Se verifica con
+`scripts/ws_fidelidad.py`.
+
 ## Tres cosas que conviene saber antes de empezar
 
 **VibeVoice apenas habla español.** El 1.5B y el Large-7B están entrenados solo

@@ -14,6 +14,17 @@ le va metiendo texto:
     GET  /tts/sesion/{id}/audio                      un WAV, toda la locucion
     POST /tts/sesion/{id}/fin                        cierra la locucion
 
+y la MISMA sesion por websocket, en una sola conexion bidireccional:
+
+    WS   /tts/sesion/ws                              texto JSON -> marcos PCM
+
+Los dos caminos comparten SesionViva entera, asi que dan el MISMO audio (se
+comprueba por md5, ver el bloque WEBSOCKET mas abajo). El HTTP se queda porque
+es lo que esta en produccion y lo que se puede probar con curl; el websocket
+existe porque la interaccion es de ida y vuelta y de larga duracion -- se mete
+texto mientras sale audio -- y partirla en peticiones sueltas es justo lo que
+obliga a reabrir contexto una y otra vez.
+
 Frase a frase con /tts/stream, cada una empieza desde cero y suena a lista de
 frases sueltas. En una sesion el modelo no deja de hablar entre frases. Y no es
 "parecido" a pasar todo el texto de golpe: es EL MISMO AUDIO, byte a byte
@@ -49,15 +60,19 @@ Configuracion por entorno, igual que el resto del stack:
 """
 
 import asyncio
+import contextlib
 import copy
 import ctypes
 import gc
+import json
 import os
 import platform
+import secrets
 import sys
 import struct
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -68,7 +83,9 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from estirar import estirar  # noqa: E402
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import (
+    Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -145,6 +162,25 @@ _candado = asyncio.Lock()
 # (model.noise_scheduler) con estado interno por solve -- step_index,
 # model_outputs --, asi que dos generaciones a la vez se corrompen la una a la
 # otra. Sin sesiones vivas nadie lo disputa y tomarlo cuesta nanosegundos.
+#
+# LO QUE ESTE CANDADO NO CUBRE: DOS SESIONES VIVAS A LA VEZ
+# Una sesion SUELTA el candado mientras espera texto (TextoEnCurso._esperar),
+# que es lo correcto -- callada no debe secuestrar la CPU de nadie --, pero
+# significa que otra puede colarse EN MITAD de su locucion. Y ahi ya no hay
+# exclusion: la que entra hace torch.manual_seed() y toca el noise_scheduler
+# compartido, asi que la primera reanuda con otro ruido del que tenia.
+#
+# MEDIDO, mismas 2 frases y misma semilla (11), alimentando frase a frase:
+#   una sola sesion         4,00 s  md5 34b42c3e...
+#   dos a la vez, la 1a     4,00 s  md5 34b42c3e...   (igual)
+#   dos a la vez, la 2a     4,00 s  md5 b0bfd38b...   (DISTINTO)
+# Da igual el transporte: sale lo mismo por HTTP y por websocket, porque el
+# codigo de la sesion es el mismo. Alimentando de golpe, sin pausa, no pasa:
+# ninguna suelta el candado a mitad y las dos salen identicas.
+#
+# No es corrupcion -- el audio suena bien --, pero deja de ser reproducible.
+# Si algun dia hace falta que lo sea con varias sesiones, el arreglo es un
+# generador de ruido POR SESION en vez del RNG global de torch.
 _candado_modelo = threading.Lock()
 _bearer = HTTPBearer(auto_error=False)
 
@@ -999,12 +1035,22 @@ class ColaAudioSesion:
         self.lazo, self.cola = lazo, cola
         self.cerrado = False
         self.trozos = 0
+        # Lo pone SesionViva.abortar() cuando el cliente se larga. Por la via
+        # HTTP nadie lo toca nunca, asi que ahi el comportamiento no cambia.
+        self.cancelado = False
 
     def put(self, trozos, indices):
         # Tras end() lo que llegue sobra: generate() no sale del bucle de 6
         # latentes aunque el EOS salte a mitad, y esos ultimos son silencio.
         if self.cerrado:
             return
+        # UNICO punto de corte que ofrece generate(): no mira ningun flag
+        # externo, asi que abortar es lanzar desde aqui y dejar que la excepcion
+        # desmonte su pila. Es lo mismo que hace StreamerCancelable en
+        # /tts/stream, y por eso el corte tarda como mucho lo que dure un trozo
+        # (~133 ms de audio) en notarse.
+        if self.cancelado:
+            raise GeneracionCancelada()
         for i, idx in enumerate(indices):
             if int(idx) != 0:
                 continue
@@ -1034,8 +1080,11 @@ class SesionViva:
         self.generaciones = 0
         self.error = None
         self.eos_temprano = 0     # veces que el modelo callo con texto pendiente
+        self.abortada = False     # el cliente se fue: cortar sin miramientos
         self._pendiente = []
         self._alimentador = None
+        self._audio = None        # el ColaAudioSesion de la generate() en curso
+        self._arrancado = False
         self._entre_locuciones = False   # parado, pero no dentro de generate()
         self._cond = threading.Condition()
         self._hilo = threading.Thread(target=self._correr, daemon=True,
@@ -1043,6 +1092,7 @@ class SesionViva:
 
     # ---- API ----
     def arrancar(self):
+        self._arrancado = True
         self._hilo.start()
 
     def alimentar(self, texto: str) -> int:
@@ -1080,11 +1130,50 @@ class SesionViva:
         if al is not None:
             al.sellar()
 
+    def abortar(self) -> None:
+        """Corta YA la generacion en curso: el cliente se fue.
+
+        cerrar() es lo educado -- el modelo dice lo que le queda y cierra con su
+        EOS --, y es lo correcto por HTTP, donde el POST /fin lo manda alguien
+        que sigue escuchando. Pero cuando lo que se cae es el websocket no queda
+        nadie al otro lado: seguir seria medio minuto de CPU al 100 % con el
+        candado del modelo tomado, generando audio para el vacio.
+
+        Se tira de los dos hilos a la vez porque el bucle puede estar en
+        cualquiera de los dos sitios: se sella el texto (por si esta parado
+        esperando mas, dentro de TextoEnCurso._esperar) y se marca la cola de
+        audio (por si esta dentro de generate(), donde put() es el unico punto
+        por el que se puede desmontar la pila).
+        """
+        with self._cond:
+            self.cerrada = True
+            self.abortada = True
+            self._pendiente = []
+            al, audio = self._alimentador, self._audio
+            self._cond.notify_all()
+        if audio is not None:
+            audio.cancelado = True
+        if al is not None:
+            al.sellar()
+
+    def esperar_fin(self, segundos: float) -> bool:
+        """Espera a que muera el hilo. False si sigue vivo al agotarse el plazo.
+
+        Hace falta esperarlo de verdad: mientras viva tiene tomado
+        _candado_modelo, y devolver el control al cliente antes de eso dejaria
+        la siguiente peticion bloqueada contra un hilo fantasma.
+        """
+        if not self._arrancado:
+            return True
+        self._hilo.join(segundos)
+        return not self._hilo.is_alive()
+
     def estado(self) -> dict:
         al = self._alimentador
         return {
             "sesion": self.nombre, "voz": self.voz,
             "viva": not self.terminada, "cerrada": self.cerrada,
+            "abortada": self.abortada,
             "escuchando": self.escuchando, "generaciones": self.generaciones,
             "pendientes": len(self._pendiente) + (len(al.restante()) if al else 0),
             "posicion": al.posicion() if al else 0,
@@ -1150,6 +1239,11 @@ class SesionViva:
                     if al.sellado_por_espera and not self._pendiente:
                         break
                     esperar_mas = True
+        except GeneracionCancelada:
+            # El cliente se fue y abortar() corto la generate() desde dentro.
+            # NO es un fallo: no se guarda en self.error ni se imprime traza.
+            print(f"[sesion] {self.nombre}: generacion abortada, el cliente se fue",
+                  flush=True)
         except Exception as e:
             import traceback
             self.error = f"{type(e).__name__}: {e}"
@@ -1164,6 +1258,14 @@ class SesionViva:
     def _generar(self, al: TextoEnCurso):
         procesador = _estado["procesador"]
         base = prefijo_voz(self.voz)
+        audio = ColaAudioSesion(self.lazo, self.cola)
+        with self._cond:
+            # Bajo el candado y comprobando abortada: si el cliente se fue entre
+            # que se armo la cola y que se registra, abortar() no la habria
+            # visto y la generate() arrancaria ya sin nadie que la oiga.
+            if self.abortada:
+                audio.cancelado = True
+            self._audio = audio
         _candado_modelo.acquire()
         try:
             _ajustar_pasos(self.pasos)
@@ -1193,10 +1295,12 @@ class SesionViva:
                     show_progress_bar=False,
                     return_speech=False,
                     all_prefilled_outputs=copy.deepcopy(base),
-                    audio_streamer=ColaAudioSesion(self.lazo, self.cola),
+                    audio_streamer=audio,
                 )
         finally:
             _candado_modelo.release()
+            with self._cond:
+                self._audio = None
 
 
 def _caducar_sesiones() -> None:
@@ -1320,7 +1424,8 @@ def health() -> dict:
         "sesiones": {"activas": SESIONES_ACTIVAS,
                      "abiertas": sorted(_SESIONES),
                      "espera_texto_s": ESPERA_TEXTO,
-                     "tope_cache": TOPE_CACHE},
+                     "tope_cache": TOPE_CACHE,
+                     "websocket": "/tts/sesion/ws"},
     }
 
 
@@ -1508,6 +1613,371 @@ async def sesion_borrar(nombre: str, _=Depends(autorizar)) -> dict:
     s.cerrar()
     _SESIONES.pop(nombre, None)
     return {"sesion": nombre, "cerrada": True}
+
+
+# --------------------------------------------------------------------------
+# WEBSOCKET: la misma sesion, pero en una sola conexion
+#
+# POR QUE, SI YA FUNCIONA POR HTTP
+# La interaccion es bidireccional y de larga duracion: entra texto mientras
+# sale audio, durante minutos. HTTP obliga a partir eso en un POST por frase
+# mas un GET de audio que dura toda la locucion, y a que el cliente sondee
+# GET /tts/sesion/{id} para saber si el modelo se ha quedado sin texto por
+# delante. Aqui es un solo socket: el texto sube, el audio y los avisos bajan,
+# y "el modelo esta esperando" llega como evento en vez de por sondeo.
+#
+# LO QUE NO CAMBIA
+# Por debajo es SesionViva, la misma clase, sin una rama especial. Asi que
+# respeta _candado_modelo igual (lo toma _generar), suelta el candado mientras
+# espera texto igual (TextoEnCurso._esperar, via al_pausar/al_reanudar) y
+# tokeniza igual (texto.strip() + "\n"). De ahi que el audio salga IDENTICO bit
+# a bit al de la via HTTP, que es lo que se comprueba por md5. El HTTP se queda
+# intacto: es lo que corre en la VM y lo que se prueba con curl.
+#
+# PROTOCOLO
+# Del cliente al servidor, mensajes de TEXTO con JSON:
+#
+#   {"accion":"abrir","voz":"sp-Spk3_man","cfg_scale":4.5,"pasos":6,"semilla":11}
+#   {"accion":"texto","texto":"..."}
+#   {"accion":"fin"}
+#
+# Del servidor al cliente, mensajes BINARIOS con el marco de
+# scripts/asistente_web.py:
+#
+#   [tipo:1 byte][longitud:4 bytes big-endian][carga]
+#   tipo 0 = PCM crudo, 16 bits con signo, 24000 Hz, mono
+#   tipo 1 = evento JSON
+#
+# El websocket ya trae longitud propia, asi que el marco es redundante ahi. Se
+# mantiene A PROPOSITO: el lector de asistente_web.py -- el bucle que acumula
+# hasta tener el marco entero y reparte por tipo -- vale tal cual, sin tocar
+# una linea, y el navegador puede alimentar el mismo camino de Web Audio venga
+# el flujo de donde venga. Lo que cuesta son 5 bytes por trozo de 133 ms.
+#
+# Eventos (campo "tipo"): abierta, texto, esperando, fin_texto, sonando,
+# hecho, error. Ver el detalle en sesion_ws().
+#
+# DEPENDENCIA QUE NO SE VE: uvicorn no habla websocket por si solo, necesita el
+# paquete `websockets` (o wsproto). Aqui llega por uvicorn[standard], que es
+# dependencia DIRECTA de vibevoice en el lock, asi que esta tanto en el venv del
+# Mac como en la imagen Docker. Si algun dia se poda -- docker/Dockerfile.voz-
+# stream ya desinstala uvloop, que viene del mismo extra --, esta ruta deja de
+# existir y uvicorn responde 404 al apreton de manos SIN decir por que.
+#
+# VELOCIDAD: NO SE ADMITE DISTINTA DE 1, Y ES A PROPOSITO
+# estirar() es WSOLA (ver estirar.py) y necesita la locucion ENTERA por tres
+# razones que aqui no se pueden salvar:
+#
+#   1. Arrastra estado entre ventanas -- la `referencia` con la que empalma la
+#      siguiente -- y mira 1024+384 muestras por delante. Estirar cada trozo de
+#      133 ms por su cuenta deja una costura audible en CADA empalme, y aqui
+#      los empalmes son ~7 por segundo durante toda la locucion.
+#   2. La salida no dura lo mismo que la entrada, asi que los trozos dejarian de
+#      encajar con los latentes y el cliente no podria alinear nada.
+#   3. La locucion de una sesion NO TIENE FIN CONOCIDO: encadena generate() al
+#      llegar a TOPE_CACHE y dura lo que el de arriba siga escribiendo.
+#      "Acumularlo todo y estirar al final" es exactamente no hacer streaming:
+#      seria no emitir un solo byte hasta el "fin", que es todo lo contrario de
+#      para lo que existe este websocket.
+#
+# /tts/stream si lo hace -- acumula la frase y la estira de golpe -- porque alli
+# la locucion es UNA frase de unos segundos y se sabe cuando acaba. Aqui se
+# rechaza con un error claro en vez de fingir. El cliente que quiera ir mas
+# deprisa tiene dos salidas honestas: (a) reproducir el PCM a otro ritmo
+# (playbackRate en Web Audio), que es gratis pero mueve el tono -- justo lo que
+# estirar.py existe para evitar --, o (b) acumular el audio de su lado y
+# estirarlo el, ya sin restriccion de tiempo real. Ninguna de las dos es
+# trabajo del servidor.
+
+MARCO_PCM = 0
+MARCO_EVENTO = 1
+
+
+def marco(tipo: int, carga: bytes) -> bytes:
+    """[tipo:1][longitud:4 BE][carga], igual que scripts/asistente_web.py."""
+    return struct.pack(">BI", tipo, len(carga)) + carga
+
+
+class AbrirSesionWS(BaseModel):
+    """Ajustes de la locucion. Solo se miran AL ABRIR: cambiarlos a mitad
+    obligaria a empezar otra locucion, que es justo lo que la sesion evita."""
+    sesion: Optional[str] = Field(None, min_length=1, max_length=64)
+    voz: str = VOZ_DEFECTO
+    cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
+    semilla: Optional[int] = Field(None, ge=0, lt=2**31)
+    pasos: Optional[int] = Field(None, ge=4, le=20)
+    # Aceptado solo para poder dar un error claro; ver el bloque VELOCIDAD.
+    velocidad: float = Field(1.0, ge=0.85, le=1.20)
+
+
+def _autorizado_ws(ws: WebSocket, token: Optional[str]) -> bool:
+    """El mismo bearer que autorizar(), mas un repliegue por query.
+
+    OJO, ESTO DEJA EL TOKEN EN LOS REGISTROS: la URL completa -- con
+    ?token=... -- aparece en el log de acceso de uvicorn, en el de cualquier
+    proxy que haya delante y en el historial del navegador. Es aceptable en una
+    red domestica y NO lo es en internet.
+
+    Se admite igualmente porque la API de WebSocket del navegador no deja poner
+    cabeceras: `new WebSocket(url)` no tiene donde meter Authorization, y el
+    unico hueco del protocolo (Sec-WebSocket-Protocol) es un apano peor. Los
+    clientes que SI pueden -- python, curl, cualquier cosa que no sea un
+    navegador -- deben usar la cabecera, que es lo que se mira primero.
+    """
+    if not TOKEN:
+        return True
+    cabecera = ws.headers.get("authorization", "")
+    if cabecera.lower().startswith("bearer "):
+        dado = cabecera[7:].strip()
+    else:
+        dado = token or ""
+    return secrets.compare_digest(dado, TOKEN)
+
+
+@app.websocket("/tts/sesion/ws")
+async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
+    """Una sesion viva por conexion. Ver el bloque WEBSOCKET de arriba.
+
+    Eventos que emite, en el orden tipico:
+
+      abierta     la sesion existe y tiene nombre (util para GET /tts/sesion/{id})
+      texto       acuse de cada frase encolada, con los tokens que salieron
+      sonando     primer trozo de PCM: a partir de aqui ya se oye algo
+      esperando   el modelo se quedo sin texto por delante y esta PARADO
+                  (esperando=true) o volvio a arrancar (esperando=false). Es el
+                  mismo flag que la via HTTP publica en GET /tts/sesion/{id},
+                  pero empujado en vez de sondeado: es la senal de "manda ya la
+                  frase siguiente si no quieres un silencio".
+      fin_texto   acuse de {"accion":"fin"}: no entra mas texto
+      hecho       la locucion termino; lleva el estado final de la sesion
+      error       cualquier cosa que salio mal, con texto explicativo
+    """
+    if not _autorizado_ws(ws, token):
+        # Se rechaza ANTES del accept: Starlette contesta 403 al apreton de
+        # manos y no llega a existir websocket ninguno. Asi un cliente sin token
+        # no consume ni una sesion ni un hilo.
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+
+    lazo = asyncio.get_running_loop()
+    t0 = time.perf_counter()
+    candado_envio = asyncio.Lock()
+    s: Optional[SesionViva] = None
+    nombre: Optional[str] = None
+    arrancado = False
+    tareas: list = []
+
+    async def enviar(tipo: int, carga: bytes) -> None:
+        # Dos tareas emiten a la vez (la bomba de audio y el vigia de
+        # 'esperando') y send_bytes no es reentrante: sin este candado se
+        # podrian intercalar dos marcos y el lector del cliente leeria basura.
+        async with candado_envio:
+            await ws.send_bytes(marco(tipo, carga))
+
+    async def evento(**kw) -> None:
+        await enviar(MARCO_EVENTO, json.dumps(kw, ensure_ascii=False).encode())
+
+    def transcurrido() -> float:
+        return round(time.perf_counter() - t0, 3)
+
+    async def bombear() -> str:
+        """Vuelca la cola de audio de la sesion al socket."""
+        primero = True
+        try:
+            while True:
+                trozo = await s.cola.get()
+                if trozo is _FIN:
+                    return "hecho"
+                if primero:
+                    primero = False
+                    await evento(tipo="sonando", s=transcurrido())
+                await enviar(MARCO_PCM, a_pcm16(trozo))
+        except (WebSocketDisconnect, RuntimeError, ConnectionError):
+            return "roto"
+
+    async def vigilar() -> None:
+        """Empuja los cambios del flag 'esperando'.
+
+        Se SONDEA el estado en vez de colgar una devolucion de llamada dentro de
+        TextoEnCurso porque 'esperando' tiene dos fuentes -- el bucle parado sin
+        texto por delante y el hueco ENTRE dos generate() -- y solo estado() las
+        junta. 100 ms es dos ordenes de magnitud mas fino que lo que tarda una
+        frase y no cuesta nada medible.
+        """
+        antes = False
+        try:
+            while True:
+                ahora = bool(s.estado()["esperando"])
+                if ahora != antes:
+                    antes = ahora
+                    await evento(tipo="esperando", esperando=ahora,
+                                 s=transcurrido())
+                await asyncio.sleep(0.1)
+        except (WebSocketDisconnect, RuntimeError, ConnectionError):
+            return
+
+    async def leer() -> str:
+        """Consume los mensajes del cliente hasta que se va.
+
+        No termina con {"accion":"fin"}: despues de cerrar el texto aun queda
+        por bajar todo el audio, y el que decide que se acabo es la bomba.
+        """
+        nonlocal arrancado
+        while True:
+            try:
+                msg = await ws.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                return "desconectado"
+            if msg["type"] == "websocket.disconnect":
+                return "desconectado"
+            crudo = msg.get("text")
+            if crudo is None:
+                await evento(tipo="error",
+                             texto="se esperaba JSON de texto, llego binario")
+                continue
+            try:
+                m = json.loads(crudo)
+            except (json.JSONDecodeError, TypeError):
+                await evento(tipo="error", texto="el mensaje no es JSON")
+                continue
+            accion = m.get("accion") if isinstance(m, dict) else None
+            if accion == "texto":
+                cuerpo = (m.get("texto") or "").strip()
+                if not cuerpo:
+                    await evento(tipo="error", texto="texto vacio")
+                    continue
+                try:
+                    n = s.alimentar(cuerpo)
+                except HTTPException as e:
+                    await evento(tipo="error", texto=str(e.detail))
+                    continue
+                if not arrancado:
+                    # Despues de alimentar, igual que por HTTP: el hilo se muere
+                    # solo si arranca sin nada que decir.
+                    s.arrancar()
+                    arrancado = True
+                await evento(tipo="texto", tokens=n, s=transcurrido())
+            elif accion == "fin":
+                s.cerrar()
+                if not arrancado:
+                    # Nunca hubo texto, asi que el hilo no arranco y nadie va a
+                    # poner el centinela en la cola. Sin esto la bomba se
+                    # quedaria esperando un fin que no llega.
+                    s.terminada = True
+                    s.cola.put_nowait(_FIN)
+                await evento(tipo="fin_texto", s=transcurrido())
+            elif accion == "abrir":
+                await evento(tipo="error",
+                             texto="la sesion ya esta abierta; abre otra conexion")
+            else:
+                await evento(tipo="error", texto=f"accion desconocida: {accion!r}")
+
+    try:
+        # ---- 1) primer mensaje: abrir ----
+        try:
+            crudo = await ws.receive_text()
+        except (WebSocketDisconnect, RuntimeError, KeyError):
+            return
+        try:
+            pet = json.loads(crudo)
+        except (json.JSONDecodeError, TypeError):
+            await evento(tipo="error", texto="el primer mensaje no es JSON")
+            return
+        if not isinstance(pet, dict) or pet.get("accion") != "abrir":
+            await evento(tipo="error",
+                         texto='el primer mensaje tiene que ser {"accion":"abrir"}')
+            return
+        try:
+            cfg = AbrirSesionWS(**{k: v for k, v in pet.items() if k != "accion"})
+        except Exception as e:
+            await evento(tipo="error",
+                         texto=f"ajustes invalidos: {str(e).splitlines()[0]}")
+            return
+        if abs(cfg.velocidad - 1.0) > 1e-3:
+            # Ver el bloque VELOCIDAD de arriba. Mejor un error claro que un
+            # audio con una costura cada 133 ms o un socket que no emite nada
+            # hasta el final.
+            await evento(
+                tipo="error",
+                texto="velocidad != 1 no se admite por websocket: estirar() "
+                      "necesita la locucion entera y aqui no tiene fin conocido. "
+                      "Usa /tts/stream para una frase suelta, o cambia el ritmo "
+                      "al reproducir.")
+            return
+        if not SESIONES_ACTIVAS:
+            await evento(tipo="error",
+                         texto="sesiones desactivadas (VIBEVOICE_SESIONES=0)")
+            return
+        _caducar_sesiones()
+        try:
+            prefijo_voz(cfg.voz)   # valida antes de montar nada
+        except HTTPException as e:
+            await evento(tipo="error", texto=str(e.detail))
+            return
+        nombre = cfg.sesion or f"ws-{uuid.uuid4().hex[:8]}"
+        if nombre in _SESIONES:
+            await evento(tipo="error", texto=f"la sesion '{nombre}' ya existe")
+            nombre = None
+            return
+        s = SesionViva(nombre, cfg.voz, cfg.cfg_scale, cfg.semilla, cfg.pasos,
+                       lazo)
+        # El audio ya sale por aqui: que GET /tts/sesion/{id}/audio no lo robe.
+        s.escuchando = True
+        _SESIONES[nombre] = s
+        await evento(tipo="abierta", sesion=nombre, voz=cfg.voz,
+                     cfg_scale=cfg.cfg_scale, semilla=cfg.semilla,
+                     pasos=cfg.pasos if cfg.pasos is not None else PASOS,
+                     ritmo=RITMO, formato="pcm_s16le_mono",
+                     rtf_esperado=RTF_MEDIDO, s=transcurrido())
+
+        # ---- 2) texto para arriba, audio para abajo ----
+        bomba = asyncio.create_task(bombear(), name=f"ws-audio-{nombre}")
+        lector = asyncio.create_task(leer(), name=f"ws-texto-{nombre}")
+        vigia = asyncio.create_task(vigilar(), name=f"ws-espera-{nombre}")
+        tareas = [bomba, lector, vigia]
+        # Termina lo que ocurra primero: o se acaba la locucion (bomba) o se va
+        # el cliente (lector). El vigia no decide nada, solo acompana.
+        await asyncio.wait({bomba, lector},
+                           return_when=asyncio.FIRST_COMPLETED)
+        if bomba.done() and bomba.result() == "hecho":
+            est = s.estado()
+            # En suppress porque la locucion puede acabar en el mismo instante
+            # en que el cliente cierra: entonces el socket ya no admite nada y
+            # eso no es un fallo que merezca una traza en el log.
+            with contextlib.suppress(Exception):
+                if est.get("error"):
+                    await evento(tipo="error", texto=est["error"])
+                await evento(tipo="hecho", s=transcurrido(), estado=est)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with contextlib.suppress(Exception):
+            await evento(tipo="error", texto=f"{type(e).__name__}: {e}")
+    finally:
+        for t in tareas:
+            t.cancel()
+        if tareas:
+            await asyncio.gather(*tareas, return_exceptions=True)
+        if s is not None:
+            # Se saca del registro ANTES de esperar al hilo: GET /tts/sesion/{id}
+            # tiene que dar 404 en cuanto se cae el websocket, no cuando el hilo
+            # se entere. Y se ABORTA en vez de cerrar educadamente porque ya no
+            # hay nadie escuchando (ver SesionViva.abortar).
+            _SESIONES.pop(nombre, None)
+            s.escuchando = False
+            s.abortar()
+            # join en un hilo del executor para no bloquear el bucle de eventos.
+            # El plazo es por si generate() se atasca: mas vale un aviso en el
+            # log que un handler colgado para siempre.
+            if not await lazo.run_in_executor(None, s.esperar_fin, 15.0):
+                print(f"[aviso] sesion {nombre}: el hilo sigue vivo 15 s despues "
+                      f"de abortar; puede quedar reteniendo _candado_modelo",
+                      flush=True)
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 def main() -> None:
