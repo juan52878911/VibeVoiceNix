@@ -293,7 +293,19 @@ class AcusticoOV:
         return torch.from_numpy(np.array(res[self.comp.output("audio")]))
 
 
-def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None):
+def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None,
+           hilos_acustico=None):
+    """hilos_acustico separa el presupuesto del decodificador del resto.
+
+    Solo tiene sentido cuando voz_stream.py lo solapa en otro hilo: entonces el
+    decodificador y el bucle (tts_lm + cabeza) corren A LA VEZ, y darles a los
+    dos `hilos` enteros es pedir el doble de nucleos de los que hay. Aqui el
+    reparto SI es exacto, porque INFERENCE_NUM_THREADS es por modelo compilado
+    -- en el camino torch no se puede, que ahi el pool intra-op es uno para
+    todo el proceso.
+
+    None = el comportamiento de antes: los mismos hilos para todo.
+    """
     from vibevoice.modular.modeling_vibevoice_streaming_inference import (
         VibeVoiceStreamingForConditionalGenerationInference,
     )
@@ -323,14 +335,17 @@ def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None):
     gc.collect()
 
     # 3) enchufar OpenVINO
-    modelo.model.tts_language_model = TtsLmOV(ir_lm, hilos)
+    # El bucle se queda con lo que no se lleve el decodificador. Minimo 1: un
+    # reparto mal puesto no debe dejar el camino critico sin hilos.
+    hilos_bucle = max(1, hilos - hilos_acustico) if hilos_acustico else hilos
+    modelo.model.tts_language_model = TtsLmOV(ir_lm, hilos_bucle)
     if ir_cabeza:
-        modelo.model.prediction_head = CabezaOV(ir_cabeza, hilos)
+        modelo.model.prediction_head = CabezaOV(ir_cabeza, hilos_bucle)
     else:
         torch.ao.quantization.quantize_dynamic(
             modelo.model.prediction_head, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
     if ir_acustico:
-        acustico = AcusticoOV(ir_acustico, hilos)
+        acustico = AcusticoOV(ir_acustico, hilos_acustico or hilos)
         modelo.model.acoustic_tokenizer.decode = acustico.decode
         modelo._acustico_ov = acustico
     gc.collect()

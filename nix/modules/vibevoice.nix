@@ -24,7 +24,13 @@ let
     name = "vibevoice";
     runtimeInputs = [ pkgs.vibevoice-env pkgs.ffmpeg ];
     text = ''
-      export OMP_NUM_THREADS="''${VIBEVOICE_HILOS:-${toString cfg.hilos}}"
+      # hilos = 0 significa "que lo decida la maquina": se deja OMP_NUM_THREADS
+      # SIN poner y detectar_hilos() (voz_stream.py) cuenta nucleos fisicos.
+      # Exportarlo vacio no vale: OpenMP lee la variable, no su contenido.
+      hilos="''${VIBEVOICE_HILOS:-${toString cfg.hilos}}"
+      if [ "$hilos" != "0" ]; then
+        export OMP_NUM_THREADS="$hilos"
+      fi
       ${lib.optionalString cfg.anclarNucleos ''
         export OMP_PLACES="''${OMP_PLACES:-cores}"
         export OMP_PROC_BIND="''${OMP_PROC_BIND:-close}"
@@ -58,19 +64,30 @@ in
 
     hilos = lib.mkOption {
       type = lib.types.int;
-      default = 6;
+      default = 0;
       description = ''
-        Hilos de OpenMP. 6 = los nucleos FISICOS del i7-8700T. Medido en la VM
-        (RTF, menor es mejor):
+        Hilos de OpenMP. **0 = detectarlos** (lo recomendado): cuenta nucleos
+        FISICOS -- no hilos logicos -- respetando el cpuset del cgroup, y a
+        partir de 8 deja uno libre para el resto del stack. Asi la misma
+        configuracion sirve en una maquina de 4, de 8 o de 12 hilos sin tocar
+        nada. La deteccion se imprime al arrancar.
+
+        Un numero fijo pisa la deteccion, que es lo que hay que hacer para
+        comparar mediciones entre si.
+
+        MAS NO ES MEJOR, y por eso se cuentan fisicos. Medido en la VM
+        (i7-8700T, 6 fisicos / 12 logicos; RTF, menor es mejor):
 
           2 hilos  4,19    8 hilos  4,31
           4 hilos  4,19   10 hilos  4,46
           6 hilos  4,24   12 hilos  5,18  <- 24% PEOR que con 2
 
-        Mas hilos empeora: la carga esta limitada por ancho de banda de
-        memoria, no por computo. Con 2 hilos ya se satura el bus DDR4 de un
-        solo canal, y del 7 al 12 encima compiten por las mismas unidades AVX2
-        de los 6 nucleos fisicos.
+        La carga esta limitada por ancho de banda de memoria, no por computo.
+        Con 2 hilos ya se satura el bus DDR4 de un solo canal, y del 7 al 12
+        encima compiten por las mismas unidades AVX2 de los 6 nucleos fisicos.
+
+        La forma de aprovechar los hilos que sobran NO es subir este numero,
+        sino solapar etapas: ver services.voz-stream.solaparDecodificador.
       '';
     };
 

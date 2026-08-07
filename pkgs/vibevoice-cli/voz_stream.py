@@ -67,6 +67,7 @@ import gc
 import json
 import os
 import platform
+import queue
 import re
 import secrets
 import sys
@@ -105,7 +106,93 @@ if not TOKEN:
         "que alcance este puerto.",
         flush=True,
     )
-HILOS = int(os.environ.get("OMP_NUM_THREADS", "6"))
+def nucleos_fisicos() -> int:
+    """Nucleos FISICOS utilizables, no hilos logicos ni nucleos de la maquina.
+
+    Los tres son numeros distintos y confundirlos es justo el error que este
+    proyecto ya midio: en el i7-8700T (6 fisicos / 12 logicos) usar los 12
+    empeora el RTF un 24 % -- los hilos hermanos de un mismo nucleo comparten
+    la unidad AVX2 y el puerto de memoria, asi que se estorban en vez de
+    sumar. Ver docs/optimizacion.md.
+
+    Por orden de fiabilidad:
+      1. sched_getaffinity: lo que el cgroup/taskset deja usar DE VERDAD. En un
+         contenedor con `--cpuset-cpus 0-3` esto da 4 y os.cpu_count() da 12.
+      2. /proc/cpuinfo agrupando por (physical id, core id): separa fisicos de
+         hermanos SMT en Linux.
+      3. hw.perflevel0.physicalcpu (macOS): los nucleos de RENDIMIENTO de un
+         Apple Silicon. Contar tambien los de eficiencia mete en el reparto
+         nucleos ~3x mas lentos, y con trabajo repartido a partes iguales el
+         lote entero va al ritmo del mas lento.
+      4. os.cpu_count() // 2 como ultimo recurso, asumiendo SMT.
+    """
+    permitidos = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            permitidos = len(os.sched_getaffinity(0))
+        except OSError:
+            permitidos = None
+
+    fisicos = None
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+            for clave in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
+                r = subprocess.run(["sysctl", "-n", clave],
+                                   capture_output=True, text=True, timeout=2)
+                if r.returncode == 0 and r.stdout.strip().isdigit():
+                    fisicos = int(r.stdout.strip())
+                    break
+        else:
+            nucleos, actual = set(), {}
+            for linea in Path("/proc/cpuinfo").read_text().splitlines():
+                if ":" not in linea:
+                    if actual:
+                        nucleos.add((actual.get("physical id", "0"),
+                                     actual.get("core id", str(len(nucleos)))))
+                        actual = {}
+                    continue
+                k, _, v = linea.partition(":")
+                actual[k.strip()] = v.strip()
+            if actual:
+                nucleos.add((actual.get("physical id", "0"),
+                             actual.get("core id", str(len(nucleos)))))
+            fisicos = len(nucleos) or None
+    except Exception:
+        fisicos = None
+
+    if fisicos is None:
+        fisicos = max(1, (os.cpu_count() or 2) // 2)
+    # La afinidad es un TOPE, no una alternativa: si el cgroup da 2 CPUs, dan
+    # igual los 6 nucleos que tenga la maquina por debajo.
+    if permitidos:
+        fisicos = min(fisicos, permitidos)
+    return max(1, fisicos)
+
+
+def detectar_hilos() -> int:
+    """Hilos de inferencia. OMP_NUM_THREADS manda; si no, los fisicos.
+
+    Se deja UNO libre a partir de 8 nucleos para que el resto del stack --
+    whisper, voz-api, el propio servidor HTTP -- pueda responder mientras esto
+    genera. Por debajo de 8 no se reserva nada: quitarle un nucleo a una
+    maquina de 4 cuesta un 25 % del computo y ahi no sobra.
+    """
+    puesto = os.environ.get("OMP_NUM_THREADS", "").strip()
+    if puesto.isdigit() and int(puesto) > 0:
+        return int(puesto)
+    n = nucleos_fisicos()
+    return n - 1 if n >= 8 else n
+
+
+HILOS = detectar_hilos()
+# Que se vea: si la deteccion se equivoca, este numero es la primera pista.
+print(f"[arranque] {HILOS} hilos de inferencia "
+      f"({nucleos_fisicos()} nucleos fisicos utilizables)", flush=True)
+# torch NO lee OMP_NUM_THREADS cuando su backend es nativo en vez de OpenMP
+# (el caso en macOS ARM), asi que se le dice explicitamente. Sin esto el
+# reparto adaptativo no llegaba al camino torch.
+torch.set_num_threads(HILOS)
 
 # Motor de inferencia: "torch" (RTF 2,19) u "openvino" (RTF 1,09).
 MOTOR = os.environ.get("VIBEVOICE_MOTOR", "torch")
@@ -259,6 +346,239 @@ def autorizar(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> N
         raise HTTPException(status_code=401, detail="token invalido o ausente")
 
 
+# ---------------------------------------------------------------------------
+# SOLAPAR EL DECODIFICADOR ACUSTICO CON EL RESTO DEL BUCLE
+# ---------------------------------------------------------------------------
+#
+# EL HALLAZGO QUE LO PERMITE: el decodificador acustico es un SUMIDERO.
+# Comprobado leyendo el bucle de Microsoft
+# (modeling_vibevoice_streaming_inference.py, lineas 776-804):
+#
+#     speech_latent  = sample_speech_tokens(...)      # cabeza de difusion
+#     audio_chunk    = acoustic_tokenizer.decode(...) # <- el 42% del tiempo
+#     audio_chunks[idx].append(audio_chunk[i])        # se guarda
+#     audio_streamer.put(audio_chunk, ...)            # se emite
+#     acoustic_embed = acoustic_connector(speech_latent)   # <- LATENT, no audio
+#
+# La realimentacion autorregresiva pasa por `acoustic_connector(speech_latent)`.
+# El audio decodificado NO vuelve a entrar en el modelo: solo se guarda y se
+# emite. Asi que decode() esta en el camino critico unicamente porque se llama
+# de forma sincrona, no porque el bucle lo necesite.
+#
+# MEDIDO en un Apple M4 (motor torch-int8, 6 hilos, texto de 180 caracteres,
+# semilla 11), reparto DENTRO de una generate() real:
+#
+#     tts_lm      189 llamadas   20,47 ms   40,3 %
+#     cabeza      540 llamadas    2,56 ms   14,4 %
+#     acustico     90 llamadas   45,19 ms   42,4 %   <- se puede solapar
+#     resto                                  2,8 %
+#
+# Con el decodificador fuera del camino critico el techo teorico es
+# max(42,4 ; 57,6) = 57,6 % del tiempo, o sea 1,74x. Lo que se consigue de
+# verdad depende de cuanto se estorben las dos etapas por ancho de banda de
+# memoria, que en esta maquina es el recurso escaso; por eso hay medicion y
+# no solo teoria (ver docs/optimizacion.md).
+#
+# POR QUE UN BUFER PREASIGNADO Y NO UN "FUTURO"
+# generate() hace `torch.cat(audio_chunks)` al final PASE LO QUE PASE -- solo
+# el `return` mira `return_speech`, no el concat --, asi que lo que devuelva
+# decode() tiene que ser un tensor de verdad, no un objeto perezoso. La salida
+# tiene forma fija y conocida (un latente -> 3200 muestras), asi que se
+# devuelve un tensor VACIO del tamano bueno y el worker lo rellena in situ.
+# Quien lo lee ve el dato porque nadie lo lee antes de que el worker acabe.
+#
+# POR QUE UN SOLO WORKER Y EN ORDEN ESTRICTO
+# El decodificador es causal y con estado: las colas de sus convoluciones las
+# deja la llamada anterior. Dos decode() a la vez, o en otro orden, darian otro
+# audio. Un unico hilo con una cola FIFO conserva el orden exacto de la version
+# sincrona, que es lo que hace que el audio salga identico bit a bit.
+#
+# LA EMISION TAMBIEN SE MUEVE AL WORKER
+# Si `streamer.put()` se quedara en el hilo de generate() habria que esperar
+# ahi al decode -- y no se solaparia nada. Asi que el worker, tras rellenar el
+# bufer, llama el mismo al put() de verdad. Efecto colateral: la cancelacion
+# cooperativa (put() lanzando GeneracionCancelada) ya no salta en el hilo de
+# generate(), asi que la excepcion se guarda y se relanza en el decode()
+# siguiente. El corte tarda como mucho un trozo mas que antes: ~133 ms.
+SOLAPAR_DECODER = os.environ.get("VIBEVOICE_SOLAPAR_DECODER", "1") not in ("0", "no")
+# Hilos para el decodificador cuando va solapado. El resto son para el camino
+# principal (tts_lm + cabeza). Solo el motor OpenVINO puede repartirlos de
+# verdad: INFERENCE_NUM_THREADS es por modelo compilado, mientras que en torch
+# el pool intra-op es uno para todo el proceso.
+HILOS_DECODER = int(os.environ.get("VIBEVOICE_HILOS_DECODER", "0")) or max(1, HILOS // 2)
+
+
+class _Trabajo:
+    """Un decode encolado y su emision, que se deciden en hilos distintos.
+
+    El worker rellena el bufer; el hilo de generate() dice a donde va. Cual de
+    los dos llega antes NO esta garantizado -- entre decode() y put() solo hay
+    un append de lista, pero "casi siempre" no es "siempre" --, asi que el que
+    llegue el ultimo es el que emite. El candado hace atomica esa decision.
+    """
+
+    __slots__ = ("bufer", "args", "kw", "destino", "indices", "listo", "emitido",
+                 "candado")
+
+    def __init__(self, bufer, args, kw):
+        self.bufer, self.args, self.kw = bufer, args, kw
+        self.destino = self.indices = None
+        self.listo = self.emitido = False
+        self.candado = threading.Lock()
+
+    def reclamar_emision(self, *, desde_worker: bool):
+        """Devuelve (destino, indices) si a QUIEN LLAMA le toca emitir."""
+        with self.candado:
+            if desde_worker:
+                self.listo = True
+                if self.destino is None or self.emitido:
+                    return None
+            else:
+                if not self.listo:
+                    return None       # ya emitira el worker, que llegara despues
+                if self.emitido:
+                    return None
+            self.emitido = True
+            return self.destino, self.indices
+
+
+class DecodificadorSolapado:
+    """Saca acoustic_tokenizer.decode() del camino critico de generate()."""
+
+    def __init__(self, decode_real, profundidad: int = 2):
+        self._decode = decode_real
+        # Cola CORTA a proposito: es cuanto puede adelantarse el bucle al
+        # decodificador. Mas profundidad no acelera -- el cuello es el propio
+        # decodificador -- y solo retrasaria la cancelacion y el audio en vuelo.
+        self._cola: "queue.Queue" = queue.Queue(maxsize=profundidad)
+        self._molde = None          # forma/dtype, del primer decode (sincrono)
+        self._fallo = None          # excepcion del worker, para relanzar en generate()
+        self._trabajos: dict = {}   # id(bufer) -> _Trabajo pendiente de destino
+        self._hilo = threading.Thread(target=self._bucle, name="decoder-acustico",
+                                      daemon=True)
+        self._hilo.start()
+
+    # ---- hilo trabajador ----
+    def _bucle(self):
+        while True:
+            trabajo = self._cola.get()
+            try:
+                if trabajo is None:
+                    return
+                if self._fallo is None:
+                    salida = self._decode(*trabajo.args, **trabajo.kw)
+                    if tuple(salida.shape) != tuple(trabajo.bufer.shape):
+                        raise RuntimeError(
+                            "el decodificador cambio de forma: esperaba "
+                            f"{tuple(trabajo.bufer.shape)} y dio "
+                            f"{tuple(salida.shape)}")
+                    trabajo.bufer.copy_(salida)
+                    envio = trabajo.reclamar_emision(desde_worker=True)
+                    if envio is not None and envio[0] is not None:
+                        # El put() de verdad, ya con el audio dentro. Puede
+                        # lanzar GeneracionCancelada: es la senal de que el
+                        # cliente se fue, y se propaga por _fallo.
+                        envio[0].put(trabajo.bufer, envio[1])
+            except BaseException as e:      # noqa: BLE001 - se relanza tal cual
+                if self._fallo is None:
+                    self._fallo = e
+            finally:
+                self._cola.task_done()
+
+    # ---- cara visible ----
+    def decode(self, latents, *a, **kw):
+        self._relanzar()
+        if self._molde is None:
+            # La primera va sincrona: hace falta su forma para poder preasignar
+            # las siguientes, y ademas es la que paga el cebado del decoder.
+            salida = self._decode(latents, *a, **kw)
+            self._molde = (tuple(salida.shape), salida.dtype)
+            return salida
+        forma, tipo = self._molde
+        bufer = torch.empty(forma, dtype=tipo)
+        trabajo = _Trabajo(bufer, (latents, *a), kw)
+        self._trabajos[id(bufer)] = trabajo
+        # put() bloquea cuando la cola esta llena: es la contrapresion que evita
+        # que el bucle se adelante sin limite al decodificador.
+        self._cola.put(trabajo)
+        return bufer
+
+    def emitir(self, bufer, streamer, indices) -> None:
+        """Dice a donde va el audio de `bufer`. Lo llama el streamer envuelto."""
+        trabajo = self._trabajos.pop(id(bufer), None)
+        if trabajo is None:
+            # No salio de un decode diferido (la primera, que va sincrona): el
+            # dato ya esta, se emite aqui mismo.
+            if streamer is not None:
+                streamer.put(bufer, indices)
+            return
+        with trabajo.candado:
+            trabajo.destino, trabajo.indices = streamer, indices
+        envio = trabajo.reclamar_emision(desde_worker=False)
+        if envio is not None and envio[0] is not None:
+            envio[0].put(trabajo.bufer, envio[1])
+        self._relanzar()
+
+    def drenar(self) -> None:
+        """Espera a que no quede audio por decodificar ni por emitir."""
+        self._cola.join()
+        self._trabajos.clear()
+        self._relanzar()
+
+    def _relanzar(self):
+        if self._fallo is not None:
+            fallo, self._fallo = self._fallo, None
+            raise fallo
+
+
+class StreamerSolapado:
+    """Envuelve al streamer real para que la emision la haga el worker.
+
+    put() aqui NO emite: le dice al decodificador que, cuando termine con ese
+    bufer, se lo entregue al streamer de verdad. end() drena antes de cerrar,
+    que es lo que garantiza que no se pierda ni un trozo ni se adelante el
+    cierre al ultimo put().
+    """
+
+    def __init__(self, solapado: DecodificadorSolapado, real):
+        self._solapado = solapado
+        self.real = real
+
+    def put(self, trozos, indices):
+        self._solapado.emitir(trozos, self.real, indices)
+
+    def end(self, indices=None):
+        self._solapado.drenar()
+        self.real.end(indices)
+
+    def __getattr__(self, nombre):
+        # cancelado, terminado, flujo(), trozos... el resto del mundo sigue
+        # hablando con el streamer real sin enterarse de esta capa.
+        return getattr(self.real, nombre)
+
+
+def solapar_decodificador(modelo) -> Optional[DecodificadorSolapado]:
+    """Instala el decodificador solapado. None si esta desactivado."""
+    if not SOLAPAR_DECODER:
+        return None
+    if EN_GPU:
+        # En GPU el reparto es otro (el decodificador deja de dominar) y ademas
+        # habria que preasignar el bufer en el dispositivo bueno. No se ha
+        # medido ahi, asi que no se activa a ciegas.
+        print("[arranque] decodificador sin solapar: solo esta medido en CPU",
+              flush=True)
+        return None
+    tok = getattr(getattr(modelo, "model", None), "acoustic_tokenizer", None)
+    if tok is None:
+        return None
+    solapado = DecodificadorSolapado(tok.decode)
+    tok.decode = solapado.decode
+    print(f"[arranque] decodificador acustico solapado "
+          f"({HILOS - HILOS_DECODER} hilos el bucle, {HILOS_DECODER} el decoder)",
+          flush=True)
+    return solapado
+
+
 def cargar_modelo():
     """Carga el modelo con el motor elegido.
 
@@ -278,7 +598,11 @@ def cargar_modelo():
             sys.path.insert(0, OV_CODIGO)
             from motor import cargar as cargar_ov
             procesador, modelo = cargar_ov(
-                MODELO_DIR, HILOS, IR_LM, IR_CABEZA, IR_ACUSTICO
+                MODELO_DIR, HILOS, IR_LM, IR_CABEZA, IR_ACUSTICO,
+                # Solo se reparte si el decodificador va a correr EN PARALELO
+                # con el bucle; si no, cada etapa tiene la maquina entera para
+                # ella durante su turno y partir los hilos solo la frenaria.
+                hilos_acustico=HILOS_DECODER if SOLAPAR_DECODER else None,
             )
             # El freno tambien aqui: sample_speech_tokens sigue siendo la de
             # torch con este motor (solo cambian los grafos que llama), y la
@@ -287,6 +611,7 @@ def cargar_modelo():
             reforzar_guia_arranque(modelo)
             instrumentar_latentes(modelo)
             modelo.set_ddpm_inference_steps(PASOS)
+            _estado["solapado"] = solapar_decodificador(modelo)
             devolver_memoria()
             _estado["motor"] = "openvino"
             return procesador, modelo
@@ -344,6 +669,9 @@ def cargar_modelo():
 
     instrumentar_latentes(modelo)
     modelo.set_ddpm_inference_steps(PASOS)
+    # Despues de cebar_decoder_acustico: asi el cebado corre DENTRO del worker
+    # y no vuelve a meter el decodificador en el camino critico.
+    _estado["solapado"] = solapar_decodificador(modelo)
     # Los pesos fp32 que acaban de ser sustituidos siguen ocupando hasta que
     # se recolectan Y se devuelven al sistema.
     devolver_memoria()
@@ -960,6 +1288,9 @@ def _ajustar_pasos(pasos: Optional[int]) -> None:
 def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
     """Cuerpo sincrono de la sintesis; corre en un hilo del executor."""
     procesador = _estado["procesador"]
+    solapado = _estado.get("solapado")
+    if solapado is not None and streamer is not None:
+        streamer = StreamerSolapado(solapado, streamer)
     try:
         with _candado_modelo:
             _ajustar_pasos(pasos)
@@ -1003,9 +1334,16 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
     finally:
         # Pase lo que pase, cierra la cola: sin esto un fallo dentro de
         # generate() dejaria al consumidor esperando un trozo que no llega.
-        # end() es idempotente.
+        # end() es idempotente. StreamerSolapado.end() ademas drena el worker,
+        # asi que al salir de aqui no queda audio a medio decodificar.
         if streamer is not None:
             streamer.end()
+        elif solapado is not None:
+            # Calentamiento: no hay streamer que drene por su cuenta, pero el
+            # worker si tiene trabajo encolado y la siguiente sintesis no debe
+            # encontrarselo a medias.
+            with contextlib.suppress(Exception):
+                solapado.drenar()
 
 
 # --------------------------------------------------------------------------
@@ -1873,6 +2211,9 @@ class SesionViva:
             if self.abortada:
                 audio.cancelado = True
             self._audio = audio
+        # Fuera del try: el `finally` lo mira, y si se resolviera dentro podria
+        # no estar definido cuando algo falle antes de llegar a esa linea.
+        solapado = _estado.get("solapado")
         _candado_modelo.acquire()
         try:
             _ajustar_pasos(self.pasos)
@@ -1896,6 +2237,10 @@ class SesionViva:
             entradas.pop("tts_text_ids")
             al.posicion_inicial = int(entradas["tts_lm_input_ids"].shape[1])
             self.generaciones += 1
+            # El envoltorio va SOLO a generate(); self._audio sigue siendo la
+            # cola de verdad, que es a la que abortar() le pone `cancelado` y
+            # de la que se leen los `retenidos` al salir.
+            destino = StreamerSolapado(solapado, audio) if solapado else audio
             with torch.no_grad():
                 _estado["modelo"].generate(
                     **entradas,
@@ -1908,9 +2253,17 @@ class SesionViva:
                     show_progress_bar=False,
                     return_speech=False,
                     all_prefilled_outputs=copy.deepcopy(base),
-                    audio_streamer=audio,
+                    audio_streamer=destino,
                 )
         finally:
+            # ANTES de soltar el candado: si generate() salio por excepcion --
+            # descarrile o aborto -- nadie llamo a end(), y el worker podria
+            # seguir decodificando trozos de ESTA locucion mientras otra sesion
+            # entra y le mueve el estado del decodificador por debajo. Ademas,
+            # `retenidos` no esta completo hasta que el worker termina de emitir.
+            if solapado is not None:
+                with contextlib.suppress(Exception):
+                    solapado.drenar()
             _candado_modelo.release()
             if audio.retenidos:
                 # Se llega aqui con retenidos solo cuando NO hubo end(): un

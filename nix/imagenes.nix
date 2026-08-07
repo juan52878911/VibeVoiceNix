@@ -156,10 +156,16 @@ in
         "VOZ_STREAM_PUERTO=8082"
         # Todo dentro de la imagen: sin esto intentaria bajar el tokenizador.
         "HF_HUB_OFFLINE=1"
-        # 6 hilos y anclaje: medido como el optimo para el motor PyTorch. Si
-        # se cambia a OpenVINO hay que QUITAR el anclaje, que ahi cuesta un
-        # 118% (89 ms/llamada sin el, 195 con el).
-        "OMP_NUM_THREADS=6"
+        # SIN OMP_NUM_THREADS a proposito: una imagen no sabe en que maquina
+        # va a correr, y voz_stream.py cuenta nucleos FISICOS respetando el
+        # cpuset del contenedor. Con `--cpuset-cpus 0-3` detecta 4 sin que
+        # nadie tenga que acordarse de pasar la variable; fijar 6 aqui la
+        # dejaba oversuscrita justo en el caso mas comun.
+        # Para clavarlo en una medicion: `docker run -e OMP_NUM_THREADS=6`.
+        #
+        # El anclaje esta medido como el optimo del motor PyTorch. Si se cambia
+        # a OpenVINO hay que QUITARLO: alli cuesta un 118% (89 ms/llamada sin
+        # el, 195 con el).
         "OMP_PLACES=cores"
         "OMP_PROC_BIND=close"
         # glibc abre una arena por hilo y no devuelve lo liberado.

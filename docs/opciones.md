@@ -127,7 +127,7 @@ Módulo: [`nix/modules/vibevoice.nix`](../nix/modules/vibevoice.nix).
 | Opción | Tipo | Por defecto | Qué hace |
 |---|---|---|---|
 | `enable` | `bool` | `false` | Instala la orden `vibevoice` en el sistema. |
-| `hilos` | `int` | `6` | Hilos de OpenMP. **Más no es mejor**: 12 hilos van un 24 % peor. |
+| `hilos` | `int` | `0` | **0 = detectar** núcleos físicos. **Más no es mejor**: 12 hilos van un 24 % peor. |
 | `anclarNucleos` | `bool` | `true` | `OMP_PLACES=cores`. ⚠️ **Invertir si el motor pasa a OpenVINO.** |
 | `cuantizar` | `bool` | `true` | int8 dinámico: casi 2× más rápido. |
 | `pasosDifusion` | `int` | `6` | Pasos del *scheduler*. 4 solo mejora un 3 %. |
@@ -165,6 +165,22 @@ ancho de banda de memoria, no los FLOPs.
 sube a 4,31 y con 12 a 5,18 — un 24 % peor. Más hilos compiten por el mismo bus de memoria, que es el
 cuello real.
 
+**Por eso el valor por defecto es `0` (detectar).** No cuenta hilos lógicos sino **núcleos físicos**, que
+es el número que importa: en el i7-8700T da 6 y no 12. Además respeta el `cpuset` del cgroup —en un
+contenedor con `--cpuset-cpus 0-3` detecta 4— y a partir de 8 núcleos deja uno libre para el resto del
+stack. Así la misma configuración sirve en una máquina de 4, de 8 o de 12 hilos sin tocar nada. El número
+elegido se imprime al arrancar:
+
+```
+[arranque] 6 hilos de inferencia (6 nucleos fisicos utilizables)
+```
+
+> **Y para aprovechar los hilos que sobran, no subas este número.** Lo que funciona es solapar etapas:
+> [`services.voz-stream.solaparDecodificador`](#servicesvoz-stream) corre el decodificador acústico a la
+> vez que el resto del bucle y baja el RTF un 21 % con el audio idéntico bit a bit. Una sola etapa ya
+> satura el bus; dos etapas distintas, no. Ver
+> [optimizacion.md](optimizacion.md#5--solapar-el-decodificador-acústico--las-dos-etapas-a-la-vez).
+
 Las dos se pueden pisar por llamada sin reconstruir el sistema:
 
 ```bash
@@ -194,6 +210,25 @@ Módulo: [`nix/modules/voz-stream.nix`](../nix/modules/voz-stream.nix).
 | `direccion` | `str` | `"0.0.0.0"` | Interfaz de escucha. |
 | `abrirCortafuegos` | `bool` | `false` | Abre el puerto en la LAN. Con el túnel activo no hace falta. |
 | `ficheroToken` | `nullOr path` | `null` | Igual que en `voz-api`: fuera del store. |
+| `solaparDecodificador` | `bool` | `true` | Corre el decodificador acústico **a la vez** que el bucle: −21 % de RTF. |
+| `hilosDecodificador` | `int` | `0` | Hilos para el decodificador solapado. 0 = la mitad de `hilos`. |
+
+**`solaparDecodificador` es la palanca de RTF más reciente, y la forma correcta de usar los hilos que
+sobran.** El decodificador acústico se lleva el 42 % del tiempo y —comprobado leyendo el bucle de
+Microsoft— es un **sumidero**: su salida se guarda y se emite, pero no vuelve a entrar en el modelo, que
+se realimenta por `acoustic_connector(speech_latent)`. Así que no tiene por qué estar en el camino
+crítico. Medido (M4, mismo texto y semilla, **mismo md5 en las 20 pasadas**):
+
+| hilos | síncrono | solapado | gana |
+|---|---|---|---|
+| 4 | 0,700 | **0,594** | 15 % |
+| **6** | 0,739 | **0,587** | **21 %** |
+| 8 | 0,785 | 0,644 | 18 % |
+
+Cuesta ~40 ms más de espera al primer sonido (0,12 → 0,16 s), que es la profundidad de la tubería. Se
+mantiene un único hilo trabajador con cola FIFO porque el decodificador es causal y con estado: ese orden
+estricto es lo que hace que el audio salga idéntico. Falta confirmarlo en el i7 de la VM, que es donde
+vive el motor OpenVINO.
 
 **Es un servicio aparte de `voz-api` a propósito.** Este carga VibeVoice (~2,3 GB); `voz-api` solo las
 voces de Piper (~100 MB). Juntarlos haría que una síntesis pesada bloqueara las notas de voz rápidas.
@@ -324,6 +359,19 @@ para depurar.
 |---|---|
 | `VIBEVOICE_HILOS` | pisa `services.vibevoice.hilos` en esa ejecución |
 | `VIBEVOICE_CFG` | pisa `services.vibevoice.cfgScale` en esa ejecución |
+
+### Las de `voz-stream`, para medir sin reconstruir
+
+| Variable | Efecto |
+|---|---|
+| `OMP_NUM_THREADS` | pisa la detección de núcleos. Sin ella, se detectan los físicos |
+| `VIBEVOICE_SOLAPAR_DECODER` | `0` desactiva el solapamiento del decodificador. Es el A/B de una línea |
+| `VIBEVOICE_HILOS_DECODER` | hilos del decodificador solapado; `0` = la mitad |
+
+```bash
+# El A/B del solapamiento: misma semilla, y el md5 tiene que salir igual
+VIBEVOICE_SOLAPAR_DECODER=0 python pkgs/vibevoice-cli/voz_stream.py
+```
 
 ---
 

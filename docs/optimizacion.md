@@ -24,8 +24,14 @@ channel*), salvo donde se indique otra cosa.
 | 2 | 6 pasos de difusión en vez de 20 | **2,18** | 1,26× | `DPMSolverMultistepScheduler` está hecho para pocos pasos |
 | 3 | Motor OpenVINO (grafos compilados) | **1,09** | 2,00× | el decodificador acústico deja de despachar desde Python |
 | 4 | Reescribir las convoluciones *depthwise* | **0,75** | 1,45× | torch no trae kernel optimizado; se vectoriza a mano |
+| 5 | Solapar el decodificador acústico | **0,59**¹ | 1,26× | el decodificador es un sumidero: no realimenta el bucle |
 
-**Total: 7,2× más rápido.** Y en paralelo, sin tocar el RTF:
+¹ Medido en un **Apple M4**, no en el i7 del banco: es el paso que falta por
+confirmar en la VM. Los cuatro anteriores sí son del i7. Ver
+[el detalle](#5--solapar-el-decodificador-acústico--las-dos-etapas-a-la-vez).
+
+**Total: 7,2× más rápido** en el banco del i7, y otro **1,26×** encima cuando se
+confirme el solapamiento. Y en paralelo, sin tocar el RTF:
 
 | Cambio | Antes | Después |
 |---|---|---|
@@ -91,6 +97,26 @@ Se dejan **6 y no 4** porque la diferencia es del 3 % y 6 da margen de calidad.
 VIBEVOICE_PASOS=4 vibevoice --texto "Compara la calidad." --salida cuatro.wav
 ```
 
+**En qué gastar lo que libera el solapamiento.** Con el decodificador fuera del
+camino crítico sobra tiempo, y los pasos de difusión son donde se puede gastar
+(M4, 6 hilos, mismo texto):
+
+| | RTF |
+|---|---|
+| 6 pasos, síncrono — *el punto de partida* | 0,727 |
+| 6 pasos, solapado | **0,609** |
+| 8 pasos, solapado | 0,649 |
+| **10 pasos, solapado** | **0,684** ← más pasos y **aun así más rápido** que el punto de partida |
+| 12 pasos, solapado | 0,800 ← ya se pasa |
+
+O sea: **se pueden pagar 10 pasos de difusión al precio de 6**. Lo que no está
+medido es si 10 pasos *suenan* mejor que 6 —el RTF no dice nada de la calidad—,
+y eso lo tiene que decir el banco de fidelidad:
+
+```bash
+VIBEVOICE_PASOS=10 python scripts/fidelidad.py
+```
+
 </details>
 
 <details>
@@ -144,7 +170,98 @@ dependencias, sin paso de conversión, sin grafos que mantener, y sirve igual en
 </details>
 
 <details>
-<summary><b>5 · Streaming</b> — primer sonido 23,21 s → 0,20 s</summary>
+<summary><b>5 · Solapar el decodificador acústico</b> — las dos etapas a la vez</summary>
+
+<br>
+
+**El hallazgo.** El decodificador acústico es un **sumidero**: su salida no
+vuelve a entrar en el modelo. Se lee en el bucle de Microsoft
+(`modeling_vibevoice_streaming_inference.py`, líneas 776-804):
+
+```python
+speech_latent  = sample_speech_tokens(...)           # cabeza de difusión
+audio_chunk    = acoustic_tokenizer.decode(...)      # <- el 42% del tiempo
+audio_chunks[idx].append(audio_chunk[i])             # se guarda
+audio_streamer.put(audio_chunk, ...)                 # se emite
+acoustic_embed = acoustic_connector(speech_latent)   # <- el LATENTE, no el audio
+```
+
+La realimentación autorregresiva pasa por `acoustic_connector(speech_latent)`.
+El audio decodificado **solo se guarda y se emite**. Así que `decode()` estaba
+en el camino crítico únicamente porque se llamaba de forma síncrona, no porque
+el bucle necesitara su resultado.
+
+**El reparto que lo justifica**, cronometrado dentro de una `generate()` real
+(M4, torch-int8, 6 hilos, semilla 11):
+
+| componente | llamadas | ms cada | % del total |
+|---|---|---|---|
+| `tts_lm` | 189 | 20,47 | 40,3 % |
+| cabeza de difusión | 540 | 2,56 | 14,4 % |
+| **decodificador acústico** | 90 | 45,19 | **42,4 %** |
+| resto | | | 2,8 % |
+
+Con el decodificador fuera del camino crítico el techo es
+max(42,4 ; 57,6) = **1,74×**.
+
+**Lo que se consigue de verdad**, con el mismo texto y la misma semilla:
+
+| hilos | síncrono | solapado | gana |
+|---|---|---|---|
+| 2 | 1,038 | 0,893 | 14 % |
+| 4 | 0,700 | **0,594** | 15 % |
+| **6** | 0,739 | **0,587** | **21 %** |
+| 8 | 0,785 | 0,644 | 18 % |
+| 10 | 0,775 | 0,630 | 19 % |
+
+**1,26× y el audio es idéntico bit a bit**: el mismo md5 en las 20 pasadas de la
+tabla. No es una aproximación.
+
+**Por qué sale 1,26× y no 1,74×.** Las dos etapas compiten por la misma máquina.
+Aun así gana bastante porque **no compiten por lo mismo**: el bucle se pasa el
+rato leyendo pesos (ancho de banda) y el decodificador es convolución, más densa
+en cómputo. Solapar una etapa limitada por memoria con otra limitada por cómputo
+es justo el caso en el que la tubería paga.
+
+**Esta es la forma de aprovechar los hilos que sobran**, y no subir `hilos`
+—que está medido que empeora—. Una sola etapa ya satura el bus; dos etapas
+distintas, no.
+
+**Lo que cuesta.** El primer sonido pasa de 0,12 a 0,16 s (+40 ms), que es la
+profundidad de la tubería. La memoria no se mueve: se comprobó que la diferencia
+de RSS entre los dos modos no sigue al modo (síncrono dio 4.014 / 5.983 / 4.922 MB
+y solapado 5.296 / 5.290 / 5.443 en pasadas alternas) — es residencia de las
+páginas del `mmap` del modelo, no coste del solapamiento.
+
+**Tres detalles de implementación que no son opcionales:**
+
+- **Un solo hilo trabajador y cola FIFO.** El decodificador es causal y con
+  estado: las colas de sus convoluciones las deja la llamada anterior. Dos
+  `decode()` a la vez, o en otro orden, darían otro audio.
+- **Búfer preasignado, no un "futuro".** `generate()` hace
+  `torch.cat(audio_chunks)` al final **pase lo que pase** —solo el `return` mira
+  `return_speech`—, así que `decode()` tiene que devolver un tensor de verdad. La
+  salida tiene forma fija (un latente → 3200 muestras), así que se devuelve un
+  tensor vacío y el worker lo rellena in situ.
+- **La emisión se muda al worker.** Si `put()` se quedara en el hilo de
+  `generate()` habría que esperar ahí al decode y no se solaparía nada. Efecto
+  colateral: la cancelación cooperativa ya no salta en el hilo de `generate()`,
+  así que se guarda y se relanza en el `decode()` siguiente — el corte tarda como
+  mucho un trozo más, ~133 ms.
+
+> **Medido en un M4, no en el i7.** La VM es donde vive el motor OpenVINO y ahí
+> falta confirmarlo. Allí el reparto debería favorecerlo aún más —el
+> decodificador pesa más—, pero eso hay que verlo. Se activa y desactiva con
+> `services.voz-stream.solaparDecodificador`, así que el A/B es una línea.
+
+```bash
+VIBEVOICE_SOLAPAR_DECODER=0 python pkgs/vibevoice-cli/voz_stream.py
+```
+
+</details>
+
+<details>
+<summary><b>6 · Streaming</b> — primer sonido 23,21 s → 0,20 s</summary>
 
 <br>
 
@@ -164,7 +281,7 @@ curl -sN -X POST http://voz:8082/tts -H "Authorization: Bearer $TOKEN" -H 'Conte
 </details>
 
 <details>
-<summary><b>6 · Subir la guía CFG de 1,5 a 3,0</b> — cuatro veces menos error, gratis</summary>
+<summary><b>7 · Subir la guía CFG de 1,5 a 3,0</b> — cuatro veces menos error, gratis</summary>
 
 <br>
 
@@ -200,7 +317,7 @@ python scripts/fidelidad.py          # reproduce el banco
 </details>
 
 <details>
-<summary><b>7 · Memoria: soltar peso muerto</b> — 3718 → 2832 MB</summary>
+<summary><b>8 · Memoria: soltar peso muerto</b> — 3718 → 2832 MB</summary>
 
 <br>
 
@@ -233,7 +350,7 @@ activaciones—. Y `MALLOC_ARENA_MAX=2` evita que glibc abra una arena por hilo.
 </details>
 
 <details>
-<summary><b>8 · Detalles de calidad que costaron poco y se notan</b></summary>
+<summary><b>9 · Detalles de calidad que costaron poco y se notan</b></summary>
 
 <br>
 
@@ -286,7 +403,7 @@ perdido.
 | Idea | Por qué parecía buena | Qué pasó de verdad |
 |---|---|---|
 | **La iGPU Intel UHD 630** | está ahí, sin usar | **2,5× más lenta que la CPU**. `matrix cores: none`, `bf16: 0`. Y comparte el mismo bus, así que **ni siquiera suma ancho de banda**. PyTorch XPU/IPEX no soportan Gen9.5 |
-| **Más hilos** | 6 núcleos, 12 hilos | **empeora**: 2 hilos 4,19 · 8 hilos 4,31 · **12 hilos 5,18 (24 % peor)**. Óptimo: 6 anclados |
+| **Más hilos** | 6 núcleos, 12 hilos | **empeora**: 2 hilos 4,19 · 8 hilos 4,31 · **12 hilos 5,18 (24 % peor)**. Óptimo: 6 anclados. La forma de aprovechar los que sobran es [solapar etapas](#5--solapar-el-decodificador-acústico--las-dos-etapas-a-la-vez), no subir este número |
 | **Bajar `cfg_scale` para acelerar** | CFG hace dos pasadas | **no afecta**: 1.5/1.3/1.0 → 3,92/4,02/4,20. Parchear el código para saltarse la incondicional tampoco (3,90) |
 | **`torch.compile`** | fusiona operaciones | **1,00×**. Nada |
 | **bf16** | mitad de bytes | Coffee Lake no tiene AVX512-BF16: sería emulado. Descartado sin medir |
@@ -297,6 +414,11 @@ perdido.
 
 **El corolario que ordena todo:** como el cuello es **leer pesos desde RAM**, lo que paga es **reducir
 bytes de peso**, no reducir operaciones. Por eso int8 ganó y `torch.compile` no.
+
+**Y el matiz que llegó después.** Ese corolario explica por qué fallan las ideas
+de la tabla, pero **no dice que la máquina esté llena**. Lo prueba el
+solapamiento: el decodificador entero cabe en el hueco que deja el bucle
+esperando a la memoria. Lo que estaba saturado era *una etapa*, no el sistema.
 
 </details>
 

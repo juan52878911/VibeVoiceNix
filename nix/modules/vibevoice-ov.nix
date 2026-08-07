@@ -42,7 +42,8 @@ let
       export VIBEVOICE_MODELO="${pesos.modelo}"
       export HF_HUB_OFFLINE=1
       # SIN anclaje de nucleos: ralentiza OpenVINO un 118% (medido).
-      export OMP_NUM_THREADS="${toString vv.hilos}"
+      ${lib.optionalString (vv.hilos != 0)
+        ''export OMP_NUM_THREADS="${toString vv.hilos}"''}
       unset OMP_PLACES OMP_PROC_BIND
 
       mkdir -p "$destino"

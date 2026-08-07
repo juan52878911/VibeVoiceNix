@@ -60,6 +60,59 @@ in
         voz-api para no manejar dos credenciales.
       '';
     };
+
+    solaparDecodificador = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Saca el decodificador acustico del camino critico y lo corre en su
+        propio hilo, a la vez que el resto del bucle.
+
+        ES LA FORMA DE APROVECHAR LOS HILOS QUE SOBRAN. Subir `hilos` no vale
+        -- esta medido que empeora --, porque una sola etapa ya satura el bus
+        de memoria. Solapar DOS etapas si suma, porque no compiten por lo
+        mismo: el bucle (tts_lm + cabeza) se pasa el rato leyendo pesos y el
+        decodificador es convolucion, mas densa en computo.
+
+        POR QUE ES SEGURO: el decodificador es un SUMIDERO. En el bucle de
+        Microsoft la realimentacion pasa por acoustic_connector(speech_latent);
+        el audio decodificado solo se guarda y se emite, no vuelve a entrar en
+        el modelo. Se mantiene un unico hilo trabajador y una cola FIFO, asi
+        que el orden de las llamadas es el mismo que en la version sincrona --
+        que es lo que hace que el audio salga IDENTICO BIT A BIT.
+
+        MEDIDO en un Apple M4 (motor torch-int8, 12 s de audio, semilla 11),
+        RTF con y sin solapar, mismo md5 en las 20 pasadas:
+
+          hilos      sincrono   solapado   gana
+            2          1,038      0,893    14%
+            4          0,700      0,594    15%
+            6          0,739      0,587    21%
+            8          0,785      0,644    18%
+           10          0,775      0,630    19%
+
+        Cuesta ~40 ms mas de espera al primer sonido (0,12 -> 0,16 s), que es
+        la profundidad de la tuberia.
+
+        PENDIENTE DE MEDIR EN EL i7-8700T de la VM, que es donde vive el motor
+        OpenVINO. La ganancia deberia ser parecida o mayor -- alli el
+        decodificador pesa mas en el reparto --, pero eso hay que verlo, no
+        suponerlo.
+      '';
+    };
+
+    hilosDecodificador = lib.mkOption {
+      type = lib.types.int;
+      default = 0;
+      description = ''
+        Hilos para el decodificador cuando va solapado; el resto son para el
+        bucle. 0 = la mitad de `services.vibevoice.hilos`.
+
+        Solo el motor OpenVINO reparte de verdad: INFERENCE_NUM_THREADS es por
+        modelo compilado. En el camino torch el pool intra-op es uno para todo
+        el proceso y este numero solo sirve de documentacion.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -85,11 +138,19 @@ in
         VOZ_STREAM_HOST = cfg.direccion;
         VOZ_STREAM_PUERTO = toString cfg.puerto;
         HF_HUB_OFFLINE = "1";
-        OMP_NUM_THREADS = toString vv.hilos;
         # glibc crea una arena por hilo y no devuelve lo liberado; con 6 hilos
         # eso fragmenta cientos de MB en un servicio que ya va justo de RAM.
+        # Con el decodificador solapado hay un hilo mas que asigna de verdad,
+        # asi que este tope importa mas que antes, no menos.
         MALLOC_ARENA_MAX = "2";
         VIBEVOICE_MOTOR = if ov.enable then "openvino" else "torch";
+        VIBEVOICE_SOLAPAR_DECODER = if cfg.solaparDecodificador then "1" else "0";
+        VIBEVOICE_HILOS_DECODER = toString cfg.hilosDecodificador;
+      }
+      # hilos = 0 -> no se pone la variable y voz_stream.py cuenta nucleos
+      # fisicos. Ponerla vacia NO vale: OpenMP mira si existe, no su valor.
+      // lib.optionalAttrs (vv.hilos != 0) {
+        OMP_NUM_THREADS = toString vv.hilos;
       }
       // lib.optionalAttrs ov.enable {
         VIBEVOICE_OV_CODIGO = "${pkgs.vibevoiceOvCodigo}";
