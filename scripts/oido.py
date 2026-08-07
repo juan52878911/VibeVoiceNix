@@ -51,8 +51,20 @@ import time
 import wave
 
 # Umbral de asignación: por debajo de esto, el locutor es desconocido y se le
-# abre perfil nuevo. 0,55 parte por el medio el hueco medido (0,446-0,626).
-UMBRAL_PERFIL = 0.55
+# abre perfil nuevo.
+#
+# 0,55 SALIA DE VOCES SINTETICAS y no vale para voz real por microfono. Las
+# generadas por VibeVoice son consistentisimas consigo mismas (0,626 el mismo
+# locutor, 0,446 distintos), pero una persona de verdad cambia de postura, de
+# distancia y de entonacion. Medido con nueve intervenciones reales del mismo
+# hablante: consigo mismo 0,274-0,506, contra el asistente 0,050-0,239. Con
+# 0,55 no se reconocia NUNCA y se abria un perfil nuevo cada vez.
+#
+# 0,25 cae en ese hueco, pero es estrecho (0,035). Con mas muestras de
+# matriculacion el margen se ensancha; con pocas, dos personas distintas
+# pueden confundirse. Si se anade a alguien mas a la casa, hay que rematricular
+# a los dos con mas muestras y recalibrar esto.
+UMBRAL_PERFIL = float(os.environ.get("VIBEVOICE_UMBRAL_PERFIL", "0.25"))
 # Solo se añade una huella nueva a un perfil existente si el parecido es
 # holgado: reforzar con casos dudosos degradaría el perfil con el tiempo.
 UMBRAL_REFUERZO = 0.70
