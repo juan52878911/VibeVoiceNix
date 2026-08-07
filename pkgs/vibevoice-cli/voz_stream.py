@@ -64,6 +64,7 @@ import contextlib
 import copy
 import ctypes
 import gc
+import hashlib
 import json
 import os
 import platform
@@ -1480,49 +1481,112 @@ _COLA_PUNTUACION = re.compile(r"[^\s\w]+$")
 # Y no es el volumen ni el tono: el RMS por sextos es plano (+-0,9 dB) y el F0
 # no cae. Es solo la estructura de pausas.
 #
-# Se probo alargar la pausa del punto SIN tocar el audio y nada funciona:
-#   ". "  (actual)      0,35 s -- corta, igual que la coma
-#   ".  " (dos espacios) identico: el modelo ignora el token de espacio extra
-#   ". — "              0,36-0,45 s segun semilla, y a veces cuesta WER
-#   "… "                sin efecto y WER peor
-#   ".\n\n"             0,44-2,08 s ERRATICO, comportamiento de fin de locucion
-#   ".\n"               0,48-2,7 s erratico: ".\n" (token 624) es EXACTAMENTE
-#                       el token con el que TERMINA toda locucion (cerrar()
-#                       anade "\n", igual que el procesador), asi que el modelo
-#                       ejecuta ahi su parada de final de texto, de duracion
-#                       loca. Por eso la variante "\n solo tras .!?" que se
-#                       descarto daba pausas de 2,7 s: no era la retencion de
-#                       puntuacion -- aqui se midio con ".\n" bien fundido en
-#                       un solo token y pasa igual --, es que "\n" SIGNIFICA
-#                       fin de locucion para este modelo.
+# Se probo alargar la pausa del punto CON UN MARCADOR DE TEXTO y no hay ninguno
+# que salga barato. Medido en la VM (i7-8700T, openvino, 6 frases x 3 semillas,
+# sp-Spk3_man, cfg 4.5, 6 pasos), cambiando SOLO el separador entre frases:
 #
-# EL ARREGLO ES EN DOS MITADES, y solo las dos juntas funcionan:
+#   separador        genera  callado   se oye   RTF que ve el reproductor
+#   " "              14,80 s   2,09 s  14,51 s   1,043
+#   "  "             15,24 s   2,09 s  14,98 s   1,108
+#   " — "            14,76 s   1,91 s  14,53 s   1,108
+#   "\t"             15,16 s   2,27 s  14,89 s   1,096
+#   "… "             15,16 s   1,91 s  14,89 s   1,085
+#   "; "             14,71 s   2,04 s  14,58 s   1,096
+#   "\n"             20,27 s   6,36 s  16,22 s   1,311
+#   "\n\n"           20,13 s   6,27 s  15,87 s   1,334
 #
-#   1. TEXTO: "\n\n" (parrafo) tras la puntuacion fuerte de cada frase. Pone
-#      la pausa EXACTAMENTE donde esta el punto -- nunca en una coma, que fue
-#      el fallo original (0,86 s tras coma cuando el "\n" iba en cada costura
-#      de trozo, cayera donde cayera). Se elige "\n\n" y no "\n" porque el
-#      modelo tambien sortea SI pausa, no solo cuanto: con ".\n" pauso en 7 de
-#      12 fronteras (3 semillas) y con ".\n\n" en 15 de 16 (4 semillas). La
-#      duracion queda erratica (0,2-2,1 s), pero eso lo arregla 2.
-#   2. AUDIO: un tope de silencio. Las pausas de ".\n" son fotogramas de 133 ms
-#      en silencio SEGUIDOS, asi que basta dejar pasar RESPIRO_FOTOGRAMAS
-#      seguidos y recortar el resto. Las pausas de coma (2-3 fotogramas) no
-#      llegan al tope y quedan intactas.
+# Solo "\n" y "\n\n" pausan. Y pausan porque el modelo ejecuta ahi su parada de
+# FIN DE LOCUCION -- ".\n" (token 624) es exactamente con lo que termina toda
+# locucion --, de duracion loca (0,2-3,2 s) y a precio completo: un fotograma
+# callado cuesta lo mismo de generar que uno de habla. El resto de separadores
+# se comportan como el espacio: el modelo los ignora.
 #
-# MEDIDO con el prototipo (mismo texto de 5 frases, semilla 11):
-#   costura con espacio       2,32 s callado · punto 0,26-0,44 s · coma 0,18-0,40
-#   ".\n" sin tope            5,52 s callado · punto 0,48-1,62 s (erratico)
-#   ".\n" + tope 3 fotogramas 2,74 s callado · punto 0,50-0,54 s · coma 0,30-0,34
-# El suelo no se puede garantizar: cuando el modelo decide no pausar no hay
-# donde meter el silencio -- se midio el clasificador de EOS fotograma a
-# fotograma buscando un ancla de final de frase alineada con el audio y es
-# plano (p < 0,001) en TODAS las fronteras internas, pause o no pause; solo
-# dispara en el fin de locucion de verdad. De ahi el "\n\n": sube la tasa de
-# acierto, y el tope se encarga del exceso.
+# ESA ERA LA VERSION ANTERIOR DE ESTE BLOQUE, Y ERA UN MAL NEGOCIO
+# Cosia "\n\n" tras cada punto y luego RECORTABA el silencio sobrante. El texto
+# quedaba bien y la pausa caia en su sitio, pero se pagaban 4,2 s de CPU por
+# 4,2 s de silencio que acto seguido se tiraban a la basura. Medido el 7 de
+# agosto en la VM, mismo texto, misma semilla, mismo motor:
+#
+#                                    audio que sale   pared    RTF
+#   /tts/stream " ".join                   15,20 s   15,18 s  0,999
+#   sesion, costura de espacio             15,20 s   15,86 s  1,044
+#   sesion, "\n\n" + recorte (lo viejo)    15,61 s   22,86 s  1,464
+#
+# La sesion NO era mas lenta: generaba los mismos 21,9 s de audio que
+# /tts/stream con "\n\n".join (22,94 s de pared, RTF 1,049) y entregaba 15,61.
+# El +40 % de RTF era exactamente el audio descartado, y por eso el reproductor
+# se quedaba seco y se oian microcortes.
+#
+# EL ARREGLO: LA PAUSA NO SE GENERA, SE INSERTA
+# El modelo YA pausa en los finales de frase con costura de espacio; lo que no
+# hace es pausar LO BASTANTE, ni siempre. Y se comprobo DONDE pausa: se parte
+# el audio por las rachas de silencio y se transcribe cada trozo (3 semillas,
+# 6 frases). NI UNA de las pausas cae dentro de una frase -- todas caen en un
+# final de frase; lo que falla es que se salta algunas (3-4 de 5). Asi que
+# alargar la pausa que el modelo YA hizo no puede meter aire donde no toca,
+# que era el fallo historico (0,86 s tras coma cuando el "\n" iba en cada
+# costura de trozo, cayera donde cayera).
+#
+#   1. TEXTO: costura con ESPACIO, siempre. Los ids son entonces identicos a
+#      los de " ".join, asi que el HABLA es bit a bit la de /tts/stream. Eso no
+#      es un parecido: es la garantia de calidad mas fuerte que hay aqui, y la
+#      comprueba scripts/ws_fidelidad.py por md5.
+#   2. AUDIO: cuando una racha de fotogramas callados llega a
+#      RESPIRO_FOTOGRAMAS -- el modelo esta pausando --, se anaden
+#      RESPIRO_ALARGA fotogramas mas del MISMO suelo de sala.
+#
+# EL UMBRAL DE DETECCION Y EL TOPE SON DOS NUMEROS DISTINTOS, y antes eran uno
+# solo. Con "\n\n" las pausas eran de 5 a 24 fotogramas y el mismo 3 servia
+# para "esto es una pausa" y para "de aqui en adelante se recorta". Con costura
+# de espacio las pausas del modelo son de 2 a 6 fotogramas: un umbral de 3 no
+# dispara en las frases cortas -- medido con las 3 frases de ws_fidelidad, el
+# modelo pausa 2 fotogramas y no se insertaba NADA -- y un tope de 3 recorta
+# aire legitimo que ya se ha pagado. Asi que:
+#
+#   RESPIRO_FOTOGRAMAS = 2   el modelo esta pausando: aqui se inserta el aire
+#   RESPIRO_TOPE       = 8   maximo de callados que se emiten: aqui se recorta
+#
+# Y de paso sale una jerarquia que antes no habia: la pausa que el modelo hace
+# corta (una coma, 2 fotogramas) queda en 4, y la larga (un punto, 4-6) queda
+# en 6-8. El modelo decide DONDE y cuanto; esto solo suma.
+#
+# EL TOPE ALTO ADEMAS MEJORA LA CALIDAD. El recorte solo puede quitar audio, y
+# el fotograma de la costura lleva dentro el ataque de la palabra siguiente
+# (ver mas abajo): cuanto menos se recorte, menos ocasiones de comerselo. Con
+# el tope en 8 no se llega a recortar en una locucion normal.
+#
+# EL RELLENO ES EL PROPIO FOTOGRAMA, EN ESPEJO. Repetirlo tal cual metia un
+# escalon en el empalme y una periodicidad de 7,5 Hz; darle la vuelta no: el
+# fotograma invertido EMPIEZA por la ultima muestra del original, asi que el
+# empalme es continuo por construccion, y alternando invertido/original la
+# cadena entera lo es. Medido sobre el WAV: el salto maximo entre muestras
+# consecutivas es 0,1477 con alargue y 0,1477 sin el -- el mismo numero, o sea
+# que no se anade ni una discontinuidad.
+#
+# MEDIDO (misma locucion de 15,18 s de pared, transcrita con whisper.cpp):
+#   alargue   se oye    RTF     racha en el punto   WER
+#     0       15,07 s  1,008    3 fot (0,40 s)      6,5 %
+#     1       15,60 s  0,973    4 fot (0,53 s)      4,3 %
+#     2       16,13 s  0,941    5 fot (0,67 s)      4,3 %
+#     3       16,67 s  0,911    6 fot (0,80 s)      6,5 %
+# (el WER se mueve por ruido de whisper: el habla es la MISMA en las cuatro).
+#
+# Y el aire no solo es gratis: DA MARGEN. Cada fotograma insertado son 133 ms
+# que el reproductor gana para rellenar el bufer, que es justo lo que hace un
+# humano al respirar entre frases. De ahi que el defecto sea 2 y no 1.
+#
+# LO QUE ESTO NO ARREGLA: si el modelo decide no pausar en una frontera, ahi
+# no hay donde insertar. Se busco un ancla independiente y no la hay -- el
+# clasificador de EOS es plano (p < 0,001) en todas las fronteras internas, y
+# la posicion de LECTURA del texto no sirve porque va por delante del habla en
+# una cantidad variable (~0,3x el texto). La alternativa era cortar la locucion
+# en cada frase para saber donde cae la frontera, y sale igual de cara: medido,
+# una generate() por frase cuesta RTF 1,172 frente a 1,060 con una sola
+# (1,2 s de pared por cada corte, que es lo mismo que costaba el "\n\n").
 #
 # La referencia historica: 7,27 s callado con "\n" en toda costura (el fallo),
-# 2,51 s cosiendo con espacio (sin aire). El punto medio es esto.
+# 2,51 s cosiendo con espacio (sin aire). El punto medio es esto, y ahora es
+# gratis.
 #
 # LO QUE NO SE PUEDE RECORTAR ES EL FOTOGRAMA ENTERO (2026-08-06)
 # La primera version tiraba el fotograma completo cuando su RMS medio bajaba
@@ -1567,13 +1631,30 @@ _COLA_PUNTUACION = re.compile(r"[^\s\w]+$")
 #   pico max descartado  0,1452 -> 0,0290  (deja de tirarse voz)
 #   costuras con ataque perdido  9/54 -> 0/54
 #
-# VIBEVOICE_RESPIRO=0 lo apaga (vuelve la costura con espacio y ningun
-# recorte, bit a bit como antes), y cada sesion puede pedirlo o rechazarlo con
-# el campo `respiro`. El umbral y el tope tienen mando por si otra voz tiene
-# un suelo de ruido distinto.
+# VIBEVOICE_RESPIRO=0 lo apaga (ni alargue ni recorte: el audio sale bit a bit
+# como el de /tts/stream con " ".join), y cada sesion puede pedirlo o
+# rechazarlo con el campo `respiro`. El umbral y el tope tienen mando por si
+# otra voz tiene un suelo de ruido distinto.
 RESPIRO_ACTIVO = os.environ.get("VIBEVOICE_RESPIRO", "1") not in ("0", "no")
-RESPIRO_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_RESPIRO_FOTOGRAMAS", "3"))
+# Callados SEGUIDOS a partir de los cuales se da por hecho que el modelo esta
+# pausando y se le mete el aire. 2 y no 1 porque un solo fotograma flojo lo da
+# tambien una oclusiva (la /p/ de "pendientes" deja 133 ms casi mudos) y ahi
+# no hay pausa ninguna: alargarlo partiria la palabra.
+RESPIRO_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_RESPIRO_FOTOGRAMAS", "2"))
+# Fotogramas de suelo de sala que se INSERTAN ahi: el aire de la frase, que ya
+# no se le pide al modelo. 0 deja solo el recorte. Cada uno son 133 ms de pausa
+# y 133 ms de margen para el bufer del reproductor; ver la tabla de arriba.
+RESPIRO_ALARGA = int(os.environ.get("VIBEVOICE_RESPIRO_ALARGA", "2"))
+# Callados seguidos que se emiten como mucho. Es la red de seguridad contra una
+# pausa desbocada -- un cliente que meta "\n\n" en su propio texto se lleva las
+# de 24 fotogramas del modelo --, no el regulador de la pausa normal: con
+# costura de espacio no se llega.
+RESPIRO_TOPE = int(os.environ.get("VIBEVOICE_RESPIRO_TOPE", "8"))
 RESPIRO_UMBRAL = float(os.environ.get("VIBEVOICE_RESPIRO_UMBRAL", "0.006"))
+# Cada cuanto mira el websocket si el modelo se quedo sin texto por delante.
+# Es tiempo que el modelo pasa PARADO esperando que se le pida mas; ver
+# sesion_ws.vigilar() para la medida.
+PERIODO_VIGIA = float(os.environ.get("VIBEVOICE_PERIODO_VIGIA", "0.01"))
 # Amplitud de pico por encima de la cual un fotograma NO se tira aunque su
 # media diga "callado": lleva senal dentro. Con 0 se vuelve al recorte de
 # fotograma entero de la primera version (y a comerse los ataques).
@@ -1582,10 +1663,6 @@ RESPIRO_PICO = float(os.environ.get("VIBEVOICE_RESPIRO_PICO", "0.03"))
 # la rampa del ataque ni meter un escalon audible en la costura. 240 = 10 ms
 # a 24 kHz; ahi la senal esta todavia en el suelo, asi que el empalme no suena.
 RESPIRO_PRERROLLO = int(os.environ.get("VIBEVOICE_RESPIRO_PRERROLLO", "240"))
-# Puntuacion fuerte (con sus comillas o parentesis de cierre) seguida de
-# espacio: la frontera de frase. [ \t]+ y no \s+ a proposito: un "\n" que ya
-# venga del cliente es suyo y se queda tal cual.
-_FIN_DE_FRASE_RESPIRO = re.compile(r"([.!?…][\"'”’»)\]]*)[ \t]+")
 
 _SESIONES: dict = {}
 _FIN = object()   # centinela: se acabo el audio de la sesion
@@ -1839,6 +1916,29 @@ def _recortar_callado(trozo):
     return plano[max(0, primera - RESPIRO_PRERROLLO):]
 
 
+def _alargar_pausa(trozo, cuantos: int = RESPIRO_ALARGA) -> list:
+    """El aire de la frase: `cuantos` fotogramas mas del suelo de sala que el
+    modelo acaba de dar, SIN pedirselos a el (ver el bloque RESPIRO).
+
+    En ESPEJO y alternando. El fotograma invertido empieza por la ultima
+    muestra del original, y el original empieza por la primera, que es con la
+    que acaba el invertido: encadenados asi, cada empalme es continuo por
+    construccion. Repetir el fotograma tal cual metia un escalon en cada junta
+    y ademas una periodicidad audible de 7,5 Hz. Comprobado sobre el WAV: el
+    salto maximo entre muestras consecutivas no cambia (0,1477 con alargue y
+    sin el), o sea que no se introduce ni una discontinuidad.
+
+    Se devuelven copias y no vistas: el trozo original ya va camino de la cola
+    y torch.flip materializa, pero clone() en el par deja claro que nadie
+    comparte memoria con lo que ya se emitio.
+    """
+    plano = trozo.reshape(-1)
+    if cuantos <= 0 or plano.numel() == 0:
+        return []
+    return [torch.flip(plano, [0]) if k % 2 == 0 else plano.clone()
+            for k in range(cuantos)]
+
+
 class ColaAudioSesion:
     """El `audio_streamer` que espera generate(), volcado a una cola asincrona.
 
@@ -1888,15 +1988,16 @@ class ColaAudioSesion:
         # Lo pone SesionViva.abortar() cuando el cliente se larga. Por la via
         # HTTP nadie lo toca nunca, asi que ahi el comportamiento no cambia.
         self.cancelado = False
-        # El tope de silencio del respiro (ver el bloque RESPIRO): con "\n"
-        # tras cada punto el modelo mete su parada de fin de locucion, de
-        # duracion erratica (0,5-2,7 s); aqui se deja pasar el principio y se
-        # recorta el resto. El contador arranca de cero en cada generate()
-        # porque _generar() monta una cola nueva: en la costura de un tope de
-        # caché eso deja pasar el tope entero otra vez, que es el lado
-        # prudente -- mete algo de aire de mas, nunca se come audio.
+        # El aire de la frase (ver el bloque RESPIRO): al llegar a
+        # RESPIRO_FOTOGRAMAS callados se alarga la pausa con suelo de sala
+        # propio, y pasado RESPIRO_TOPE se recorta lo que el modelo siga
+        # callando. Los contadores arrancan de cero en cada generate() porque
+        # _generar() monta una cola nueva: en la costura de un tope de caché
+        # eso da un poco de aire de mas al empezar, que es el lado prudente --
+        # nunca se come audio.
         self.respiro = respiro
         self._callado_seguido = 0
+        self._sonado = False      # ya salio algun fotograma con voz dentro
 
     def put(self, trozos, indices):
         # Tras end() lo que llegue sobra: generate() no sale del bucle de 6
@@ -1914,26 +2015,47 @@ class ColaAudioSesion:
             if int(idx) != 0:
                 continue
             trozo = trozos[i].detach().float().cpu()
-            if self.respiro:
-                # Un fotograma "callado" es el suelo de sala de una pausa del
-                # modelo. Pasado el tope se recorta, pero NO a ciegas: el
-                # fotograma de la costura lleva dentro el ataque de la palabra
-                # siguiente y tirarlo entero se lo comia (ver el bloque
-                # RESPIRO). Solo se tira lo que de verdad esta callado; lo que
+            if not self.respiro:
+                self._emitir(trozo)
+                continue
+            # Un fotograma "callado" es el suelo de sala de una pausa del
+            # modelo, y una pausa del modelo es SIEMPRE un final de frase
+            # (comprobado transcribiendo los trozos entre pausa y pausa; ver
+            # el bloque RESPIRO). Asi que aqui se hacen las dos mitades del
+            # respiro: en cuanto se confirma la pausa se ALARGA con suelo de
+            # sala propio -- el aire, gratis --, y pasado RESPIRO_TOPE se
+            # RECORTA lo que el modelo siga callando.
+            if float(trozo.pow(2).mean().sqrt()) >= RESPIRO_UMBRAL:
+                self._callado_seguido = 0
+                self._sonado = True
+                self._emitir(trozo)
+                continue
+            self._callado_seguido += 1
+            if self._callado_seguido > RESPIRO_TOPE:
+                # El recorte NO es a ciegas: el fotograma de la costura lleva
+                # dentro el ataque de la palabra siguiente y tirarlo entero se
+                # lo comia. Solo se tira lo que de verdad esta callado; lo que
                 # lleva senal se emite desde justo antes de ella.
-                if float(trozo.pow(2).mean().sqrt()) < RESPIRO_UMBRAL:
-                    self._callado_seguido += 1
-                    if self._callado_seguido > RESPIRO_FOTOGRAMAS:
-                        trozo = _recortar_callado(trozo)
-                        if trozo is None:
-                            continue
-                else:
-                    self._callado_seguido = 0
-            self.trozos += 1
-            if self.texto is not None and self.texto.en_prorroga():
-                self.retenidos.append(trozo)
-            else:
-                self.lazo.call_soon_threadsafe(self.cola.put_nowait, trozo)
+                trozo = _recortar_callado(trozo)
+                if trozo is not None:
+                    self._emitir(trozo)
+                continue
+            self._emitir(trozo)
+            # El aire va ENTRE frases, no delante de la primera: el silencio de
+            # cabecera solo retrasa el primer sonido, que es la latencia que
+            # mas se nota. De ahi `_sonado`.
+            if self._callado_seguido == RESPIRO_FOTOGRAMAS and self._sonado:
+                for extra in _alargar_pausa(trozo):
+                    self._emitir(extra)
+
+    def _emitir(self, trozo) -> None:
+        """Un fotograma a la cola -- o a la reserva, si la locucion ya esta en
+        prorroga y hay que esperar al EOS para soltarlo."""
+        self.trozos += 1
+        if self.texto is not None and self.texto.en_prorroga():
+            self.retenidos.append(trozo)
+        else:
+            self.lazo.call_soon_threadsafe(self.cola.put_nowait, trozo)
 
     def end(self, indices=None):
         # Aqui SOLO se llega con un cierre legitimo (el EOS del modelo, o el
@@ -2020,14 +2142,15 @@ class SesionViva:
         # "\n" garantizado es el del final de la locucion, que lo pone
         # cerrar() igual que el procesador en una peticion suelta.
         #
-        # Pero espacio EN TODO resulto pasarse de frenada: el modelo lee
-        # ". " con pausa de coma (0,35 s, medido) y la locucion queda sin
-        # aire. Con `respiro` (el defecto), cada final de frase -- y SOLO
-        # los finales de frase, nunca una coma -- vuelve a "\n", y el tope
-        # de silencio de ColaAudioSesion doma la duracion; el porque y las
-        # medidas, en el bloque RESPIRO de arriba. Un cliente que QUIERA una
-        # pausa de parrafo puede seguir mandando el "\n" dentro de su propio
-        # texto: ese no se toca (el patron solo convierte espacio o tab).
+        # Y el espacio se queda EN TODA costura, tambien con `respiro`. Hubo
+        # una version (6 de agosto) que ponia "\n\n" tras cada punto para que
+        # el modelo pausara de verdad; funcionaba, pero le costaba al modelo
+        # generar 4,2 s de silencio que el tope de ColaAudioSesion tiraba acto
+        # seguido -- RTF 1,46 en sesion frente a 1,04 con espacio, y el
+        # reproductor seco. El aire ahora se INSERTA en el audio y no se le
+        # pide al modelo; las medidas, en el bloque RESPIRO de arriba. Un
+        # cliente que QUIERA una pausa de parrafo puede seguir mandando el
+        # "\n" dentro de su propio texto: ese no se toca.
         #
         # El espacio va como PREFIJO del trozo siguiente, no como sufijo del
         # anterior, porque el BPE funde " y" en un token: sufijo daria un
@@ -2054,19 +2177,12 @@ class SesionViva:
         with self._cond:
             if self.cerrada:
                 raise HTTPException(409, f"sesion '{self.nombre}' ya cerrada")
+            # Sin tocar la puntuacion: `respiro` ya no cambia NI UN TOKEN, solo
+            # el audio (ver el bloque RESPIRO). Por eso una sesion con respiro
+            # y otra sin el generan el mismo habla, y las dos la misma que
+            # /tts/stream con " ".join.
             pieza = (self._cola_punt + (" " if self._hablado else "")
                      + texto.strip())
-            if self.respiro:
-                # Cada final de frase pasa a "\n\n": la unica marca que hace
-                # pausar de verdad a este modelo (ver el bloque RESPIRO; la
-                # duracion la doma el tope de ColaAudioSesion). La regla se
-                # aplica sobre la pieza entera, asi que cubre igual la costura
-                # entre trozos -- la puntuacion retenida acaba de pegarse
-                # delante -- que un punto en mitad de un trozo largo. Una coma
-                # o un trozo cortado por clausula no casan con el patron y se
-                # quedan con su espacio: justo el fallo historico (pausa de
-                # 0,86 s tras coma) que esto no debe repetir.
-                pieza = _FIN_DE_FRASE_RESPIRO.sub("\\1\n\n", pieza)
             m = _COLA_PUNTUACION.search(pieza)
             self._cola_punt = m.group(0) if m else ""
             if m:
@@ -2458,9 +2574,9 @@ class PeticionSesion(BaseModel):
     cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
     semilla: Optional[int] = Field(None, ge=0, lt=2**31)
     pasos: Optional[int] = Field(None, ge=4, le=20)
-    # Pausa de verdad en cada punto (ver el bloque RESPIRO). Solo se mira al
-    # CREAR la sesion, como la voz. respiro=False da la locucion de antes,
-    # bit a bit: costura con espacio y ni un fotograma recortado.
+    # Aire en cada final de frase (ver el bloque RESPIRO). Solo se mira al
+    # CREAR la sesion, como la voz. respiro=False da el audio pelado del
+    # modelo, bit a bit el de /tts/stream con " ".join: ni alargue ni recorte.
     respiro: bool = True
     # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
     fin: bool = False
@@ -2497,6 +2613,8 @@ def health() -> dict:
                      "tope_cache": TOPE_CACHE,
                      "respiro": {"activo": RESPIRO_ACTIVO,
                                  "fotogramas": RESPIRO_FOTOGRAMAS,
+                                 "alarga": RESPIRO_ALARGA,
+                                 "tope": RESPIRO_TOPE,
                                  "umbral_rms": RESPIRO_UMBRAL,
                                  "umbral_pico": RESPIRO_PICO,
                                  "prerrollo": RESPIRO_PRERROLLO},
@@ -2706,8 +2824,8 @@ async def sesion_borrar(nombre: str, _=Depends(autorizar)) -> dict:
 # Por debajo es SesionViva, la misma clase, sin una rama especial. Asi que
 # respeta _candado_modelo igual (lo toma _generar), suelta el candado mientras
 # espera texto igual (TextoEnCurso._esperar, via al_pausar/al_reanudar) y
-# tokeniza igual (trozos cosidos con espacio, "\n" en cada final de frase si
-# hay respiro, y un "\n" al final; ver alimentar() y el bloque RESPIRO). De
+# tokeniza igual (trozos cosidos con espacio y un "\n" al final; el respiro no
+# toca el texto, solo el audio -- ver alimentar() y el bloque RESPIRO). De
 # ahi que el audio salga IDENTICO bit a bit al de la via HTTP con los mismos
 # ajustes, que es lo que se comprueba por md5. El HTTP se queda intacto: es
 # lo que corre en la VM y lo que se prueba con curl.
@@ -2883,8 +3001,17 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
         Se SONDEA el estado en vez de colgar una devolucion de llamada dentro de
         TextoEnCurso porque 'esperando' tiene dos fuentes -- el bucle parado sin
         texto por delante y el hueco ENTRE dos generate() -- y solo estado() las
-        junta. 100 ms es dos ordenes de magnitud mas fino que lo que tarda una
-        frase y no cuesta nada medible.
+        junta.
+
+        EL PERIODO SI SE NOTA, y estaba en 100 ms. Este evento es lo unico que
+        le dice al cliente "manda ya la frase siguiente": mientras no salga, el
+        modelo esta PARADO sin nada que decir. Sondear cada 100 ms le regala al
+        modelo una espera de 0 a 100 ms en CADA frontera de frase, y el
+        asistente alimenta frase a frase. Medido con 6 frases (4 pasadas): con
+        100 ms la sesion va a RTF 0,985 alimentada frase a frase frente a 0,959
+        de golpe; con 10 ms las dos van igual. No es gratis del todo -- son 100
+        vueltas por segundo de un dict y un corte de lista -- pero al lado de
+        los 133 ms que cuesta un fotograma no se mide.
         """
         antes = False
         try:
@@ -2894,7 +3021,7 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
                     antes = ahora
                     await evento(tipo="esperando", esperando=ahora,
                                  s=transcurrido())
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(PERIODO_VIGIA)
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             return
 
@@ -3061,7 +3188,36 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
             await ws.close()
 
 
+def identificar_codigo() -> None:
+    """Deja en el registro QUE FICHERO se esta ejecutando y su huella.
+
+    NO ES DECORACION. El 6 de agosto se perdieron horas midiendo un fallo del
+    respiro contra un servicio que NO tenia el respiro: un drop-in olvidado en
+    /run/systemd/system/voz-stream.service.d/prueba.conf reescribia ExecStart
+    para apuntar a una copia de trabajo en /var/lib/voz-prueba/voz_stream.py.
+    Como /run es tmpfs, el drop-in sobrevive a daemon-reload y a
+    `nixos-rebuild switch` -- la generacion nueva se instalaba, el servicio se
+    reiniciaba y seguia arrancando el fichero viejo. El despliegue decia que si
+    y el proceso corria codigo de cinco commits antes, con el freno de guia en
+    un 0.80 que ya no estaba en ninguna configuracion.
+
+    Nada en el arranque lo delataba: la unidad en /etc apuntaba al store, y
+    solo el cmdline del PID contaba la verdad. Con esta linea, un
+    `journalctl -u voz-stream | grep codigo` la cuenta sola.
+    """
+    try:
+        ruta = Path(__file__).resolve()
+        datos = ruta.read_bytes()
+        huella = hashlib.sha256(datos).hexdigest()[:12]
+        print(f"[arranque] codigo {ruta} sha256:{huella} "
+              f"({len(datos.splitlines())} lineas)", flush=True)
+    except Exception as e:
+        # Nunca impedir el arranque por no poder identificarse.
+        print(f"[arranque] no se pudo identificar el codigo: {e}", flush=True)
+
+
 def main() -> None:
+    identificar_codigo()
     # workers=1 SIEMPRE: cada worker cargaria su propio modelo (~2,3 GB) y la
     # VM de 5 GB no aguanta dos.
     uvicorn.run(
