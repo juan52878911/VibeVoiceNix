@@ -9,12 +9,14 @@ Cuatro cosas, y las cuatro con numeros:
   1. FIDELIDAD. El PCM que baja por el websocket tiene que ser IDENTICO -- md5,
      no "parecido" -- al de la sesion HTTP con las mismas frases, la misma voz
      y la misma semilla, y tambien al de /tts/stream con las frases unidas por
-     ESPACIO. El separador no es un detalle: la sesion cose los trozos con
-     espacio y pone un unico "\\n" al final de la locucion (igual que hace el
-     procesador con una peticion suelta), desde que se midio que un "\\n" por
-     costura mete pausas de parrafo erraticas -- hasta 2,7 s -- en mitad de la
-     locucion; ver SesionViva.alimentar() en voz_stream.py. Comparar contra la
-     referencia equivocada es el error clasico aqui.
+     ESPACIO. Se pide respiro=False a proposito: el respiro (pausa de verdad
+     en cada punto; bloque RESPIRO de voz_stream.py) mete "\\n" tras cada
+     final de frase y recorta el silencio sobrante, asi que con el puesto la
+     referencia " ".join ya no es la equivalente. Sin respiro, la sesion cose
+     los trozos con espacio y pone un unico "\\n" al final de la locucion
+     (igual que hace el procesador con una peticion suelta). Comparar contra
+     la referencia equivocada es el error clasico aqui. El respiro tiene su
+     propia prueba (punto 5).
 
      El websocket ademas se alimenta en el CASO DIFICIL: cada frase se manda
      solo cuando llega el evento esperando=true, es decir cuando el modelo ya
@@ -34,6 +36,13 @@ Cuatro cosas, y las cuatro con numeros:
   4. LIMPIEZA. Al cortar el websocket a mitad de la locucion, la sesion tiene
      que desaparecer: GET /tts/sesion/{id} da 404 y el candado del modelo queda
      libre para la peticion siguiente.
+
+  5. RESPIRO. Con respiro (el defecto de las sesiones) el audio tiene que
+     respetar el tope de silencio: ninguna racha de fotogramas de 133 ms por
+     debajo del umbral puede pasar de fotogramas+2 (los dos de margen son los
+     bordes, que quedan justo bajo el umbral de deteccion pero encima del de
+     recorte), y tiene que haber pausas de final de frase (rachas >= 2). Los
+     parametros exactos se leen de /health, no se suponen.
 
 El marco binario es el de scripts/asistente_web.py: [tipo:1][longitud:4 BE]
 [carga], tipo 0 = PCM y tipo 1 = evento JSON.
@@ -78,10 +87,12 @@ def http_stream(url, token, texto, voz, cfg, semilla, pasos):
     return pedir(f"{url}/tts/stream", token, cuerpo).read()[44:]
 
 
-def http_sesion(url, token, nombre, frases, voz, cfg, semilla, pasos):
+def http_sesion(url, token, nombre, frases, voz, cfg, semilla, pasos,
+                respiro=False):
     """Sesion HTTP: se meten todas las frases y se escucha el WAV continuo."""
     import threading
-    base = {"voz": voz, "cfg_scale": cfg, "semilla": semilla}
+    base = {"voz": voz, "cfg_scale": cfg, "semilla": semilla,
+            "respiro": respiro}
     if pasos is not None:
         base["pasos"] = pasos
     pcm = bytearray()
@@ -142,7 +153,7 @@ def desmarcar(buf, salida_pcm, eventos):
 
 async def ws_sesion(url, token, frases, voz, cfg, semilla, pasos,
                     por_cabecera=True, cortar_en=None, traza=None,
-                    antes_de_cortar=None):
+                    antes_de_cortar=None, respiro=False):
     """Habla por el websocket y devuelve (pcm, eventos, nombre).
 
     cortar_en: si viene, se cierra el socket a lo bruto en cuanto hayan bajado
@@ -165,7 +176,7 @@ async def ws_sesion(url, token, frases, voz, cfg, semilla, pasos,
     # velocidad: 1.0 explicita a proposito: es el unico valor que admite el
     # websocket y conviene que la prueba pase por esa comprobacion.
     abrir = {"accion": "abrir", "voz": voz, "cfg_scale": cfg,
-             "velocidad": 1.0, "semilla": semilla}
+             "velocidad": 1.0, "semilla": semilla, "respiro": respiro}
     if pasos is not None:
         abrir["pasos"] = pasos
 
@@ -270,7 +281,8 @@ def main():
     ap.add_argument("--semilla", type=int, default=11)
     ap.add_argument("--pasos", type=int, default=6)
     ap.add_argument("--pruebas",
-                    default="fidelidad,eventos,concurrencia,corte,errores,auth")
+                    default="fidelidad,eventos,concurrencia,respiro,corte,"
+                            "errores,auth")
     a = ap.parse_args()
     pruebas = a.pruebas.split(",")
     fallos = []
@@ -401,6 +413,53 @@ def main():
                 fallos.append(f"concurrencia: la {etiqueta} != sesion a solas")
                 print(f"  FALLO la {etiqueta} != sesion a solas: {len(pcm)} vs "
                       f"{len(pcm_sola)} bytes, primer byte distinto en {iguales}")
+
+    # ------------------------------------------------------- 3b) respiro --
+    # Con respiro (el defecto real de las sesiones) el audio no es comparable
+    # por md5 a " ".join: lo que se comprueba es el CONTRATO del tope de
+    # silencio, con los parametros que anuncia /health.
+    if "respiro" in pruebas:
+        print("\n[respiro]")
+        salud = json.load(pedir(f"{a.url}/health", a.token))
+        resp = salud["sesiones"].get("respiro", {})
+        fot, umbral = resp.get("fotogramas", 3), resp.get("umbral_rms", 0.006)
+        pcm_resp, _, _ = asyncio.run(ws_sesion(
+            a.url, a.token, FRASES, a.voz, a.cfg, a.semilla, a.pasos,
+            respiro=True))
+        # rachas de fotogramas de 133 ms (3200 muestras s16le) bajo el umbral
+        muestras_fot = 3200 * 2
+        rachas, racha = [], 0
+        for i in range(0, len(pcm_resp) - muestras_fot + 1, muestras_fot):
+            fotog = pcm_resp[i:i + muestras_fot]
+            acum = 0
+            for j in range(0, len(fotog), 2):
+                v = int.from_bytes(fotog[j:j + 2], "little", signed=True)
+                acum += v * v
+            rms = (acum / (len(fotog) // 2)) ** 0.5 / 32768.0
+            if rms < umbral:
+                racha += 1
+            else:
+                if racha:
+                    rachas.append(racha)
+                racha = 0
+        if racha:
+            rachas.append(racha)
+        pausas = [r for r in rachas if r >= 2]
+        larga = max(rachas, default=0)
+        print(f"  {dur(pcm_resp):5.2f} s de audio · rachas de silencio "
+              f"{sorted(rachas, reverse=True)[:8]} (fotogramas de 133 ms)")
+        if larga <= fot + 2:
+            print(f"  OK  ninguna racha pasa del tope ({larga} <= {fot}+2)")
+        else:
+            fallos.append(f"respiro: racha de {larga} fotogramas con tope {fot}")
+            print(f"  FALLO racha de {larga} fotogramas; el tope es {fot}")
+        if len(pausas) >= len(FRASES) - 1:
+            print(f"  OK  {len(pausas)} pausas de final de frase "
+                  f"({len(FRASES)} frases)")
+        else:
+            fallos.append(f"respiro: solo {len(pausas)} pausas para "
+                          f"{len(FRASES)} frases")
+            print(f"  FALLO solo {len(pausas)} pausas para {len(FRASES)} frases")
 
     # ----------------------------------- 4) corte a mitad y limpieza --
     if "corte" in pruebas:

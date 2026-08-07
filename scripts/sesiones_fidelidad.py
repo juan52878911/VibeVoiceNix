@@ -82,8 +82,13 @@ class Sesion:
         self._hilo = None
 
     def texto(self, frase, fin=False):
+        # respiro=False a proposito: lo que se compara aqui es la maquinaria
+        # de alimentacion contra 'junta' (" ".join), bit a bit. El respiro
+        # cambia los tokens ("\n" tras cada punto) y recorta silencios, asi
+        # que con el puesto la igualdad seria contra otra referencia; su
+        # prueba vive en scripts/ws_fidelidad.py.
         cuerpo = {"texto": frase, "voz": self.voz, "cfg_scale": self.cfg,
-                  "semilla": self.semilla, "fin": fin}
+                  "semilla": self.semilla, "fin": fin, "respiro": False}
         return json.load(_pedir(f"{self.url}/tts/sesion/{self.nombre}", self.token, cuerpo))
 
     def escuchar(self):
