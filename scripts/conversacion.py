@@ -60,6 +60,21 @@ CUANTO HISTORIAL Y POR QUE
 El historial vive en el NAVEGADOR (viaja con cada petición), igual que la
 instrucción de sistema: el puente no guarda estado y recargar la página
 empieza de cero, que es lo esperable.
+
+LAS RESPUESTAS CORTADAS SE GUARDAN PARTIDAS EN DOS
+Cuando alguien interrumpe, el apunte del asistente no es «lo que dijo»: es lo
+que la otra persona LLEGÓ A OÍR más lo que se quedó dentro. Las dos cosas
+significan cosas distintas -- «detalla eso último» apunta a lo oído y «sigue»
+a lo que faltaba -- y las dos se le enseñan al modelo. Sin ellas cree que
+terminó la frase y repite el final, o peor, arranca de cero.
+
+PERO NO DENTRO DE SU PROPIO TURNO. El apunte del asistente lleva SOLO lo que
+se oyó; el aviso del corte va en la INSTRUCCIÓN DE SISTEMA
+(interrupcion.nota_de_corte). Metido dentro del mensaje del asistente, el
+modelo lo lee como algo que escribió él y lo continúa: medido con qwen3:4b,
+su respuesta empezó literalmente por «(te quedaba por decir: «…asignada será
+la del…»» y eso salió por el altavoz. En el sistema es una regla sobre la
+conversación, no un trozo de ella, y no se repite.
 """
 import json
 import re
@@ -68,6 +83,7 @@ import urllib.error
 import urllib.request
 
 from asistente import MINIMAX_API, clave_minimax
+from interrupcion import nota_de_corte, texto_para_la_compuerta
 
 RECUERDO_COMPUERTA = 6
 RECUERDO_RESPUESTA = 16
@@ -123,9 +139,14 @@ def _guion_compuerta(texto, historial, hablante, segundos_desde_respuesta):
     if recorte:
         lineas.append("Conversación reciente:")
         for h in recorte:
-            quien = ("asistente" if h.get("rol") == "asistente"
-                     else (h.get("quien") or "alguien"))
-            lineas.append(f"  {quien}: {h.get('texto', '')}")
+            asistente = h.get("rol") == "asistente"
+            quien = "asistente" if asistente else (h.get("quien") or "alguien")
+            # El corte se le enseña también a la compuerta: sin él, un «sigue»
+            # detrás de una respuesta a medias parece una frase suelta sin
+            # destinatario. Con él es obvio a quién se le habla.
+            dicho = (texto_para_la_compuerta(h) if asistente
+                     else h.get("texto", ""))
+            lineas.append(f"  {quien}: {dicho}")
         if segundos_desde_respuesta is not None:
             lineas.append("(el asistente terminó de hablar hace "
                           f"{segundos_desde_respuesta:.0f} s)")
@@ -264,6 +285,12 @@ def preguntar_con_historial(pregunta, historial, modelo, url_ollama,
     if hablante:
         sistema = ((sistema or "") + " Estás en una conversación de voz con "
                    f"varias personas; ahora mismo te habla {hablante}.")
+    # Si la última respuesta se quedó a medias, el modelo tiene que saber por
+    # dónde iba -- y saberlo COMO INSTRUCCIÓN, no como algo que él dijo. Ver
+    # la cabecera de este fichero y interrupcion.nota_de_corte.
+    nota = nota_de_corte(recorte)
+    if nota:
+        sistema = (sistema or "") + nota
     if modelo.lower().startswith("minimax"):
         return _historial_minimax(pregunta, recorte, modelo, sistema, hablante)
     return _historial_ollama(pregunta, recorte, modelo, url_ollama, sistema,
@@ -278,7 +305,8 @@ def _historial_minimax(pregunta, recorte, modelo, sistema, hablante,
     mensajes = []
     for h in recorte:
         papel = "assistant" if h.get("rol") == "asistente" else "user"
-        contenido = h.get("texto", "") if papel == "assistant" else _con_hablante(h)
+        contenido = (h.get("texto", "") if papel == "assistant"
+                     else _con_hablante(h))
         if mensajes and mensajes[-1]["role"] == papel:
             mensajes[-1]["content"] += "\n" + contenido
         else:
@@ -320,7 +348,8 @@ def _historial_ollama(pregunta, recorte, modelo, url, sistema, hablante):
         mensajes.append({"role": "system", "content": sistema})
     for h in recorte:
         papel = "assistant" if h.get("rol") == "asistente" else "user"
-        contenido = h.get("texto", "") if papel == "assistant" else _con_hablante(h)
+        contenido = (h.get("texto", "") if papel == "assistant"
+                     else _con_hablante(h))
         mensajes.append({"role": papel, "content": contenido})
     mensajes.append({"role": "user",
                      "content": f"[{hablante}]: {pregunta}" if hablante else pregunta})

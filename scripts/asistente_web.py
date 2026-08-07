@@ -104,6 +104,58 @@ interrumpir mientras habla. Si no hay modelo de huellas, la pagina se repliega
 a medio duplex: ignora el microfono mientras suena la voz. Los porques y las
 medidas, en las cabeceras de scripts/oido.py y scripts/conversacion.py.
 
+INTERRUMPIRLE HABLANDO: CALLAR Y ENTENDER SON DOS COSAS DISTINTAS
+El ciclo de antes decidia TODO despues de whisper, y whisper costaba 2,1-2,9 s:
+si le hablabas encima seguia hablando dos segundos largos. Pero para callarse
+no hace falta saber QUE le has dicho, solo que hay una persona hablando, y eso
+lo sabe la huella de voz en 10 ms. Asi que la interrupcion va por tres
+escalones, cada uno mas lento y mas listo que el anterior:
+
+  1. BAJAR LA VOZ, ~0,15 s. En cuanto el VAD dice "hay voz" -- 96 ms de
+     energia seguida -- la pagina baja el volumen al 18 % (duckear()). No
+     decide nada todavia: es reversible, y si resulta ser el propio asistente
+     colandose por el microfono, el volumen vuelve y solo se ha oido un bache.
+  2. CALLAR DE VERDAD, 0,6-1,7 s segun como arranque la frase. Con 0,3 s de
+     voz grabada, POST /barrera pregunta a la huella si es una persona
+     matriculada. Si lo es, se aborta la locucion, se cierra la sesion de voz
+     y se apunta POR DONDE IBA. Se prueba en escalones (0,3 · 0,4 · 0,5 · 0,7
+     · 1,0 · 1,4 s de voz) porque el primero cuesta 10 ms y acierta la mitad
+     de las veces; la tabla, en oido.py. Si la intervencion es demasiado corta
+     para decidirse -- «¿Cómo?» son 192 ms de voz --, recoge la huella del
+     trozo entero al llegar a /escuchar, sin esperar a la transcripcion.
+  3. ENTENDER, despues. Cuando el VAD cierra la frase, el trozo entero pasa
+     por el camino de siempre y ademas por interrupcion.clasificar(): «espera»
+     y «para» y «sigue» son frases hechas y se resuelven SIN LLM y SIN
+     compuerta, que es lo que hace que «espera» -> «¿qué pasa?» suene en 1,07 s
+     desde que dejas de hablar en vez de en cinco segundos. Lo que no es una
+     frase hecha va al LLM con el contexto del corte detras.
+  4. Y SI RESULTA QUE NO ERA PARA EL, VUELVE. La barrera calla sin saber que
+     le han dicho, asi que a veces callara porque hablabas con otra persona.
+     Sin marcha atras eso le dejaria mudo a mitad de frase: reanudar() retoma
+     la locucion por donde iba en cuanto la compuerta dice que no era para el.
+
+POR DONDE IBA CUANDO LE CORTASTE
+Al abortar, la pagina parte la respuesta en dos: lo que LLEGO A SONAR y lo que
+se quedo dentro. Las dos mitades van al historial y las dos se le enseñan al
+modelo (interrupcion.texto_para_el_modelo). Es lo que permite «detalla eso
+ultimo» -- que habla de lo dicho -- y «sigue» -- que habla de lo que faltaba.
+
+LA COMPUERTA YA NO ESPERA SU TURNO
+Antes el orden era whisper -> compuerta -> LLM, en fila, y la compuerta ponia
+0,47-0,70 s en el camino critico. Ahora /preguntar la lanza EN PARALELO con el
+LLM y solo retiene la entrega de la primera frase a la sesion de voz hasta
+tener veredicto. Como el LLM tarda 1,15-6,5 s en tener la primera frase, la
+compuerta termina antes y no se nota. Lo que cuesta: si la respuesta era NO,
+se han gastado ~0,7 s de LLM para nada. Se apaga con --sin-solapar.
+
+WHISPER, EL SUMANDO GORDO, EN NATIVO
+whisper.cpp corria en Docker, donde no hay Metal, y costaba 2,1-2,9 s por
+frase FUERA DEL LARGO del audio -- es arranque del codificador, no proceso.
+Compilado nativo en el Mac cuesta 0,28 s con el MISMO modelo y la MISMA
+transcripcion (medido, tabla en scripts/escucha_fidelidad.py). Se levanta con
+scripts/whisper-mac.sh y se le apunta con --whisper-url; sin esa opcion todo
+sigue yendo por voz-api como siempre.
+
 DEPENDENCIA: el cliente de websocket (`websockets`, el mismo que usa
 scripts/ws_fidelidad.py). Esta en pkgs/vibevoice/.venv, que es con lo que hay
 que arrancar esto:
@@ -133,6 +185,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from narrador import trocear  # noqa: E402
 from asistente import ABRE_PENSAMIENTO, CIERRA_PENSAMIENTO, limpiar, preguntar  # noqa: E402
 from conversacion import RECUERDO_COMPUERTA, decidir, preguntar_con_historial  # noqa: E402
+from interrupcion import clasificar, que_decir  # noqa: E402
 from oido import Oido  # noqa: E402
 
 try:
@@ -342,10 +395,17 @@ modelo esperando a la segunda."><div class="n" id="h4">—</div><div class="e">s
   cada intervención se transcribe y un modelo decide si iba dirigida al
   asistente; solo entonces contesta, con la conversación entera detrás.
   Sabe <b>quién habla</b> por la huella de la voz (el timbre, no lo que se
-  dice) y desecha la suya propia, así que puedes interrumpirle mientras habla.
+  dice) y desecha la suya propia.
   Los desconocidos reciben un perfil automático; ponles nombre abajo.
   Arranca apagada y solo funciona en <code>127.0.0.1</code>, como el botón
   Hablar.</p>
+  <p class="nota"><b>Puedes cortarle hablando.</b> Baja la voz en cuanto oye a
+  alguien y calla del todo en medio segundo, cuando la huella confirma que
+  eres una persona y no él mismo — sin esperar a saber qué has dicho. Después
+  entiende: «espera» o «¿cómo?» te devuelven un «¿qué pasa?» sin pasar por el
+  modelo grande, «para» le deja callado, «sigue» retoma por donde iba, y
+  cualquier otra cosa la responde sabiendo <b>qué llevaba dicho y qué le
+  quedaba</b>. Si resulta que no le hablabas a él, vuelve solo a su frase.</p>
   <details class="ajustes"><summary>Perfiles de voz (quién es quién)</summary>
     <div id="perfLista" style="display:flex;flex-direction:column;gap:.5rem;margin-top:.9rem"></div>
     <div class="fila">
@@ -480,6 +540,67 @@ function marca(id,estado){
 // SU contexto y no el de la otra.
 const historial=[];        // la conversacion entera: {rol, texto, quien}
 let enPregunta=false, enAudio=false, preguntaEnCurso=null;
+// BAJAR LA VOZ Y CALLARLA SON DOS COSAS DISTINTAS, y por eso hay un nodo de
+// ganancia en medio en vez de conectar cada trozo al destino. Bajarla es
+// reversible y se hace a los ~150 ms, con la sola noticia de que hay voz;
+// callarla es definitivo y espera a que la huella confirme que es una
+// persona (~0,5 s). Sin el nodo, lo unico que se podia hacer era cerrar el
+// contexto, que es irreversible: una falsa alarma habria partido la frase.
+let ganancia=null, agachado=false, ultimoDicho="";
+const NIVEL_AGACHADO=0.18;   // no cero: que se siga oyendo de fondo
+const CAIDA_MS=70;           // fundido de salida. De golpe suena a corte seco
+function duckear(){
+  if(!ganancia||agachado) return;
+  agachado=true;
+  ganancia.gain.setTargetAtTime(NIVEL_AGACHADO,ganancia.context.currentTime,0.03);
+}
+function desduckear(){
+  if(!ganancia||!agachado) return;
+  agachado=false;
+  ganancia.gain.setTargetAtTime(1,ganancia.context.currentTime,0.05);
+}
+// Callar del todo: fundido corto y abortar la peticion. El contexto se cierra
+// solo, con retardo, para que el fundido llegue a oirse (ver el final de
+// preguntarVoz).
+function silenciar(){
+  if(ganancia){
+    agachado=false;
+    ganancia.gain.cancelScheduledValues(ganancia.context.currentTime);
+    ganancia.gain.setTargetAtTime(0,ganancia.context.currentTime,CAIDA_MS/3000);
+  }
+  if(aborto) aborto.abort();
+}
+// Lo que llego a SONAR y lo que se quedo dentro. Son cosas distintas para el
+// modelo: «detalla eso ultimo» habla de lo primero y «sigue» de lo segundo.
+// El estado de cada trozo ya lo sabe la pagina, que es quien lo pinta.
+function loQueLlevaba(){
+  const dicho=[], resto=[];
+  for(const t of trozos)
+    (t.estado==="fin"||t.estado==="son"?dicho:resto).push(t.texto);
+  if(pendiente) resto.push(pendiente);
+  return {dicho:dicho.join(" ").trim(), restante:resto.join(" ").trim()};
+}
+// LA BARRERA CALLA SIN SABER QUE LE HAN DICHO, y eso obliga a saber volver.
+// Se para con la sola noticia de que hay una persona hablando -- ese es el
+// truco entero, y por eso pasa en medio segundo en vez de en tres -- pero a
+// veces resulta que esa persona le hablaba a OTRA. Sin marcha atras, hablar
+// cerca del asistente le dejaba mudo a mitad de frase.
+//
+// `corte` guarda lo que quedo por decir hasta que se sabe si la interrupcion
+// era para el. Si no lo era, se retoma la locucion por donde iba (reanudar);
+// si lo era, se descarta y se contesta.
+let corte=null;
+function reanudar(motivo,c){
+  c=c||corte; corte=null;
+  if(!c||!c.restante) return false;
+  // El apunte cortado se quita: al terminar la reanudacion se vuelve a
+  // escribir entero, sin la marca, porque al final SI lo dijo todo.
+  const i=historial.findIndex(h=>h.rol==="asistente"&&h.cortado&&h.texto===c.dicho);
+  if(i>=0) historial.splice(i,1);
+  apunta(`<span class="meta">${escapar(motivo)}: sigo por donde iba</span>`);
+  lanzarPregunta("",{decir:c.restante,continuaDe:c.dicho,sinApunte:true});
+  return true;
+}
 function lanzarPregunta(q,extra){
   preguntaEnCurso=preguntarVoz(q,extra||{}).finally(()=>{preguntaEnCurso=null;});
   return preguntaEnCurso;
@@ -489,7 +610,15 @@ async function preguntarVoz(q,extra){
   ["h1","h2","h3","h4"].forEach(i=>$(i).textContent="—");
   trozos=[]; pendiente=""; pintar(); di("preguntando…");
   const actx=new AudioContext(); const ab=new AbortController();
-  ctx=actx; cabeza=0; aborto=ab;
+  const gan=actx.createGain(); gan.connect(actx.destination);
+  // El arnes de pruebas inyecta audio por el camino del servidor y NO quiere
+  // oirlo salir por los altavoces. Con el nodo de ganancia sale gratis.
+  if(window.__escucha&&__escucha.mudo) gan.gain.value=0;
+  ctx=actx; cabeza=0; aborto=ab; ganancia=gan; agachado=false;
+  // La cuenta de falsas alarmas se lleva POR LOCUCION: si en la anterior el
+  // microfono oyo al altavoz dos veces, esta empieza otra vez con margen.
+  barrera.falsos=0;
+  let cortada=false, descartada=false;
   // La velocidad NO viaja al servidor: el websocket de sesion la rechaza a
   // proposito (ver la nota del panel). Se aplica aqui con playbackRate, que
   // es gratis pero mueve el tono. Se congela al empezar para que moverla a
@@ -498,8 +627,12 @@ async function preguntarVoz(q,extra){
   const t0=performance.now(); let resto=new Uint8Array(0), primero=0, hitos={};
   const marcas=extra.marcas||{}; marcas.t0=t0;
   let respuesta="";
-  historial.push({rol:"usuario",texto:q,quien:extra.hablante||undefined});
-  while(historial.length>24) historial.shift();
+  // Al reanudar no hay pregunta que apuntar: nadie ha dicho nada, es la misma
+  // locucion de antes que sigue.
+  if(!extra.sinApunte){
+    historial.push({rol:"usuario",texto:q,quien:extra.hablante||undefined});
+    while(historial.length>24) historial.shift();
+  }
   try{
     const r=await fetch("/preguntar",{method:"POST",signal:ab.signal,
       headers:{"content-type":"application/json"},
@@ -507,6 +640,11 @@ async function preguntarVoz(q,extra){
         sistema:$("sistema").value,
         historial:historial.slice(0,-1),   // lo anterior a esta pregunta
         hablante:extra.hablante||null,
+        // `decir` salta el LLM y manda el texto tal cual a la voz: es el
+        // «¿qué pasa?» de una interrupcion. `compuerta` pide que el veredicto
+        // se resuelva AQUI, en paralelo con el LLM, en vez de en /escuchar.
+        decir:extra.decir||null,
+        compuerta:extra.compuerta||null,
         voz:$("voz").value, cfg:+$("cfg").value,
         pasos:+$("pasos").value,
         semilla:$("semilla").value===""?null:+$("semilla").value})});
@@ -529,6 +667,13 @@ async function preguntarVoz(q,extra){
             case "hito":
               if(ev.hito==="token"){ marcas.token=ev.s; $("h1").textContent=ev.s.toFixed(2)+"s"; }
               if(ev.hito==="frase"){ hitos.frase=ev.s; marcas.frase=ev.s; $("h2").textContent=ev.s.toFixed(2)+"s"; }
+              if(ev.hito==="compuerta") marcas.compuerta=ev.s;
+              break;
+            // La compuerta, corriendo en paralelo, dijo que no era para mi:
+            // ni una palabra ha salido por la voz (el puente retiene la
+            // entrega hasta el veredicto). Se deshace el apunte del historial.
+            case "no_dirigida":
+              descartada=true; marcas.compuerta=ev.s; marcas.no_dirigida=true;
               break;
             case "token":   // el LLM escribio: solo cambia lo pendiente
               pendiente=ev.pendiente; pintar(); break;
@@ -556,7 +701,7 @@ async function preguntarVoz(q,extra){
           cabeza=actx.currentTime+0.15; }
         const buf=actx.createBuffer(1,f32.length,24000);
         buf.copyToChannel(f32,0);
-        const src=actx.createBufferSource(); src.buffer=buf; src.connect(actx.destination);
+        const src=actx.createBufferSource(); src.buffer=buf; src.connect(gan);
         src.playbackRate.value=vel;
         if(cabeza<actx.currentTime) cabeza=actx.currentTime;
         // A otra velocidad el trozo dura otra cosa: si no se divide, el
@@ -572,13 +717,41 @@ async function preguntarVoz(q,extra){
     di(restante>200?"terminando de hablar…":"listo.");
     await new Promise(rs=>setTimeout(rs,restante+250));
     di("listo.");
-  }catch(e){ di(e.name==="AbortError"?"parado.":"error: "+e.message,e.name!=="AbortError"); }
+  }catch(e){
+    cortada=e.name==="AbortError";
+    di(cortada?"parado.":"error: "+e.message,!cortada);
+  }
   $("ir").disabled=false; $("parar").hidden=true;
   enPregunta=false; enAudio=false;
-  try{ actx.close(); }catch(_){}
-  // Al historial va lo que LLEGO A DECIR: si le interrumpieron a mitad, eso
-  // es lo que la otra persona oyo, y es a eso a lo que contestara.
-  if(respuesta.trim()) historial.push({rol:"asistente",texto:respuesta.trim()});
+  // El cierre va CON RETARDO para que el fundido de silenciar() llegue a
+  // sonar: cerrar el contexto corta el audio en seco, y un corte seco a mitad
+  // de palabra suena a averia, no a que te esta escuchando.
+  const suyo=actx; setTimeout(()=>{ try{ suyo.close(); }catch(_){} },CAIDA_MS+30);
+  if(ganancia===gan){ ganancia=null; agachado=false; }
+  // AL HISTORIAL, PARTIDO EN DOS. Antes iba `respuesta` entera -- todo lo que
+  // el LLM habia escrito -- y eso es mentira en cuanto hay una interrupcion:
+  // la otra persona solo oyo una parte, y el modelo creia haber dicho el
+  // resto. Ahora se guardan las dos mitades y el LLM las ve como lo que son.
+  const donde=loQueLlevaba();
+  // Al reanudar, lo dicho antes del corte y lo dicho ahora son UNA respuesta:
+  // se pegan y el apunte queda sin marca de corte, porque al final se dijo
+  // entera y el modelo no tiene por que creer que le cortaron.
+  const antes=extra.continuaDe?extra.continuaDe+" ":"";
+  if(descartada){
+    // No era para mi y no salio ni un byte de voz: el apunte de la pregunta
+    // que se metio al empezar sobra, o la proxima respuesta arrastraria una
+    // conversacion ajena.
+    const i=historial.findIndex(h=>h.rol==="usuario"&&h.texto===q);
+    if(i>=0) historial.splice(i,1);
+  }else if(cortada&&donde.dicho){
+    historial.push({rol:"asistente",texto:antes+donde.dicho,cortado:true,
+                    restante:donde.restante||undefined});
+    ultimoDicho=antes+donde.dicho;
+    corte={dicho:antes+donde.dicho,restante:donde.restante};
+  }else if(respuesta.trim()){
+    historial.push({rol:"asistente",texto:antes+respuesta.trim()});
+    ultimoDicho=antes+respuesta.trim();
+  }
   while(historial.length>24) historial.shift();
   if(escucha.activa&&!enPregunta) estEsc("escuchando");
   return marcas;
@@ -587,7 +760,7 @@ $("ir").addEventListener("click",()=>{
   const q=$("q").value.trim(); if(!q) return;
   lanzarPregunta(q);
 });
-$("parar").addEventListener("click",()=>aborto&&aborto.abort());
+$("parar").addEventListener("click",()=>silenciar());
 
 // ================== escucha continua ===================================
 // El microfono SIEMPRE abierto y sin palabra de activacion. El bucle:
@@ -608,19 +781,40 @@ $("parar").addEventListener("click",()=>aborto&&aborto.abort());
 //
 // VAD: RMS por bloques de 32 ms con suelo de ruido adaptativo (EMA solo
 // cuando NO hay voz, para no aprenderse a si mismo como ruido). Arranca con
-// ~100 ms seguidos por encima del umbral alto y cierra tras 600 ms por
-// debajo del bajo. 600 y no 300: las pausas internas de una frase dictada
-// llegan a 400-500 ms (medido con locuciones de Piper: hasta 0,46 s entre
-// clausulas) y un cierre de 300 ms parte la frase en dos. Se antepone
-// ademas ~400 ms de antesala para no comerse el arranque de la primera
-// palabra, que el umbral solo pilla ya empezada.
+// ~100 ms seguidos por encima del umbral alto y cierra tras 500 ms por
+// debajo del bajo.
+//
+// EL CIERRE: 500 ms, MEDIDO. Estaba en 600 porque las pausas internas de una
+// frase parten el segmento si se cierra demasiado pronto. Se paso el VAD --
+// esta misma clase, portada a Python -- por doce locuciones generadas con
+// VibeVoice, del largo de una orden real, contando cuantos trozos salian:
+//
+//     cierre  250  300  350  400  450  500  600 ms
+//     frases partidas  2    2    2    2    1    1    1  de 12
+//
+// La unica que se parte por debajo de 450 es «No, espera, ¿qué has dicho?»,
+// que lleva dentro una pausa de 400-450 ms. De 450 a 600 no cambia NADA: los
+// 100 ms de mas eran gratis para el que espera y no compraban nada. Se deja
+// en 500, un escalon por encima del ultimo que fallaba.
+//
+// minVozMs BAJA A 150 CUANDO HAY HUELLAS. Estaba en 250 para tirar toses y
+// golpes, pero se comia «¿Cómo?» -- 192 ms de voz medidos, y justo una de las
+// frases con las que se interrumpe. La huella filtra eso mucho mejor: tos,
+// golpe y ruido de sala dan coseno entre -0,06 y +0,04 contra CUALQUIER
+// perfil (medido, ver oido.py). Sin modelo de huellas se vuelve a 250,
+// porque entonces el unico filtro es este.
+//
+// Se antepone ademas ~400 ms de antesala para no comerse el arranque de la
+// primera palabra, que el umbral solo pilla ya empezada. Esa antesala es para
+// WHISPER: la barrera de interrupcion la salta a proposito (preN), porque el
+// silencio diluye la huella (tabla en oido.py).
 class Vad{
   constructor(al){
     this.al=al; this.rate=48000;
-    this.cierreMs=600; this.preMs=400; this.minVozMs=250; this.maxMs=15000;
+    this.cierreMs=500; this.preMs=400; this.minVozMs=250; this.maxMs=15000;
     this.ruido=0.004; this.resto=new Float32Array(0);
     this.enVoz=false; this.pre=[]; this.seg=[]; this.silencio=0;
-    this.conVoz=0; this.arranque=0;
+    this.conVoz=0; this.arranque=0; this.preN=0;
   }
   umbrales(){ return [Math.max(0.012,this.ruido*4), Math.max(0.006,this.ruido*2.5)]; }
   alimentar(f32,rate){
@@ -643,6 +837,9 @@ class Vad{
       if(rms>alto){
         if((this.arranque+=ms)>=90){
           this.enVoz=true; this.seg=this.pre; this.pre=[];
+          // Cuantos bloques del segmento son antesala (silencio de antes de
+          // la primera palabra). La barrera se los salta; whisper no.
+          this.preN=Math.max(0,this.seg.length-Math.round(this.arranque/ms));
           this.silencio=0; this.conVoz=this.arranque; this.arranque=0;
           this.al.voz&&this.al.voz(true);
         }
@@ -654,6 +851,10 @@ class Vad{
       this.seg.push(b.slice());
       if(rms>bajo){ this.silencio=0; this.conVoz+=ms; }
       else this.silencio+=ms;
+      // Cada bloque, mientras hay voz: es el gancho de la interrupcion. No
+      // espera al cierre a proposito -- esperar al cierre es justo lo que
+      // hacia que el asistente siguiera hablando dos segundos largos.
+      this.al.creciendo&&this.al.creciendo(this);
       if(this.silencio>=this.cierreMs||this.seg.length*ms>=this.maxMs) this._cerrar();
     }
   }
@@ -670,7 +871,86 @@ class Vad{
 
 const escucha={activa:false,huellas:false,ctx:null,flujo:null,nodo:null,
                vad:null,cola:[],procesando:false,ultimaRespuesta:0,
-               vozConAudio:false};
+               vozConAudio:false,agacharse:true};
+
+// ================== la barrera: callar antes de entender ================
+// Tres escalones, del mas rapido al mas listo, medidos de punta a punta en la
+// pagina real (muda, con audio inyectado; ver scripts/escucha_fidelidad.py):
+//
+//   ~0,15 s   el VAD dice "hay voz"         -> BAJAR el volumen (reversible)
+//   0,6-1,7 s la huella dice "es una persona" -> CALLAR y apuntar por donde iba
+//   +0,3 s    whisper e interrupcion.clasificar -> QUE hacer con el silencio
+//
+// El escalon de en medio es el que decide si esto se siente natural, y es el
+// que no existia: antes habia que esperar a whisper (2,1-2,9 s) para saber
+// siquiera que habias hablado. Lo que hace variar ese 0,6-1,7 s no es el
+// coste de la huella (10 ms) sino COMO ARRANCA la frase: «para» empieza con
+// una oclusiva y el VAD la pilla en 0,26 s; un «oye» flojo tarda 0,58 s en
+// pasar el umbral, y encima acumula voz mas despacio.
+//
+// LOS ESCALONES DE LA HUELLA, MEDIDOS (tabla completa en scripts/oido.py):
+// con 0,3 s de voz acierta la mitad de las veces, con 0,5 s acierta siempre,
+// y la voz del PROPIO asistente no da un solo falso positivo en ningun largo
+// (0 de 41). Por eso se pregunta varias veces en vez de esperar directamente
+// al largo seguro: el primer escalon cuesta 10 ms y cuando acierta ahorra
+// 200 ms. Y errar por corto no rompe nada, porque el trozo sigue su camino.
+const ESCALONES_BARRERA=[0.3,0.4,0.5,0.7,1.0,1.4];
+// Cuantas veces se puede bajar el volumen en falso dentro de una misma
+// locucion antes de dejar de hacerlo. Sin este tope, un microfono que oiga
+// bien al altavoz -- eco que el navegador no cancele del todo -- convertiria
+// la locucion en un bache continuo. La barrera de la huella sigue viva: solo
+// se pierde el aviso temprano.
+const FALSOS_AGACHE=2;
+const barrera={activa:false,escalon:0,enVuelo:false,inicio:0,falsos:0,
+               callo:false,ms:null};
+function reiniciarBarrera(){
+  barrera.activa=false; barrera.escalon=0; barrera.enVuelo=false;
+}
+function abrirBarrera(){
+  // Solo tiene sentido con el asistente hablando y con huellas: sin timbre no
+  // hay forma de distinguirle a el de quien le interrumpe.
+  if(!escucha.huellas||!enAudio||!enPregunta){ reiniciarBarrera(); return; }
+  barrera.activa=true; barrera.escalon=0; barrera.enVuelo=false;
+  barrera.inicio=performance.now();
+  if(escucha.agacharse&&barrera.falsos<FALSOS_AGACHE) duckear();
+}
+async function tocarBarrera(vad){
+  if(!barrera.activa||barrera.enVuelo) return;
+  const meta=ESCALONES_BARRERA[barrera.escalon];
+  if(meta===undefined||vad.conVoz/1000<meta) return;
+  barrera.enVuelo=true; barrera.escalon++;
+  // SIN LA ANTESALA (seg.slice(preN)): son 400 ms de silencio de sala que
+  // diluyen el vector -- medido, con ellos hace falta 0,6 s de voz para
+  // acertar siempre y sin ellos 0,5 s. Whisper si la quiere; la huella no.
+  const bloques=vad.seg.slice(vad.preN);
+  let n=0; for(const b of bloques) n+=b.length;
+  const f32=new Float32Array(n); let o=0;
+  for(const b of bloques){ f32.set(b,o); o+=b.length; }
+  try{
+    const d=await fetch("/barrera",{method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({wav:b64(codificarWav(f32,vad.rate))})}).then(r=>r.json());
+    __escucha.traza.push({fase:"barrera",escalon:meta,humano:!!d.humano,
+      cos:d.cos,cos_asistente:d.cos_asistente,
+      ms:Math.round(performance.now()-barrera.inicio)});
+    if(d.humano&&barrera.activa&&enPregunta){
+      const ms=Math.round(performance.now()-barrera.inicio);
+      barrera.activa=false; barrera.falsos=0;
+      barrera.callo=true; barrera.ms=ms;
+      apunta(`<span class="meta">te oí y me callé en ${(ms/1000).toFixed(2)}s `+
+             `(${meta}s de voz, coseno ${d.cos})</span>`);
+      estEsc("te escucho","voz");
+      silenciar();            // aborta la locucion; el corte queda apuntado
+    }else if(barrera.escalon>=ESCALONES_BARRERA.length){
+      // Se agotaron los escalones sin ver una persona: lo mas probable es que
+      // sea el propio asistente colandose por el microfono. Se devuelve el
+      // volumen y se deja de preguntar hasta la siguiente entrada de voz.
+      barrera.activa=false; barrera.falsos++;
+      desduckear();
+    }
+  }catch(_){ barrera.activa=false; desduckear(); }
+  barrera.enVuelo=false;
+}
 function estEsc(txt,clase){ $("escEst").textContent=txt; $("escEst").dataset.e=clase||txt; }
 function escapar(t){return String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 function apunta(html,clase){
@@ -700,24 +980,42 @@ function prepararVad(){
     nivel:(rms,umbral)=>{$("vui").style.width=Math.min(100,rms/(umbral*3)*100)+"%";},
     voz:v=>{
       if(v){ escucha.vozConAudio=enAudio;
+             abrirBarrera();          // el primer escalon: bajar la voz
              if(escucha.activa&&!enPregunta) estEsc("voz detectada","voz"); }
-      else if(escucha.activa&&!enPregunta&&!escucha.cola.length&&!escucha.procesando)
-        estEsc("escuchando");
+      else{
+        // Se acabo la entrada de voz sin que la huella confirmara a nadie:
+        // devolver el volumen. Si SI confirmo, la locucion ya esta abortada y
+        // esto no toca nada.
+        reiniciarBarrera(); desduckear();
+        if(escucha.activa&&!enPregunta&&!escucha.cola.length&&!escucha.procesando)
+          estEsc("escuchando");
+      }
     },
+    creciendo:vad=>tocarBarrera(vad),
     segmento:(f32,rate)=>alSegmento(f32,rate)});
+  // Ver el bloque de la clase Vad: con huellas, la tos la filtra el timbre
+  // mucho mejor que el largo, y 250 ms se comian «¿Cómo?» (192 ms medidos).
+  escucha.vad.minVozMs=escucha.huellas?150:250;
 }
 function alSegmento(f32,rate){
   if(!escucha.activa) return;
   // "hablando": sono voz del asistente durante ALGUNA parte del trozo. El
   // servidor endurece el filtro con eso (ver /escuchar).
   const hablando=enAudio||escucha.vozConAudio||__escucha.hablando;
+  // "interrumpe": la barrera ya callo al asistente por esta misma voz. El
+  // trozo no viene a preguntar nada, viene a explicar la interrupcion.
+  const interrumpe=barrera.callo; barrera.callo=false;
   escucha.vozConAudio=false;
   // Repliegue sin huellas: medio duplex. Sin timbre no hay forma fiable de
   // distinguir al asistente del que interrumpe, asi que mientras hay una
   // pregunta en marcha el microfono no cuenta.
   if(!escucha.huellas&&(enPregunta||__escucha.hablando)) return;
   if(escucha.cola.length>=2) escucha.cola.shift();   // no acumular retraso
-  escucha.cola.push({f32,rate,fin:performance.now(),hablando});
+  // `fin` es cuando DEJASTE DE HABLAR, no cuando el VAD lo dio por cerrado:
+  // el cierre son cierreMs de silencio DESPUES de la ultima palabra, y
+  // cargarselos al LLM en la cuenta escondia medio segundo del total.
+  escucha.cola.push({f32,rate,hablando,interrumpe,
+                     fin:performance.now()-escucha.vad.cierreMs});
   procesarCola();
 }
 async function procesarCola(){
@@ -735,7 +1033,7 @@ async function procesarSegmento(s){
     const r=await fetch("/escuchar",{method:"POST",
       headers:{"content-type":"application/json"},
       body:JSON.stringify({wav:b64(codificarWav(s.f32,s.rate)),
-        hablando:!!s.hablando,
+        hablando:!!s.hablando, interrumpe:!!s.interrumpe,
         historial:historial.slice(-6),
         respondio_hace_s:escucha.ultimaRespuesta?
           Math.round((performance.now()-escucha.ultimaRespuesta)/100)/10:null})});
@@ -751,7 +1049,13 @@ async function procesarSegmento(s){
         const ev=JSON.parse(ln);
         __escucha.traza.push(ev);
         if(ev.fase==="huella"){ quien=ev;
-          if(!ev.descartada) estEsc("transcribiendo","proc"); }
+          // CALLAR AQUI, NO AL FINAL. Esta huella es la buena -- la del
+          // trozo entero -- y llega en ~30-90 ms; esperar a la decision
+          // costaba ademas la transcripcion. Es la red de la barrera: recoge
+          // las intervenciones demasiado cortas para decidirse a media frase
+          // («¿Cómo?» son 192 ms de voz y no llega ni al primer escalon).
+          if(!ev.descartada){ estEsc("transcribiendo","proc");
+            if(enPregunta&&aborto) silenciar(); } }
         else if(ev.fase==="texto"){ texto=ev.texto||""; traza.stt=ev.s;
           if(texto) estEsc("¿me hablan a mí?","proc"); }
         else if(ev.fase==="decision"){ decision=ev; traza.compuerta=ev.s; }
@@ -765,36 +1069,89 @@ async function procesarSegmento(s){
   if(quien&&quien.descartada){
     apunta(`<span class="meta">descartada: ${escapar(quien.motivo||"voz del asistente")}` +
            (quien.cos!==undefined?` (coseno ${quien.cos})`:"")+`</span>`,"fuera");
+    reanudar("no era una persona");
     return;
   }
-  if(!texto){ apunta(`<span class="meta">(voz sin palabras)</span>`,"fuera"); return; }
+  if(!texto){ apunta(`<span class="meta">(voz sin palabras)</span>`,"fuera");
+              reanudar("voz sin palabras"); return; }
   const cabecera=`<span class="quien">${escapar(nombre)}</span> <span class="dicho">«${escapar(texto)}»</span>`;
   const tiempos=`huella ${((quien&&quien.s)||0).toFixed(2)}s · stt ${(traza.stt||0).toFixed(2)}s · compuerta ${(traza.compuerta||0).toFixed(2)}s`;
-  if(!decision||!decision.dirigida){
+  // dirigida === null quiere decir "sin resolver": la compuerta corre dentro
+  // de /preguntar, en paralelo con el LLM. false sigue queriendo decir que no.
+  if(decision&&decision.dirigida===false){
     apunta(`${cabecera} <span class="meta">no era para mí · ${tiempos}</span>`,"fuera");
+    reanudar("no era para mí");
     return;
   }
-  apunta(`${cabecera} <span class="meta">para mí · ${tiempos}</span>`);
+  const intencion=decision&&decision.intencion||null;
+  apunta(`${cabecera} <span class="meta">`+
+         (intencion?`interrupción: ${intencion}`:"para mí")+` · ${tiempos}</span>`);
   if(__escucha.sinPreguntar){       // el arnes de pruebas corta aqui
-    __escucha.traza.push({fase:"preguntaria",texto,hablante:quien&&quien.perfil?nombre:null});
+    __escucha.traza.push({fase:"preguntaria",texto,intencion,
+                          hablante:quien&&quien.perfil?nombre:null});
     if(escucha.activa) estEsc("escuchando");
     return;
   }
-  // Interrupcion: si estaba hablando, que se calle y atienda. Se espera a
-  // que la pregunta vieja LIMPIE (cierra su contexto de audio) antes de
-  // lanzar la nueva; son milisegundos y evita pisarse los globales.
-  if(enPregunta&&aborto){ aborto.abort(); if(preguntaEnCurso) await preguntaEnCurso; }
-  estEsc("pensando","pensando");
-  const marcas={};
+  // Ya se callo arriba, al llegar la huella. Aqui solo se espera a que la
+  // pregunta vieja LIMPIE (cierra su contexto de audio) antes de lanzar la
+  // nueva; son milisegundos y evita pisarse los globales.
+  if(enPregunta&&aborto){ silenciar(); if(preguntaEnCurso) await preguntaEnCurso; }
+
+  // ---- que hacer con el silencio que se acaba de abrir ------------------
+  // Las ordenes hechas se responden SIN LLM y SIN compuerta. Es la diferencia
+  // entre «espera» -> «¿qué pasa?» en menos de un segundo, y en cinco.
+  const hablante=quien&&quien.perfil?nombre:null;
+  // El corte se aparta AQUI: si se contesta, se descarta; si la compuerta
+  // acaba diciendo que no era para el, se retoma con esta copia. Dejarlo en
+  // la global no vale, porque la respuesta que se lanza ahora la pisaria.
+  const cortePrevio=corte; corte=null;
+  if(intencion==="parar"){
+    apunta(`<span class="meta">callado. dime cuando quieras.</span>`);
+    historial.push({rol:"usuario",texto,quien:hablante||undefined});
+    while(historial.length>24) historial.shift();
+    if(escucha.activa) estEsc("escuchando");
+    return;
+  }
+  let extra={hablante,marcas:{}};
+  // La frase fija viene del servidor (interrupcion.que_decir), no de aqui:
+  // asi el texto que dice el asistente vive en un solo sitio.
+  if(decision&&decision.decir) extra.decir=decision.decir;
+  else if(intencion==="repetir"){
+    if(!ultimoDicho){ apunta(`<span class="meta">no había dicho nada aún</span>`,"fuera");
+      if(escucha.activa) estEsc("escuchando"); return; }
+    extra.decir=ultimoDicho;
+  }else if(intencion==="seguir"){
+    // SI LO QUE QUEDABA DA PARA ALGO, se dice tal cual: es literalmente
+    // seguir por donde iba, y suena al instante en vez de esperar 1-6 s a que
+    // el LLM redacte una continuacion parecida. El tope de 60 letras es para
+    // no rematar con un cabo suelto de tres palabras; por debajo de eso vale
+    // mas que lo escriba el modelo, que ve el corte en el historial.
+    if(cortePrevio&&cortePrevio.restante&&cortePrevio.restante.length>=60)
+      extra.decir=cortePrevio.restante;
+    else texto="Sigue por donde ibas.";
+  }else{
+    // Ni orden hecha ni nada: la compuerta decide, en paralelo con el LLM.
+    extra.compuerta={historial:historial.slice(-6),hablante,
+      respondio_hace_s:escucha.ultimaRespuesta?
+        Math.round((performance.now()-escucha.ultimaRespuesta)/100)/10:null};
+  }
+  estEsc(extra.decir?"contestando":"pensando","pensando");
+  const marcas=extra.marcas;
   // NO se espera al final del audio: los trozos que el VAD saque mientras
   // el asistente habla se procesan (asi es como se le puede interrumpir).
-  lanzarPregunta(texto,{hablante:quien&&quien.perfil?nombre:null,marcas}).then(()=>{
+  lanzarPregunta(texto,extra).then(()=>{
     escucha.ultimaRespuesta=performance.now();
-    if(marcas.sonido!==undefined){
+    if(marcas.no_dirigida){
+      apunta(`<span class="meta">no era para mí (compuerta `+
+             `${(marcas.compuerta||0).toFixed(2)}s, en paralelo: no sonó nada)</span>`,"fuera");
+      reanudar("no era para mí",cortePrevio);
+    }else if(marcas.sonido!==undefined){
       const total=(marcas.t0+marcas.sonido*1000-s.fin)/1000;
-      apunta(`<span class="meta">fin de tu voz → primer sonido: ${total.toFixed(2)}s `+
-             `(stt ${(traza.stt||0).toFixed(2)} + compuerta ${(traza.compuerta||0).toFixed(2)} `+
-             `+ LLM y voz ${(marcas.sonido||0).toFixed(2)})</span>`);
+      apunta(`<span class="meta">dejas de hablar → primer sonido: ${total.toFixed(2)}s `+
+             `(cierre del VAD ${(escucha.vad.cierreMs/1000).toFixed(2)} `+
+             `+ stt ${(traza.stt||0).toFixed(2)}`+
+             (marcas.compuerta!==undefined?` + compuerta ${marcas.compuerta.toFixed(2)} (solapada)`:"")+
+             ` + LLM y voz ${(marcas.sonido||0).toFixed(2)})</span>`);
     }
     if(escucha.activa&&!enPregunta) estEsc("escuchando");
   });
@@ -919,25 +1276,90 @@ $("perfAlta").addEventListener("click",async()=>{
 
 // ---- ganchos de prueba -------------------------------------------------
 // Para probar el bucle SIN microfono ni altavoces: inyectan PCM s16 por el
-// MISMO camino que el microfono (VAD -> /escuchar -> compuerta), y
+// MISMO camino que el microfono (VAD -> barrera -> /escuchar -> compuerta), y
 // sinPreguntar corta justo antes del LLM grande y de la voz. Los usa el
 // arnes de pruebas del repo; a la pagina no le estorban.
-window.__escucha={traza:[],sinPreguntar:false,hablando:false,interno:escucha,
+//
+// `mudo` es lo que permite medir la INTERRUPCION de verdad -- pidiendo una
+// respuesta larga y hablandole encima -- sin que salga un solo sonido por los
+// altavoces: pone a cero el nodo de ganancia por el que ya pasa todo el
+// audio. Nada mas cambia, asi que los tiempos son los mismos que con volumen.
+// `inyectarEnVivo` alimenta el VAD en TIEMPO REAL (a ritmo de reloj, no de
+// golpe) para que los milisegundos que mide la barrera signifiquen algo.
+window.__escucha={traza:[],sinPreguntar:false,hablando:false,mudo:false,
+  interno:escucha,barrera,
   armar(){ if(!escucha.vad) prepararVad();
            escucha.activa=true; escucha.huellas=true; estEsc("escuchando"); },
-  inyectarB64(cad,rate){
+  _aF32(cad){
     const crudo=atob(cad), n=crudo.length>>1, f=new Float32Array(n);
     for(let i=0;i<n;i++){
       let v=crudo.charCodeAt(2*i)|(crudo.charCodeAt(2*i+1)<<8);
       if(v>=32768) v-=65536;
       f[i]=v/32768;
     }
-    escucha.vad.alimentar(f,rate||16000);
+    return f;
+  },
+  inyectarB64(cad,rate){ escucha.vad.alimentar(this._aF32(cad),rate||16000); },
+  async inyectarEnVivo(cad,rate){
+    rate=rate||16000;
+    const f=this._aF32(cad), paso=Math.round(rate*0.032);
+    barrera.ms=null;
+    const t0=performance.now();
+    for(let i=0;i<f.length;i+=paso){
+      escucha.vad.alimentar(f.subarray(i,Math.min(i+paso,f.length)),rate);
+      const debe=t0+(i+paso)/rate*1000;
+      const falta=debe-performance.now();
+      if(falta>0) await new Promise(r=>setTimeout(r,falta));
+    }
+    return {t0,callarMs:barrera.ms};
   },
   estado(){ return {chip:$("escEst").textContent,activa:escucha.activa,
     cola:escucha.cola.length,procesando:escucha.procesando,
-    enVoz:escucha.vad?escucha.vad.enVoz:false,huellas:escucha.huellas}; }};
+    enVoz:escucha.vad?escucha.vad.enVoz:false,huellas:escucha.huellas,
+    enPregunta,enAudio,agachado,callarMs:barrera.ms,
+    ganancia:ganancia?ganancia.gain.value:null,
+    historial:historial.slice(-4)}; }};
 </script></body></html>"""
+
+
+def _multipart(campos, nombre_fichero, datos, tipo="audio/wav"):
+    lim = "----" + uuid.uuid4().hex
+    cuerpo = b""
+    for k, v in campos.items():
+        cuerpo += (f'--{lim}\r\nContent-Disposition: form-data; name="{k}"'
+                   f'\r\n\r\n{v}\r\n').encode()
+    cuerpo += (f'--{lim}\r\nContent-Disposition: form-data; name="{nombre_fichero}"; '
+               f'filename="voz.wav"\r\nContent-Type: {tipo}\r\n\r\n').encode()
+    cuerpo += datos + f"\r\n--{lim}--\r\n".encode()
+    return f"multipart/form-data; boundary={lim}", cuerpo
+
+
+def stt_nativo(url, wav, prompt=""):
+    """(texto, error) contra un whisper.cpp NATIVO, sin voz-api en medio.
+
+    El camino de siempre es navegador -> puente -> voz-api -> ffmpeg ->
+    whisper en Docker. Aqui se cortan los dos saltos de en medio: la pagina ya
+    construye WAV s16 y whisper.cpp lo lee solo (miniaudio remuestrea; se
+    comprobo con el mismo audio a 16, 22 y 48 kHz -- transcripcion identica),
+    asi que ffmpeg no pinta nada.
+
+    Lo que SI se conserva de voz-api es el sesgo de vocabulario: sin el,
+    whisper transcribe "WireGuard" como "We The War". Viaja como `prompt`,
+    igual que hace voz-api.
+    """
+    campos = {"language": "es", "temperature": "0.0", "response_format": "json"}
+    if prompt:
+        campos["prompt"] = prompt
+    tipo, cuerpo = _multipart(campos, "file", wav)
+    pet = urllib.request.Request(f"{url}/inference", method="POST", data=cuerpo,
+                                 headers={"content-type": tipo})
+    try:
+        d = json.load(urllib.request.urlopen(pet, timeout=120))
+    except Exception as e:
+        return None, (f"whisper nativo no responde en {url}/inference "
+                      f"({type(e).__name__}: {e}); levantalo con "
+                      f"scripts/whisper-mac.sh")
+    return (d.get("text") or "").strip(), None
 
 
 def desmarcar(buf, al_pcm, al_evento):
@@ -1055,11 +1477,17 @@ class Puente(BaseHTTPRequestHandler):
         seria trabajo repetido. La peticion multipart es calcada a la de
         transcribir() en scripts/fidelidad.py, que es la referencia probada.
         """
+        # WHISPER NATIVO SOLO PARA WAV. El boton de microfono manda lo que
+        # grabe MediaRecorder -- webm/opus en Chrome, mp4/aac en Safari -- y
+        # eso necesita el ffmpeg de voz-api. La escucha continua, en cambio,
+        # construye WAV s16 ella misma y puede ir por el camino corto.
+        base = tipo.split(";")[0].strip()
+        if CFG.get("whisper") and base in ("audio/wav", "audio/x-wav"):
+            return stt_nativo(CFG["whisper"], audio, CFG.get("prompt_stt", ""))
         # La extension del nombre es cosmetica (ffmpeg huele el contenido),
         # pero que al menos no mienta para los formatos conocidos.
         ext = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/mp4": "mp4",
-               "audio/mpeg": "mp3", "audio/ogg": "ogg"}.get(
-            tipo.split(";")[0].strip(), "webm")
+               "audio/mpeg": "mp3", "audio/ogg": "ogg"}.get(base, "webm")
         lim = "----" + uuid.uuid4().hex
         cuerpo = (f'--{lim}\r\nContent-Disposition: form-data; '
                   f'name="idioma"\r\n\r\nes\r\n'
@@ -1092,6 +1520,38 @@ class Puente(BaseHTTPRequestHandler):
             return self.responder_json(502, {"error": err})
         self.responder_json(200, {"texto": texto})
 
+    def barrera(self):
+        """¿Hay una persona hablando AHORA MISMO? Solo la huella, ~10 ms.
+
+        Es el camino corto de la interrupcion, y a proposito no hace nada
+        mas: nada de whisper, nada de compuerta, nada de tocar perfiles. La
+        pagina lo llama a media palabra -- con 0,35, 0,5 y 0,7 s de voz
+        grabada -- mientras el asistente habla, y en cuanto contesta que si,
+        calla. El resto (que dijiste, y que hacer con ello) llega despues por
+        /escuchar, cuando el VAD cierre la frase.
+
+        Un `humano: false` NO quiere decir "es el asistente": quiere decir
+        "todavia no lo se". Errar por corto solo retrasa la interrupcion al
+        camino normal; nunca calla al asistente por equivocacion.
+        """
+        n = int(self.headers.get("content-length", 0))
+        try:
+            pet = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return self.responder_json(400, {"error": "peticion ilegible"})
+        if OIDO is None or not OIDO.listo():
+            # Sin huellas no hay barrera posible; la pagina ya lo sabe por
+            # /perfiles y se repliega a medio duplex, pero que no reviente.
+            return self.responder_json(200, {"humano": False,
+                                             "motivo": "sin huellas"})
+        try:
+            wav = base64.b64decode(pet.get("wav") or "")
+        except (ValueError, TypeError):
+            wav = b""
+        if len(wav) < 100:
+            return self.responder_json(400, {"error": "sin audio"})
+        self.responder_json(200, OIDO.barrera(wav))
+
     def escuchar(self):
         """Una intervencion oida por la escucha continua, de punta a punta.
 
@@ -1107,6 +1567,15 @@ class Puente(BaseHTTPRequestHandler):
         El ORDEN de las fases es la optimizacion: la huella cuesta ~25 ms y
         descarta la propia voz del asistente ANTES de pagar la transcripcion
         entera de whisper y la llamada de la compuerta.
+
+        LA COMPUERTA YA NO SE PAGA SIEMPRE. Dos atajos, los dos medidos:
+          - Si el texto es una orden hecha de interrupcion -- «espera»,
+            «para», «sigue», «¿qué has dicho?» -- se resuelve aqui mismo, en
+            microsegundos, y no se llama a nadie. La compuerta cuesta
+            0,47-0,70 s y sobre esas frases no aporta: son inequivocas.
+          - Si no lo es, la compuerta NO se llama aqui: se manda `dirigida`
+            sin resolver y la resuelve /preguntar EN PARALELO con el LLM, que
+            es donde deja de costar tiempo. Con --sin-solapar vuelve aqui.
         """
         n = int(self.headers.get("content-length", 0))
         try:
@@ -1151,16 +1620,39 @@ class Puente(BaseHTTPRequestHandler):
             if err:
                 return linea(fase="fin", error=err)
             texto = (texto or "").strip()
-            linea(fase="texto", texto=texto,
+            # La intencion de interrupcion se mira SIEMPRE, no solo cuando el
+            # asistente esta hablando: un «para» dicho justo cuando acaba de
+            # callarse tambien es un «para», y responderle «¿qué pasa?» a un
+            # «espera» es lo suyo aunque llegue medio segundo tarde.
+            intencion = clasificar(texto) if texto else None
+            linea(fase="texto", texto=texto, intencion=intencion,
+                  interrumpe=bool(pet.get("interrumpe")),
                   s=round(time.perf_counter() - t0, 3))
             if not texto:
                 return linea(fase="fin", vacia=True)
 
-            dirigida, s, crudo = decidir(
-                texto, pet.get("historial"), quien.get("nombre"),
-                CFG["compuerta"], CFG["ollama"], pet.get("respondio_hace_s"))
-            linea(fase="decision", dirigida=dirigida, s=round(s, 3),
-                  crudo=crudo)
+            if intencion is not None:
+                # Frase hecha: ni compuerta ni LLM. Ver la cabecera de
+                # scripts/interrupcion.py. La frase que hay que decir la pone
+                # interrupcion.py y no la pagina, para que el texto viva en un
+                # solo sitio; `null` quiere decir "no hay frase fija" (parar
+                # se resuelve callando, repetir necesita lo ultimo dicho, que
+                # solo sabe el navegador).
+                decir, retoma = que_decir(intencion)
+                linea(fase="decision", dirigida=True, s=0.0,
+                      intencion=intencion, decir=decir, retoma=retoma,
+                      crudo="orden de interrupcion")
+            elif CFG.get("solapar"):
+                # Sin veredicto: lo dara /preguntar mientras el LLM arranca.
+                linea(fase="decision", dirigida=None, s=0.0,
+                      crudo="la resuelve /preguntar en paralelo")
+            else:
+                dirigida, s, crudo = decidir(
+                    texto, pet.get("historial"), quien.get("nombre"),
+                    CFG["compuerta"], CFG["ollama"],
+                    pet.get("respondio_hace_s"))
+                linea(fase="decision", dirigida=dirigida, s=round(s, 3),
+                      crudo=crudo)
             linea(fase="fin")
         except (BrokenPipeError, ConnectionResetError):
             pass                            # el navegador se fue a mitad
@@ -1207,6 +1699,8 @@ class Puente(BaseHTTPRequestHandler):
             return self.transcribir()
         if self.path == "/escuchar":
             return self.escuchar()
+        if self.path == "/barrera":
+            return self.barrera()
         if self.path == "/perfiles/matricular":
             return self.perfil_matricular()
         if self.path == "/perfiles/renombrar":
@@ -1276,6 +1770,37 @@ class Puente(BaseHTTPRequestHandler):
         parar = threading.Event()           # el navegador se fue: soltarlo todo
         pendiente, n_frases, dentro = "", 0, False
 
+        # ---- la compuerta, EN PARALELO con el LLM -------------------------
+        # Antes iba delante, en fila, y ponia 0,47-0,70 s en el camino
+        # critico. Aqui arranca a la vez que el LLM y lo unico que retiene es
+        # la ENTREGA de la primera frase a la sesion de voz: mientras no haya
+        # veredicto no sale un solo byte de audio. Como la primera frase tarda
+        # 1,15-6,5 s en estar escrita y la compuerta 0,7 s, el veredicto llega
+        # antes de que haga falta y no se nota.
+        #
+        # Lo que cuesta si la respuesta era NO: ~0,7 s de LLM tirados. Con
+        # Ollama es gratis; con MiniMax son unos pocos tokens. --sin-solapar
+        # devuelve la compuerta a /escuchar, delante de todo.
+        compuerta = pet.get("compuerta")
+        veredicto = {}          # {"dirigida": bool, "s": float, "crudo": str}
+
+        def hilo_compuerta():
+            # Pase lo que pase, este hilo TIENE que dejar un veredicto: el
+            # bucle de abajo no entrega una sola frase hasta que lo haya, y sin
+            # esto una averia aqui dejaria al asistente mudo hasta el plazo de
+            # los 90 s. Ante la duda se abre, como hace decidir() por dentro.
+            try:
+                d, s, crudo = decidir(pet["texto"], compuerta.get("historial"),
+                                      compuerta.get("hablante"),
+                                      CFG["compuerta"], CFG["ollama"],
+                                      compuerta.get("respondio_hace_s"))
+            except Exception as e:
+                d, s, crudo = True, 0.0, f"averia: {type(e).__name__}: {e}"
+            veredicto.update(dirigida=d, s=s, crudo=crudo)
+
+        if compuerta:
+            threading.Thread(target=hilo_compuerta, daemon=True).start()
+
         # El productor manda SIEMPRE el pendiente que queda tras extraer un
         # trozo, en vez de que la pagina intente descontarlo por su cuenta.
         # Restar longitudes se desalinea en cuanto hay un espacio de mas, y el
@@ -1287,7 +1812,13 @@ class Puente(BaseHTTPRequestHandler):
             # camino de siempre, que es el probado.
             historial = pet.get("historial") or []
             hablante = pet.get("hablante")
-            if historial or hablante:
+            if pet.get("decir"):
+                # TEXTO FIJO, SIN LLM. Es como se dice el «¿qué pasa?» de una
+                # interrupcion: no hay nada que redactar, y meter un LLM en
+                # medio costaria 1,15-6,5 s que la frase no aprovecha. Se cuela
+                # por el mismo troceador y la misma sesion de voz que el resto.
+                origen = iter([pet["decir"]])
+            elif historial or hablante:
                 origen = preguntar_con_historial(pet["texto"], historial,
                                                  modelo, CFG["ollama"],
                                                  sistema, hablante)
@@ -1520,7 +2051,23 @@ class Puente(BaseHTTPRequestHandler):
                 #    Esperar a que el LLM escriba 25 caracteres mas cuesta mas
                 #    que la pausa que ahorra, porque escribe mas deprisa de lo
                 #    que el modelo habla.
-                while not cerrado:
+                #
+                #    PERO NO ANTES DE QUE LA COMPUERTA DE EL VISTO BUENO. Las
+                #    frases se quedan en la cola (que tiene sitio de sobra: 64
+                #    frases contra los ~0,7 s que tarda el veredicto) y salen
+                #    todas juntas en cuanto llega. Retener AQUI y no antes es
+                #    lo que hace que la compuerta salga del camino critico sin
+                #    arriesgarse a decir en voz alta algo que no era para el.
+                if compuerta and veredicto and not veredicto["dirigida"]:
+                    evento(tipo="no_dirigida", s=round(veredicto["s"], 3),
+                           crudo=veredicto.get("crudo", ""))
+                    break
+                entregar = not compuerta or bool(veredicto)
+                if entregar and compuerta and "visto" not in visto:
+                    visto.add("visto")
+                    evento(tipo="hito", hito="compuerta",
+                           s=round(veredicto["s"], 3))
+                while entregar and not cerrado:
                     try:
                         item = cola_trozos.get_nowait()
                     except queue.Empty:
@@ -1644,11 +2191,31 @@ def main():
                         os.path.join(os.path.dirname(os.path.dirname(
                             os.path.abspath(__file__))), "perfiles_voz.json")),
                     help="donde guardar los perfiles de voz (JSON)")
+    ap.add_argument("--whisper-url",
+                    default=os.environ.get("WHISPER_NATIVO_URL", ""),
+                    help="un whisper.cpp NATIVO (scripts/whisper-mac.sh) para "
+                         "la escucha continua, saltandose voz-api y ffmpeg. "
+                         "Medido en el mismo Mac con el mismo modelo small: "
+                         "0,28 s frente a 2,18 s en Docker, y la MISMA "
+                         "transcripcion. Sin esto todo va por --api-url")
+    ap.add_argument("--prompt-stt", default=os.environ.get(
+        "VOZ_PROMPT_STT",
+        "Vocabulario tecnico: homelab, Proxmox, WireGuard, Docker, contenedor, "
+        "Caddy, systemd, OpenClaw, Piper, whisper, backup, deploy, NixOS."),
+        help="sesgo de vocabulario para el whisper nativo. Es el mismo que "
+             "voz-api aplica por su cuenta, y se nota: sin el, 'WireGuard' "
+             "sale como 'We The War'")
+    ap.add_argument("--sin-solapar", action="store_true",
+                    help="devuelve la compuerta a su sitio de antes -- delante "
+                         "del LLM y en fila -- en vez de correrla en paralelo. "
+                         "Cuesta 0,47-0,70 s de latencia y ahorra los tokens "
+                         "de LLM que se tiran cuando la respuesta es NO")
     a = ap.parse_args()
     CFG.update(modelo=a.modelo, ollama=a.ollama, voz_url=a.voz_url, token=a.token,
                voz=a.voz, arranque=a.arranque, sistema=a.sistema, cfg=a.cfg,
                voz_api=a.api_url, token_api=a.token_api or a.token,
-               compuerta=a.compuerta)
+               compuerta=a.compuerta, whisper=a.whisper_url.rstrip("/"),
+               prompt_stt=a.prompt_stt, solapar=not a.sin_solapar)
     global OIDO
     OIDO = Oido(a.perfiles)
     OIDO.precargar()        # ~6 s de carga del modelo, en un hilo aparte
@@ -1657,7 +2224,16 @@ def main():
           f"{'' if a.modelo.lower().startswith('minimax') else ' via ' + a.ollama}")
     print(f"  voz : {a.voz_url}/tts/sesion/ws (una sesion por respuesta)")
     print(f"  stt : {a.api_url}/stt (el microfono de la pagina; whisper)")
-    print(f"  oido: compuerta {a.compuerta} · perfiles en {a.perfiles}")
+    if a.whisper_url:
+        print(f"        {a.whisper_url}/inference para la escucha continua "
+              f"(whisper nativo, ~8x mas rapido)")
+    else:
+        print("        [aviso] sin --whisper-url la escucha continua paga "
+              "2,1-2,9 s por frase en whisper.\n"
+              "                levanta el nativo con scripts/whisper-mac.sh")
+    print(f"  oido: compuerta {a.compuerta}"
+          f"{' (en paralelo con el LLM)' if not a.sin_solapar else ' (en fila)'}"
+          f" · perfiles en {a.perfiles}")
     if ws_conectar is None:
         print("  [aviso] falta el paquete 'websockets': el puente sirve la "
               "pagina pero no podra hablar.\n"

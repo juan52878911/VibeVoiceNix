@@ -576,7 +576,28 @@ python scripts/asistente.py      # Ollama -> voz, en la terminal
 # El de la página habla por la sesión de WebSocket, así que necesita el
 # paquete `websockets`: hay que arrancarlo con el venv, no con el python suelto.
 pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py
+
+# En un Mac, además: whisper NATIVO sobre Metal. Es la mitad de la latencia.
+./scripts/whisper-mac.sh &
+pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py \
+    --whisper-url http://127.0.0.1:8083
 ```
+
+**En un Mac, `whisper` en Docker cuesta 2,1 s por frase y nativo 0,28 s, con la
+misma transcripción palabra por palabra.** No es que el modelo `small` sea
+lento: es que los contenedores en macOS corren en una VM Linux que no ve Metal.
+Bajar a `base` ahorra otros 0,18 s y casi dobla los errores, así que no
+compensa. Los números y la batería, en `scripts/whisper-mac.sh` y
+`scripts/escucha_fidelidad.py`.
+
+**Se le puede cortar hablando.** La página baja el volumen en cuanto el VAD oye
+voz (~0,15 s) y calla del todo cuando la huella confirma que es una persona y
+no él mismo (~0,6 s), sin esperar a saber qué se ha dicho. Después entiende:
+«espera» o «¿cómo?» devuelven un «¿qué pasa?» sin pasar por el LLM ni por la
+compuerta; «para» le deja callado; «sigue» retoma por donde iba. Y si la
+interrupción no era para él, vuelve solo a su frase. Al cortarse guarda **lo
+que llegó a decir y lo que le quedaba** por separado, que es lo que hace que
+«detalla eso último» signifique algo.
 
 La página manda **cada frase a la misma sesión** en vez de una petición por
 frase, así que la respuesta entera es una sola locución. La velocidad distinta

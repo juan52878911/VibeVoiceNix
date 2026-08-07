@@ -42,6 +42,35 @@ construcción: da igual qué voz esté configurada, se aprende la que SUENA.
 TROZOS CORTOS: por debajo de ~0,8 s la huella es ruido (medido: un trozo de
 0,1 s dio coseno -0,04 contra su propio locutor). Se devuelve "indeterminado"
 en vez de adivinar.
+
+LA BARRERA: LA MISMA HUELLA, PERO A MEDIA FRASE Y CON MENOS AUDIO
+identificar() responde "quien es" y necesita margen. barrera() responde algo
+mas facil -- "esto NO es el asistente" -- y por eso se conforma con mucho
+menos. Es lo que permite callar mientras alguien empieza a hablar, en vez de
+esperar a que termine la frase y pase por whisper.
+
+MEDIDO (voz de sp-Spk0_woman contra su propio perfil y contra el perfil
+'asistente' aprendido de audio generado; 5-7 arranques distintos por casilla):
+
+    voz    antesala 0,4 s   antesala 0,2 s   sin antesala
+    0,3 s      4/7              4/7             3/7
+    0,4 s      6/7              6/7             6/7
+    0,5 s      5/6              6/6             6/6
+    0,6 s      6/6              6/6             6/6
+
+    la voz del ASISTENTE: 0 falsos de 5-6 por casilla, en TODAS.
+    tos, golpe y ruido de sala: coseno entre -0,06 y +0,04. Nunca pasan.
+
+Dos cosas que decide esta tabla:
+  - LA ANTESALA DEL VAD ESTORBA. Los 400 ms de sala que el VAD antepone para
+    no comerse la primera palabra son silencio, y diluyen el vector: con ellos
+    hacen falta 0,6 s de voz para acertar siempre; sin ellos, 0,5 s. La
+    barrera manda SOLO la parte sonora; la antesala se queda para whisper,
+    que si la necesita.
+  - MEDIO SEGUNDO DE VOZ BASTA, y errar por corto no rompe nada: si la
+    barrera no se decide, el trozo sigue su camino normal y la interrupcion
+    llega igual, solo que mas tarde. Por eso se prueba en escalones (0,35 ·
+    0,5 · 0,7 s): el primero acierta la mitad de las veces y cuesta 10 ms.
 """
 import json
 import os
@@ -65,6 +94,22 @@ import wave
 # pueden confundirse. Si se anade a alguien mas a la casa, hay que rematricular
 # a los dos con mas muestras y recalibrar esto.
 UMBRAL_PERFIL = float(os.environ.get("VIBEVOICE_UMBRAL_PERFIL", "0.25"))
+# RECONOCER A UNA PERSONA Y RECONOCERSE A SI MISMO NO PIDEN EL MISMO NUMERO,
+# y usar uno solo para las dos cosas tenia una consecuencia fea: una voz
+# DESCONOCIDA que rozara el 0,25 contra el perfil del asistente se archivaba
+# como "es su propia voz" y se ignoraba entera. Medido: sp-Spk0_woman, una voz
+# que el asistente no ha oido nunca, da 0,266 contra su perfil -- por encima
+# de 0,25. Un invitado se quedaba sin poder hablarle, y sin poder cortarle.
+#
+# El hueco para separarlo es enorme, porque su propia voz se parece MUCHO mas
+# a si misma que cualquier otra cosa: contra el perfil que aprende de su
+# propio audio, sus locuciones dan 0,602-1,00 (seis medidas) y esa voz ajena
+# 0,266. 0,45 parte ese hueco por el medio con 0,15 de margen a cada lado.
+#
+# Por que 0,25 sigue bien para las personas: una persona real cambia de
+# postura y de distancia y consigo misma solo llega a 0,274-0,506, mientras
+# que el asistente es una sintesis y sale casi igual siempre.
+UMBRAL_ASISTENTE = float(os.environ.get("VIBEVOICE_UMBRAL_ASISTENTE", "0.45"))
 # Solo se añade una huella nueva a un perfil existente si el parecido es
 # holgado: reforzar con casos dudosos degradaría el perfil con el tiempo.
 UMBRAL_REFUERZO = 0.70
@@ -77,6 +122,11 @@ MARGEN_HABLANDO = 0.10
 MAX_HUELLAS = 8
 # Por debajo de esto no hay timbre que medir (ver cabecera).
 MINIMO_SEGUNDOS = 0.8
+# La barrera se conforma con menos porque su pregunta es mas facil: no "quien
+# es" sino "esto no es el asistente". Con 0,35 s acierta la mitad de las veces
+# y con 0,5 s todas (tabla en la cabecera); por debajo de 0,3 s el vector es
+# ruido y no se responde.
+MINIMO_BARRERA = 0.3
 
 RITMO_HUELLA = 16_000
 
@@ -214,10 +264,10 @@ class Oido:
         return perfil
 
     # ---- huellas --------------------------------------------------------
-    def _huella(self, t):
+    def _huella(self, t, minimo=MINIMO_SEGUNDOS):
         """Tensor de voz -> vector unitario de 192d, o None si es muy corto."""
         import torch
-        if len(t) < MINIMO_SEGUNDOS * RITMO_HUELLA:
+        if len(t) < minimo * RITMO_HUELLA:
             return None
         modelo = self._cargar_modelo()
         if modelo is None:
@@ -270,7 +320,7 @@ class Oido:
             humanos = [(p, c) for p, c in pares if p["tipo"] != "asistente"]
             mejor, cos = max(humanos, key=lambda x: x[1], default=(None, -1.0))
 
-            if cos_asistente >= UMBRAL_PERFIL and cos_asistente >= cos:
+            if cos_asistente >= UMBRAL_ASISTENTE and cos_asistente >= cos:
                 return {"descartada": True, "perfil": "asistente",
                         "nombre": "el propio asistente",
                         "cos": round(cos_asistente, 3), "motivo": "es su propia voz",
@@ -293,6 +343,49 @@ class Oido:
                     "nombre": perfil["nombre"], "tipo": perfil["tipo"],
                     "cos": round(cos, 3),
                     "s": round(time.perf_counter() - t0, 3)}
+
+    def barrera(self, wav: bytes, minimo: float = MINIMO_BARRERA) -> dict:
+        """¿Está hablando una PERSONA ahora mismo? Medio segundo y ya.
+
+        La pregunta de identificar() es "de quién es esta voz" y hace falta
+        oír la frase entera. Ésta es más fácil -- "esto no es el asistente"
+        -- y se responde a media palabra, que es lo que permite callar
+        mientras alguien empieza a hablar. No toca los perfiles: se llama
+        varias veces por interrupción y reforzar con trozos de medio segundo
+        degradaría el perfil.
+
+        La regla es la MISMA que aplica identificar() con hablando=True (gana
+        un humano por encima del umbral y por MARGEN_HABLANDO sobre el
+        asistente), para que las dos vías no puedan contradecirse.
+
+        Devuelve {humano: bool, ...}. `humano: false` no significa "es el
+        asistente": significa "todavía no lo sé". Quien llama vuelve a
+        preguntar con más audio, y si nunca se decide, el trozo sigue por el
+        camino normal y la interrupción llega igual, más tarde.
+        """
+        t0 = time.perf_counter()
+        try:
+            t = _decodificar_wav(wav)
+        except Exception:
+            return {"humano": False, "motivo": "audio ilegible", "s": 0.0}
+        huella = self._huella(t, minimo=minimo)
+        if huella is None:
+            return {"humano": False, "motivo": "trozo demasiado corto",
+                    "s": round(time.perf_counter() - t0, 3)}
+        with self.candado:
+            pares = self._parecidos(huella)
+            cos_asistente = max((c for p, c in pares
+                                 if p["tipo"] == "asistente"), default=-1.0)
+            humanos = [(p, c) for p, c in pares if p["tipo"] != "asistente"]
+            mejor, cos = max(humanos, key=lambda x: x[1], default=(None, -1.0))
+        humano = (mejor is not None and cos >= UMBRAL_PERFIL
+                  and cos - max(cos_asistente, 0.0) >= MARGEN_HABLANDO)
+        return {"humano": humano,
+                "perfil": mejor["id"] if humano and mejor else None,
+                "nombre": mejor["nombre"] if humano and mejor else None,
+                "tipo": mejor["tipo"] if humano and mejor else None,
+                "cos": round(cos, 3), "cos_asistente": round(cos_asistente, 3),
+                "s": round(time.perf_counter() - t0, 3)}
 
     def matricular(self, nombre: str, wav: bytes) -> dict:
         """Alta (o refuerzo) a mano desde la página: nombre + unos segundos."""

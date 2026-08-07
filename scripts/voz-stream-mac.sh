@@ -27,7 +27,16 @@ command -v uv >/dev/null || { echo "hace falta uv: brew install uv"; exit 1; }
 # que trae MPS de serie. No hay que forzar nada.
 echo "==> dependencias"
 cd "$raiz/pkgs/vibevoice"
-uv sync --frozen --no-dev
+# --inexact ES OBLIGATORIO, y cuesta un rato descubrir por que. Sin el, uv
+# DESINSTALA lo que no este en el lock, y en este mismo venv viven speechbrain
+# y torchaudio -- las huellas de voz del asistente (scripts/oido.py), que no
+# son dependencia de VibeVoice y por tanto no estan en el lock. Resultado:
+# arrancar el motor de voz dejaba al asistente sin huellas
+# ("ModuleNotFoundError: No module named 'speechbrain'"), y sin huellas no hay
+# ni reconocimiento de locutor ni interrupcion: la pagina se repliega a medio
+# duplex y se queda sorda mientras habla. Pasaba en silencio, porque el puente
+# sigue sirviendo la pagina igual.
+uv sync --frozen --no-dev --inexact
 
 export HF_HOME="$cache/hf"
 voces="$cache/voces"
