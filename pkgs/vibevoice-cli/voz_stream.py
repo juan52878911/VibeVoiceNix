@@ -1506,8 +1506,7 @@ _COLA_PUNTUACION = re.compile(r"[^\s\w]+$")
 #      12 fronteras (3 semillas) y con ".\n\n" en 15 de 16 (4 semillas). La
 #      duracion queda erratica (0,2-2,1 s), pero eso lo arregla 2.
 #   2. AUDIO: un tope de silencio. Las pausas de ".\n" son fotogramas de 133 ms
-#      en silencio SEGUIDOS (RMS < 0,004; el habla mas debil mide >= 0,010, se
-#      midio fotograma a fotograma), asi que basta dejar pasar RESPIRO_FOTOGRAMAS
+#      en silencio SEGUIDOS, asi que basta dejar pasar RESPIRO_FOTOGRAMAS
 #      seguidos y recortar el resto. Las pausas de coma (2-3 fotogramas) no
 #      llegan al tope y quedan intactas.
 #
@@ -1525,6 +1524,49 @@ _COLA_PUNTUACION = re.compile(r"[^\s\w]+$")
 # La referencia historica: 7,27 s callado con "\n" en toda costura (el fallo),
 # 2,51 s cosiendo con espacio (sin aire). El punto medio es esto.
 #
+# LO QUE NO SE PUEDE RECORTAR ES EL FOTOGRAMA ENTERO (2026-08-06)
+# La primera version tiraba el fotograma completo cuando su RMS medio bajaba
+# del umbral, con la idea de que el silencio y el habla no se solapan. NO ES
+# CIERTO, y se midio: 29 locuciones, 6 voces en espanol, 3 semillas, 2 textos,
+# 400 s de audio, fotograma a fotograma.
+#
+#   suelo de sala   RMS  p50 0,00073   p99 0,00503   MAX 0,00554
+#   habla           RMS  MIN 0,00185   p1  0,00504   p50 0,055
+#
+# Es decir: el suelo LLEGA a 0,0055 y hay habla en 0,0018. Con la media de
+# 133 ms las dos poblaciones se pisan y NINGUN umbral las separa (el mejor
+# posible deja 13 fotogramas mal clasificados). El motivo es de bulto: el
+# fotograma de la COSTURA es medio silencio y medio palabra -- el ataque de
+# la primera palabra tras la pausa entra a los 70-120 ms de sus 133 --, asi
+# que su media queda en 0,003-0,0045 y el recorte se llevaba el ataque
+# entero. Medido en las mismas 29 locuciones: 9 de las 54 costuras (17 %)
+# perdian el arranque de la palabra, y la muestra mas fuerte que se tiraba
+# llegaba a |x| = 0,145 -- a -17 dBFS eso no es suelo de sala, es la voz.
+# El WER no lo ve (2,5 % con recorte contra 3,0 % sin el: whisper rellena la
+# consonante que falta), pero se oye como que "el audio se corta un poco".
+#
+# EL ARREGLO: decidir con el PICO, y recortar solo la CABEZA callada.
+# La amplitud de pico del fotograma si separa las dos cosas en la costura,
+# con un hueco vacio entre medias:
+#
+#   costuras que son silencio de verdad   pico |x| <= 0,0185
+#   costuras que llevan el ataque dentro  pico |x| >= 0,0406
+#
+# RESPIRO_PICO = 0,03 cae en ese hueco. Un fotograma por debajo se tira
+# entero, como antes; uno por encima NO se tira: se emite desde justo antes
+# de su primera muestra fuerte (con RESPIRO_PRERROLLO de margen para no
+# cortar la rampa del ataque) y se recorta solo el silencio de delante,
+# ~84 ms de media. El contador de callados NO se rearma al rescatar: la
+# pausa sigue midiendo lo mismo, que es justo lo que este bloque vino a
+# arreglar. En habla floja continuada (RMS bajo el umbral pero con picos)
+# la primera muestra fuerte llega antes del prerrollo, asi que el fotograma
+# sale entero y no se recorta nada.
+#
+# MEDIDO en el mismo corpus, antes y despues:
+#   recorte total        34,27 s -> 33,67 s (de 400 s: el aire no cambia)
+#   pico max descartado  0,1452 -> 0,0290  (deja de tirarse voz)
+#   costuras con ataque perdido  9/54 -> 0/54
+#
 # VIBEVOICE_RESPIRO=0 lo apaga (vuelve la costura con espacio y ningun
 # recorte, bit a bit como antes), y cada sesion puede pedirlo o rechazarlo con
 # el campo `respiro`. El umbral y el tope tienen mando por si otra voz tiene
@@ -1532,6 +1574,14 @@ _COLA_PUNTUACION = re.compile(r"[^\s\w]+$")
 RESPIRO_ACTIVO = os.environ.get("VIBEVOICE_RESPIRO", "1") not in ("0", "no")
 RESPIRO_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_RESPIRO_FOTOGRAMAS", "3"))
 RESPIRO_UMBRAL = float(os.environ.get("VIBEVOICE_RESPIRO_UMBRAL", "0.006"))
+# Amplitud de pico por encima de la cual un fotograma NO se tira aunque su
+# media diga "callado": lleva senal dentro. Con 0 se vuelve al recorte de
+# fotograma entero de la primera version (y a comerse los ataques).
+RESPIRO_PICO = float(os.environ.get("VIBEVOICE_RESPIRO_PICO", "0.03"))
+# Muestras que se dejan DELANTE de esa primera muestra fuerte, para no cortar
+# la rampa del ataque ni meter un escalon audible en la costura. 240 = 10 ms
+# a 24 kHz; ahi la senal esta todavia en el suelo, asi que el empalme no suena.
+RESPIRO_PRERROLLO = int(os.environ.get("VIBEVOICE_RESPIRO_PRERROLLO", "240"))
 # Puntuacion fuerte (con sus comillas o parentesis de cierre) seguida de
 # espacio: la frontera de frase. [ \t]+ y no \s+ a proposito: un "\n" que ya
 # venga del cliente es suyo y se queda tal cual.
@@ -1764,6 +1814,31 @@ class TextoEnCurso:
             self.esperado += time.monotonic() - marca
 
 
+def _recortar_callado(trozo):
+    """De un fotograma que el tope del respiro manda recortar, lo que hay que
+    EMITIR. None si esta callado de verdad y se puede tirar entero.
+
+    El fotograma dura 133 ms y el ataque de la palabra siguiente cae DENTRO de
+    el, asi que la media no vale para decidir (ver el bloque RESPIRO). Se mira
+    el pico: si no llega a RESPIRO_PICO es suelo de sala y se va entero; si
+    llega, se devuelve desde RESPIRO_PRERROLLO muestras antes de la primera
+    fuerte -- se tira solo la cabeza callada y el ataque se salva.
+
+    Se aplana a 1-D porque a partir de aqui el trozo puede ser mas corto que
+    un fotograma y lo unico que se hace con el es concatenarlo (a_pcm16 ya
+    hace reshape(-1), y `numel` no cambia de sentido)."""
+    plano = trozo.reshape(-1)
+    if RESPIRO_PICO <= 0:
+        return None
+    # nonzero() y no argmax(): argmax no promete devolver la PRIMERA de varias
+    # posiciones maximas, y aqui la primera es justo lo que se busca.
+    fuertes = torch.nonzero(plano.abs() >= RESPIRO_PICO)
+    if fuertes.numel() == 0:
+        return None
+    primera = int(fuertes[0])
+    return plano[max(0, primera - RESPIRO_PRERROLLO):]
+
+
 class ColaAudioSesion:
     """El `audio_streamer` que espera generate(), volcado a una cola asincrona.
 
@@ -1816,9 +1891,10 @@ class ColaAudioSesion:
         # El tope de silencio del respiro (ver el bloque RESPIRO): con "\n"
         # tras cada punto el modelo mete su parada de fin de locucion, de
         # duracion erratica (0,5-2,7 s); aqui se deja pasar el principio y se
-        # recorta el resto. El contador NO se reinicia entre generate() de la
-        # misma sesion a proposito: la costura de un tope de caché tambien es
-        # silencio y tambien merece tope.
+        # recorta el resto. El contador arranca de cero en cada generate()
+        # porque _generar() monta una cola nueva: en la costura de un tope de
+        # caché eso deja pasar el tope entero otra vez, que es el lado
+        # prudente -- mete algo de aire de mas, nunca se come audio.
         self.respiro = respiro
         self._callado_seguido = 0
 
@@ -1840,14 +1916,17 @@ class ColaAudioSesion:
             trozo = trozos[i].detach().float().cpu()
             if self.respiro:
                 # Un fotograma "callado" es el suelo de sala de una pausa del
-                # modelo: RMS medido <= 0,004 en pausa, >= 0,010 en el habla
-                # mas debil. Pasado el tope, el fotograma se tira ENTERO --
-                # ni se emite ni se retiene -- y el primer fotograma con voz
-                # rearma el contador.
+                # modelo. Pasado el tope se recorta, pero NO a ciegas: el
+                # fotograma de la costura lleva dentro el ataque de la palabra
+                # siguiente y tirarlo entero se lo comia (ver el bloque
+                # RESPIRO). Solo se tira lo que de verdad esta callado; lo que
+                # lleva senal se emite desde justo antes de ella.
                 if float(trozo.pow(2).mean().sqrt()) < RESPIRO_UMBRAL:
                     self._callado_seguido += 1
                     if self._callado_seguido > RESPIRO_FOTOGRAMAS:
-                        continue
+                        trozo = _recortar_callado(trozo)
+                        if trozo is None:
+                            continue
                 else:
                     self._callado_seguido = 0
             self.trozos += 1
@@ -2418,7 +2497,9 @@ def health() -> dict:
                      "tope_cache": TOPE_CACHE,
                      "respiro": {"activo": RESPIRO_ACTIVO,
                                  "fotogramas": RESPIRO_FOTOGRAMAS,
-                                 "umbral_rms": RESPIRO_UMBRAL},
+                                 "umbral_rms": RESPIRO_UMBRAL,
+                                 "umbral_pico": RESPIRO_PICO,
+                                 "prerrollo": RESPIRO_PRERROLLO},
                      "websocket": "/tts/sesion/ws"},
     }
 
