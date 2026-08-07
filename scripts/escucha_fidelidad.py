@@ -22,6 +22,12 @@ QUE MIDE
 RESULTADOS de la pasada de referencia (2026-08-06, Mac M-series, todo local):
   compuerta qwen3:4b    24/24 aciertos · 0,70 s de media, 0,83 el peor
   compuerta qwen3:1.7b  17/24 (7 falsos positivos) · 0,31 s. NO lo uses.
+  compuerta SIN Ollama  Qwen3-4B-Instruct-2507 GGUF Q4_K_M en llama-server
+                        (--ollama http://127.0.0.1:PUERTO, decidir() detecta
+                        el servidor sola): 24/24 · 0,47 s de media, 0,64 el
+                        peor. Menos modelo NO llega, medido con esta bateria:
+                        Qwen2.5-3B 21/24 · 1.5B 19/24 · 0.5B 15/24 ·
+                        Llama-3.2-1B 14/24.
   whisper /stt          2,1-2,9 s para locuciones de 1,9-10,3 s. ES EL
                         SUMANDO GORDO de la latencia: whisper.cpp (modelo
                         small) corre en Docker, donde no hay Metal, y el

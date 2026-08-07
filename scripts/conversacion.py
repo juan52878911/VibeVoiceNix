@@ -33,6 +33,22 @@ más que qwen3:1.7b y es el defecto; el pequeño queda para máquinas justas.
 Si la compuerta se configura con un modelo MiniMax-*, funciona igualmente
 (thinking desactivado, SI/NO en texto), asumiendo la espera.
 
+SIN OLLAMA: LO MISMO CONTRA llama-server (llama.cpp), MEDIDO 2026-08-06
+Para el empaquetado final (Nix, sin servicios externos) la compuerta corre
+igual contra un llama-server con Qwen3-4B-Instruct-2507 en GGUF Q4_K_M
+fijado por hash. Con la bateria de escucha_fidelidad.py, en el mismo Mac:
+
+    qwen3:4b via Ollama (referencia del dia)      24/24 · 0,65 s de media
+    2507 via llama-server, Metal                  24/24 · 0,47 s · RSS 3,1 GB
+    2507 via llama-server, solo CPU (8 hilos M4)  24/24 · 1,31 s
+
+Menos modelo NO llega, medido con la misma bateria y el mismo esquema:
+Qwen2.5-3B 21/24 · qwen3:1.7b 17/24 · Qwen2.5-1.5B 19/24 · Qwen2.5-0.5B
+15/24 · Llama-3.2-1B 14/24. La compuerta necesita un ~4B y por tanto GPU
+(en CPU rompe el segundo) y ~3 GB: vive donde el puente, no en la VM.
+decidir() distingue el servidor sola (GET /props, que Ollama no tiene), asi
+que la misma opcion --ollama vale para los dos y quitarlo no toca nada.
+
 CUANTO HISTORIAL Y POR QUE
   - La compuerta ve los últimos 6 apuntes (3 turnos). Le bastan para pillar
     continuaciones («¿y en euros?», «vale, hazlo») y más solo la encarece:
@@ -48,6 +64,7 @@ empieza de cero, que es lo esperable.
 import json
 import re
 import time
+import urllib.error
 import urllib.request
 
 from asistente import MINIMAX_API, clave_minimax
@@ -127,6 +144,8 @@ def decidir(texto, historial, hablante, modelo, url_ollama,
     try:
         if modelo.lower().startswith("minimax"):
             crudo = _decidir_minimax(guion, modelo)
+        elif _es_llamacpp(url_ollama):
+            crudo = _decidir_llamacpp(guion, url_ollama)
         else:
             crudo = _decidir_ollama(guion, modelo, url_ollama)
     except Exception as e:
@@ -161,6 +180,52 @@ def _decidir_ollama(guion, modelo, url):
                                  headers={"content-type": "application/json"})
     d = json.load(urllib.request.urlopen(pet, timeout=60))
     return d.get("response", "")
+
+
+_TIPO_URL = {}
+
+
+def _es_llamacpp(url):
+    """True si en la URL escucha un llama-server (llama.cpp), no Ollama.
+
+    Se distingue UNA vez por proceso con GET /props: llama-server lo contesta
+    y Ollama devuelve 404. Un fallo de conexion no se cachea -- lo recoge el
+    try de decidir(), que ante averia abre la compuerta."""
+    if url not in _TIPO_URL:
+        try:
+            with urllib.request.urlopen(f"{url}/props", timeout=5) as r:
+                _TIPO_URL[url] = r.status == 200
+        except urllib.error.HTTPError:
+            _TIPO_URL[url] = False
+    return _TIPO_URL[url]
+
+
+def _decidir_llamacpp(guion, url):
+    # El mismo esquema que con Ollama, por el endpoint OpenAI de llama-server.
+    # max_tokens corto A PROPOSITO: la gramatica del esquema permite blancos
+    # tras cerrar el JSON y el 2507 los emite en vez del EOS justo en los
+    # casos NO (medido: sin tope se va a ~2 s por decision; con tope, 0,5 s).
+    cuerpo = {"model": "compuerta", "stream": False,
+              "messages": [{"role": "system", "content": COMPUERTA_SISTEMA},
+                           {"role": "user", "content": guion}],
+              "temperature": 0, "max_tokens": 12,
+              "json_schema": {"type": "object",
+                              "properties": {"dirigida": {"type": "boolean"}},
+                              "required": ["dirigida"]}}
+    pet = urllib.request.Request(f"{url}/v1/chat/completions", method="POST",
+                                 data=json.dumps(cuerpo).encode(),
+                                 headers={"content-type": "application/json"})
+    d = json.load(urllib.request.urlopen(pet, timeout=60))
+    crudo = d["choices"][0]["message"]["content"].strip()
+    # Si el tope truncó el JSON, el true/false ya emitido decide igual: la
+    # gramatica garantiza que solo puede aparecer el del veredicto.
+    try:
+        json.loads(crudo)
+    except ValueError:
+        bajo = crudo.lower()
+        if "true" in bajo or "false" in bajo:
+            return json.dumps({"dirigida": "true" in bajo})
+    return crudo
 
 
 def _decidir_minimax(guion, modelo):
