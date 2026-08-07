@@ -87,13 +87,35 @@ ADEMAS, DESDE LA PAGINA
     http://127.0.0.1:8090 funciona; desde otra maquina de la red, no, y el
     boton sale deshabilitado explicando por que.
 
+ESCUCHA CONTINUA (nueva, y arranca APAGADA)
+Un interruptor en la pagina abre el microfono EN CONTINUO, sin palabra de
+activacion: la pagina segmenta por energia (VAD), cada intervencion pasa por
+POST /escuchar -- huella de voz para saber QUIEN habla, whisper para el texto,
+y una compuerta (un LLM pequeño y rapido) que decide si iba dirigida al
+asistente -- y solo entonces se responde, con el historial de la conversacion
+detras. Quien habla se etiqueta contra perfiles de voz (scripts/oido.py) que
+se crean solos para desconocidos y se matriculan o renombran desde la pagina.
+
+La realimentacion acustica (el asistente oyendose a si mismo y contestandose)
+se corta por HUELLA DE VOZ: el puente aprende la voz que el mismo emite --
+guarda unos segundos del PCM de cada respuesta y refresca el perfil
+'asistente' -- y descarta todo lo que case con ella. Por eso se puede
+interrumpir mientras habla. Si no hay modelo de huellas, la pagina se repliega
+a medio duplex: ignora el microfono mientras suena la voz. Los porques y las
+medidas, en las cabeceras de scripts/oido.py y scripts/conversacion.py.
+
 DEPENDENCIA: el cliente de websocket (`websockets`, el mismo que usa
 scripts/ws_fidelidad.py). Esta en pkgs/vibevoice/.venv, que es con lo que hay
 que arrancar esto:
 
     pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py
+
+Para las huellas de voz hacen falta ademas speechbrain y torchaudio en ese
+mismo venv (cinco paquetes; torch ya estaba). Sin ellos todo lo demas
+funciona y la escucha continua pasa a medio duplex.
 """
 import argparse
+import base64
 import json
 import os
 import queue
@@ -110,6 +132,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from narrador import trocear  # noqa: E402
 from asistente import ABRE_PENSAMIENTO, CIERRA_PENSAMIENTO, limpiar, preguntar  # noqa: E402
+from conversacion import RECUERDO_COMPUERTA, decidir, preguntar_con_historial  # noqa: E402
+from oido import Oido  # noqa: E402
 
 try:
     from websockets.exceptions import ConnectionClosed
@@ -121,6 +145,8 @@ except ImportError:  # pragma: no cover - solo para poder dar un error legible
         """Marcador para que el modulo importe aunque falte `websockets`."""
 
 CFG = {}
+# Los perfiles de voz (scripts/oido.py). None si main() no llego a crearlos.
+OIDO = None
 
 # Sin ruido del socket durante esto, se da por rota la sesion. El plazo largo
 # es a proposito: el servicio deja de emitir mientras espera texto -- hasta
@@ -212,6 +238,30 @@ select{background:var(--f);color:var(--t);border:1px solid var(--b);
  border:1px solid var(--b);border-radius:6px;padding:.35rem}
 .est{margin-top:.75rem;font-size:.88rem;color:var(--s)}
 .est.err{color:#e0725f}
+/* La escucha continua: el chip dice EN QUE ESTA el oido ahora mismo. */
+.chip{padding:.25rem .7rem;border-radius:99px;font-size:.8rem;
+ border:1px solid var(--b);color:var(--s);white-space:nowrap}
+.chip[data-e=escuchando]{border-color:#2b4a6f;color:#7fb3e8}
+.chip[data-e=voz]{border-color:#7a5b1e;color:#f0c274;animation:latir 1.1s ease-in-out infinite}
+.chip[data-e=proc]{border-color:#4a3a6b;color:#b8a3e8;animation:latir 1.1s ease-in-out infinite}
+.chip[data-e=pensando]{border-color:#4a3a6b;color:#b8a3e8;animation:latir 1.1s ease-in-out infinite}
+.chip[data-e=hablando]{border-color:#1f4033;color:#7fd6a8}
+.vu{width:7rem;height:.55rem;background:var(--f);border:1px solid var(--b);
+ border-radius:99px;overflow:hidden;align-self:center}
+.vu i{display:block;height:100%;width:0;background:var(--a);transition:width .06s linear}
+.log{margin-top:1rem;padding-top:.9rem;border-top:1px solid var(--b);
+ font-size:.82rem;color:var(--s);max-height:16rem;overflow:auto;
+ display:flex;flex-direction:column;gap:.4rem}
+.log .quien{color:var(--a);font-weight:600}
+.log .dicho{color:var(--t)}
+.log .meta{font-size:.72rem;color:#6b7280;font-variant-numeric:tabular-nums}
+.log .fuera{opacity:.65}
+.perfil{display:flex;gap:.6rem;align-items:center;font-size:.85rem}
+.perfil input{flex:1;background:var(--f);color:var(--t);border:1px solid var(--b);
+ border-radius:6px;padding:.4rem}
+.perfil .tipo{font-size:.72rem;color:#6b7280;white-space:nowrap}
+#perfNombre{background:var(--f);color:var(--t);border:1px solid var(--b);
+ border-radius:6px;padding:.5rem}
 </style></head><body><main>
 <header><h1>Asistente de voz</h1>
 <p class="sub">Escribe y responde hablando. Los tres tiempos de abajo separan
@@ -280,6 +330,34 @@ modelo esperando a la segunda."><div class="n" id="h4">—</div><div class="e">s
     <span><i class="t son">sonando</i> el modelo va por aquí</span>
   </div>
   <div class="est" id="est"></div>
+</div>
+
+<div class="caja">
+  <div class="fila">
+    <button id="esc">Activar escucha continua</button>
+    <span class="chip" id="escEst" data-e="apagada">apagada</span>
+    <span class="vu" title="nivel del micrófono contra el umbral de voz"><i id="vui"></i></span>
+  </div>
+  <p class="nota">Micrófono <b>siempre abierto</b>, sin palabra de activación:
+  cada intervención se transcribe y un modelo decide si iba dirigida al
+  asistente; solo entonces contesta, con la conversación entera detrás.
+  Sabe <b>quién habla</b> por la huella de la voz (el timbre, no lo que se
+  dice) y desecha la suya propia, así que puedes interrumpirle mientras habla.
+  Los desconocidos reciben un perfil automático; ponles nombre abajo.
+  Arranca apagada y solo funciona en <code>127.0.0.1</code>, como el botón
+  Hablar.</p>
+  <details class="ajustes"><summary>Perfiles de voz (quién es quién)</summary>
+    <div id="perfLista" style="display:flex;flex-direction:column;gap:.5rem;margin-top:.9rem"></div>
+    <div class="fila">
+      <input id="perfNombre" placeholder="nombre">
+      <button id="perfAlta" class="sec">Grabar 5 s y matricular</button>
+    </div>
+    <p class="nota">Es un diferenciador, no una cerradura: separa personas para
+    poder colgarles preferencias y memoria, no autentica a nadie. Renombra
+    escribiendo en la casilla. El perfil «Asistente» se aprende solo, de su
+    propia voz, cada vez que habla.</p>
+  </details>
+  <div class="log" id="log"></div>
 </div>
 </main><script>
 const $=i=>document.getElementById(i);
@@ -391,23 +469,44 @@ function marca(id,estado){
   if(t){ t.estado=estado; pintar(); }
 }
 
-$("ir").addEventListener("click",async()=>{
-  const q=$("q").value.trim(); if(!q) return;
-  $("ir").disabled=true; $("parar").hidden=false;
+// ---- una pregunta, de punta a punta -----------------------------------
+// Antes esto vivia dentro del boton Preguntar. Se saca a funcion porque la
+// escucha continua lanza EXACTAMENTE el mismo camino (misma sesion de voz,
+// mismos colores, mismos hitos) y necesita dos cosas mas: que la promesa se
+// resuelva cuando el audio ha TERMINADO de sonar, y poder abortar la
+// locucion en curso cuando alguien interrumpe. El contexto de audio y el
+// abortador son LOCALES (actx/ab) ademas de globales: si una interrupcion
+// arranca una pregunta nueva mientras la vieja aun limpia, cada una cierra
+// SU contexto y no el de la otra.
+const historial=[];        // la conversacion entera: {rol, texto, quien}
+let enPregunta=false, enAudio=false, preguntaEnCurso=null;
+function lanzarPregunta(q,extra){
+  preguntaEnCurso=preguntarVoz(q,extra||{}).finally(()=>{preguntaEnCurso=null;});
+  return preguntaEnCurso;
+}
+async function preguntarVoz(q,extra){
+  $("ir").disabled=true; $("parar").hidden=false; enPregunta=true;
   ["h1","h2","h3","h4"].forEach(i=>$(i).textContent="—");
   trozos=[]; pendiente=""; pintar(); di("preguntando…");
-  ctx=new AudioContext(); cabeza=0; aborto=new AbortController();
+  const actx=new AudioContext(); const ab=new AbortController();
+  ctx=actx; cabeza=0; aborto=ab;
   // La velocidad NO viaja al servidor: el websocket de sesion la rechaza a
   // proposito (ver la nota del panel). Se aplica aqui con playbackRate, que
   // es gratis pero mueve el tono. Se congela al empezar para que moverla a
   // mitad no descuadre el reloj de encolado.
   const vel=+$("vel").value;
   const t0=performance.now(); let resto=new Uint8Array(0), primero=0, hitos={};
+  const marcas=extra.marcas||{}; marcas.t0=t0;
+  let respuesta="";
+  historial.push({rol:"usuario",texto:q,quien:extra.hablante||undefined});
+  while(historial.length>24) historial.shift();
   try{
-    const r=await fetch("/preguntar",{method:"POST",signal:aborto.signal,
+    const r=await fetch("/preguntar",{method:"POST",signal:ab.signal,
       headers:{"content-type":"application/json"},
       body:JSON.stringify({texto:q,modelo:$("modelo").value,pensar:$("pensar").checked,
         sistema:$("sistema").value,
+        historial:historial.slice(0,-1),   // lo anterior a esta pregunta
+        hablante:extra.hablante||null,
         voz:$("voz").value, cfg:+$("cfg").value,
         pasos:+$("pasos").value,
         semilla:$("semilla").value===""?null:+$("semilla").value})});
@@ -428,13 +527,14 @@ $("ir").addEventListener("click",async()=>{
           const ev=JSON.parse(new TextDecoder().decode(carga));
           switch(ev.tipo){
             case "hito":
-              if(ev.hito==="token") $("h1").textContent=ev.s.toFixed(2)+"s";
-              if(ev.hito==="frase"){ hitos.frase=ev.s; $("h2").textContent=ev.s.toFixed(2)+"s"; }
+              if(ev.hito==="token"){ marcas.token=ev.s; $("h1").textContent=ev.s.toFixed(2)+"s"; }
+              if(ev.hito==="frase"){ hitos.frase=ev.s; marcas.frase=ev.s; $("h2").textContent=ev.s.toFixed(2)+"s"; }
               break;
             case "token":   // el LLM escribio: solo cambia lo pendiente
               pendiente=ev.pendiente; pintar(); break;
             case "trozo":   // se cerro un trozo: pasa a tener entidad propia
               trozos.push({id:ev.id,texto:ev.texto,estado:"seg"});
+              respuesta+=ev.texto+" ";
               pendiente=ev.pendiente; pintar(); break;
             case "sintetizando": marca(ev.id,"sint"); break;  // entregado a la sesion
             case "sonando":     marca(ev.id,"son");  break;  // el modelo va por aqui
@@ -448,15 +548,17 @@ $("ir").addEventListener("click",async()=>{
         const pcm=new Int16Array(carga.slice(0,pares).buffer);
         const f32=new Float32Array(pcm.length);
         for(let k=0;k<pcm.length;k++) f32[k]=pcm[k]/32768;
-        if(!primero){ primero=(performance.now()-t0)/1000;
+        if(!primero){ primero=(performance.now()-t0)/1000; marcas.sonido=primero;
           $("h3").textContent=primero.toFixed(2)+"s";
           if(hitos.frase) $("h4").textContent=(primero-hitos.frase).toFixed(2)+"s";
-          di("hablando…"); cabeza=ctx.currentTime+0.15; }
-        const buf=ctx.createBuffer(1,f32.length,24000);
+          di("hablando…"); enAudio=true;
+          if(escucha.activa) estEsc("hablando","hablando");
+          cabeza=actx.currentTime+0.15; }
+        const buf=actx.createBuffer(1,f32.length,24000);
         buf.copyToChannel(f32,0);
-        const src=ctx.createBufferSource(); src.buffer=buf; src.connect(ctx.destination);
+        const src=actx.createBufferSource(); src.buffer=buf; src.connect(actx.destination);
         src.playbackRate.value=vel;
-        if(cabeza<ctx.currentTime) cabeza=ctx.currentTime;
+        if(cabeza<actx.currentTime) cabeza=actx.currentTime;
         // A otra velocidad el trozo dura otra cosa: si no se divide, el
         // siguiente se encola tarde y se oye un hueco en cada empalme.
         src.start(cabeza); cabeza+=buf.duration/vel;
@@ -466,16 +568,375 @@ $("ir").addEventListener("click",async()=>{
     // Los datos acaban ANTES que el sonido: se genera mas rapido de lo que
     // se escucha (RTF < 1), asi que al terminar la descarga aun queda cola
     // encolada en Web Audio. Se avisa cuando de verdad se calla.
-    const restante=Math.max(0,(cabeza-ctx.currentTime)*1000);
+    const restante=Math.max(0,(cabeza-actx.currentTime)*1000);
     di(restante>200?"terminando de hablar…":"listo.");
-    setTimeout(()=>{ di("listo."); $("ir").disabled=false; $("parar").hidden=true;
-                     ctx.close(); }, restante+250);
-    return;
+    await new Promise(rs=>setTimeout(rs,restante+250));
+    di("listo.");
   }catch(e){ di(e.name==="AbortError"?"parado.":"error: "+e.message,e.name!=="AbortError"); }
   $("ir").disabled=false; $("parar").hidden=true;
-  try{ ctx.close(); }catch(_){}
+  enPregunta=false; enAudio=false;
+  try{ actx.close(); }catch(_){}
+  // Al historial va lo que LLEGO A DECIR: si le interrumpieron a mitad, eso
+  // es lo que la otra persona oyo, y es a eso a lo que contestara.
+  if(respuesta.trim()) historial.push({rol:"asistente",texto:respuesta.trim()});
+  while(historial.length>24) historial.shift();
+  if(escucha.activa&&!enPregunta) estEsc("escuchando");
+  return marcas;
+}
+$("ir").addEventListener("click",()=>{
+  const q=$("q").value.trim(); if(!q) return;
+  lanzarPregunta(q);
 });
 $("parar").addEventListener("click",()=>aborto&&aborto.abort());
+
+// ================== escucha continua ===================================
+// El microfono SIEMPRE abierto y sin palabra de activacion. El bucle:
+//
+//   VAD (energia, aqui) -> POST /escuchar (huella -> whisper -> compuerta)
+//   -> si iba dirigida al asistente, lanzarPregunta() con el historial
+//
+// REALIMENTACION -- el asistente oyendose por el altavoz -- tres capas:
+//   1. la huella de voz: el puente aprende la voz que EL MISMO emite y
+//      descarta lo que case con ella; mientras habla, ademas, solo deja
+//      pasar voz que gane CLARAMENTE a un perfil humano. Por eso se le
+//      puede interrumpir.
+//   2. echoCancellation en getUserMedia: el navegador resta del microfono
+//      lo que sale por el altavoz. Ayuda; con altavoces no basta sola.
+//   3. sin modelo de huellas: medio duplex -- el microfono se ignora
+//      mientras el asistente habla o piensa. No hay interrupcion, pero
+//      tampoco puede contestarse a si mismo.
+//
+// VAD: RMS por bloques de 32 ms con suelo de ruido adaptativo (EMA solo
+// cuando NO hay voz, para no aprenderse a si mismo como ruido). Arranca con
+// ~100 ms seguidos por encima del umbral alto y cierra tras 600 ms por
+// debajo del bajo. 600 y no 300: las pausas internas de una frase dictada
+// llegan a 400-500 ms (medido con locuciones de Piper: hasta 0,46 s entre
+// clausulas) y un cierre de 300 ms parte la frase en dos. Se antepone
+// ademas ~400 ms de antesala para no comerse el arranque de la primera
+// palabra, que el umbral solo pilla ya empezada.
+class Vad{
+  constructor(al){
+    this.al=al; this.rate=48000;
+    this.cierreMs=600; this.preMs=400; this.minVozMs=250; this.maxMs=15000;
+    this.ruido=0.004; this.resto=new Float32Array(0);
+    this.enVoz=false; this.pre=[]; this.seg=[]; this.silencio=0;
+    this.conVoz=0; this.arranque=0;
+  }
+  umbrales(){ return [Math.max(0.012,this.ruido*4), Math.max(0.006,this.ruido*2.5)]; }
+  alimentar(f32,rate){
+    if(rate!==this.rate){ this.rate=rate; this.resto=new Float32Array(0); }
+    const tam=Math.round(rate*0.032);
+    let d=new Float32Array(this.resto.length+f32.length);
+    d.set(this.resto); d.set(f32,this.resto.length);
+    let i=0;
+    for(; i+tam<=d.length; i+=tam) this._bloque(d.subarray(i,i+tam));
+    this.resto=d.slice(i);
+  }
+  _bloque(b){
+    let s=0; for(let k=0;k<b.length;k++) s+=b[k]*b[k];
+    const rms=Math.sqrt(s/b.length), [alto,bajo]=this.umbrales();
+    const ms=b.length/this.rate*1000;
+    this.al.nivel&&this.al.nivel(rms,alto);
+    if(!this.enVoz){
+      this.pre.push(b.slice());
+      while((this.pre.length-1)*ms>this.preMs) this.pre.shift();
+      if(rms>alto){
+        if((this.arranque+=ms)>=90){
+          this.enVoz=true; this.seg=this.pre; this.pre=[];
+          this.silencio=0; this.conVoz=this.arranque; this.arranque=0;
+          this.al.voz&&this.al.voz(true);
+        }
+      }else{
+        this.arranque=0;
+        this.ruido=this.ruido*0.95+rms*0.05;
+      }
+    }else{
+      this.seg.push(b.slice());
+      if(rms>bajo){ this.silencio=0; this.conVoz+=ms; }
+      else this.silencio+=ms;
+      if(this.silencio>=this.cierreMs||this.seg.length*ms>=this.maxMs) this._cerrar();
+    }
+  }
+  _cerrar(){
+    const bloques=this.seg; this.seg=[]; this.enVoz=false;
+    this.al.voz&&this.al.voz(false);
+    if(this.conVoz<this.minVozMs) return;      // un golpe, una tos: fuera
+    let n=0; for(const b of bloques) n+=b.length;
+    const f32=new Float32Array(n); let o=0;
+    for(const b of bloques){ f32.set(b,o); o+=b.length; }
+    this.al.segmento&&this.al.segmento(f32,this.rate);
+  }
+}
+
+const escucha={activa:false,huellas:false,ctx:null,flujo:null,nodo:null,
+               vad:null,cola:[],procesando:false,ultimaRespuesta:0,
+               vozConAudio:false};
+function estEsc(txt,clase){ $("escEst").textContent=txt; $("escEst").dataset.e=clase||txt; }
+function escapar(t){return String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function apunta(html,clase){
+  const e=document.createElement("div"); if(clase) e.className=clase;
+  e.innerHTML=html; $("log").prepend(e);
+  while($("log").children.length>40) $("log").lastChild.remove();
+}
+function codificarWav(f32,rate){
+  const n=f32.length, b=new ArrayBuffer(44+n*2), v=new DataView(b);
+  const s=(o,t)=>{for(let i=0;i<t.length;i++)v.setUint8(o+i,t.charCodeAt(i))};
+  s(0,"RIFF"); v.setUint32(4,36+n*2,true); s(8,"WAVEfmt ");
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,rate,true); v.setUint32(28,rate*2,true);
+  v.setUint16(32,2,true); v.setUint16(34,16,true);
+  s(36,"data"); v.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++){const x=Math.max(-1,Math.min(1,f32[i]));
+    v.setInt16(44+i*2,x<0?x*32768:x*32767,true);}
+  return b;
+}
+function b64(buf){
+  let s=""; const u=new Uint8Array(buf);
+  for(let i=0;i<u.length;i+=32768) s+=String.fromCharCode.apply(null,u.subarray(i,i+32768));
+  return btoa(s);
+}
+function prepararVad(){
+  escucha.vad=new Vad({
+    nivel:(rms,umbral)=>{$("vui").style.width=Math.min(100,rms/(umbral*3)*100)+"%";},
+    voz:v=>{
+      if(v){ escucha.vozConAudio=enAudio;
+             if(escucha.activa&&!enPregunta) estEsc("voz detectada","voz"); }
+      else if(escucha.activa&&!enPregunta&&!escucha.cola.length&&!escucha.procesando)
+        estEsc("escuchando");
+    },
+    segmento:(f32,rate)=>alSegmento(f32,rate)});
+}
+function alSegmento(f32,rate){
+  if(!escucha.activa) return;
+  // "hablando": sono voz del asistente durante ALGUNA parte del trozo. El
+  // servidor endurece el filtro con eso (ver /escuchar).
+  const hablando=enAudio||escucha.vozConAudio||__escucha.hablando;
+  escucha.vozConAudio=false;
+  // Repliegue sin huellas: medio duplex. Sin timbre no hay forma fiable de
+  // distinguir al asistente del que interrumpe, asi que mientras hay una
+  // pregunta en marcha el microfono no cuenta.
+  if(!escucha.huellas&&(enPregunta||__escucha.hablando)) return;
+  if(escucha.cola.length>=2) escucha.cola.shift();   // no acumular retraso
+  escucha.cola.push({f32,rate,fin:performance.now(),hablando});
+  procesarCola();
+}
+async function procesarCola(){
+  if(escucha.procesando) return;
+  escucha.procesando=true;
+  while(escucha.cola.length) await procesarSegmento(escucha.cola.shift());
+  escucha.procesando=false;
+  if(escucha.activa&&!enPregunta) estEsc("escuchando");
+}
+async function procesarSegmento(s){
+  const traza={};
+  estEsc("¿quién habla?","proc");
+  let quien=null,texto="",decision=null,error=null;
+  try{
+    const r=await fetch("/escuchar",{method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({wav:b64(codificarWav(s.f32,s.rate)),
+        hablando:!!s.hablando,
+        historial:historial.slice(-6),
+        respondio_hace_s:escucha.ultimaRespuesta?
+          Math.round((performance.now()-escucha.ultimaRespuesta)/100)/10:null})});
+    // NDJSON incremental: cada linea es una fase y se pinta SEGUN llega.
+    const lector=r.body.getReader(); const dec=new TextDecoder(); let buf="";
+    while(true){
+      const {done,value}=await lector.read();
+      if(value) buf+=dec.decode(value,{stream:true});
+      let i;
+      while((i=buf.indexOf("\\n"))>=0){
+        const ln=buf.slice(0,i); buf=buf.slice(i+1);
+        if(!ln.trim()) continue;
+        const ev=JSON.parse(ln);
+        __escucha.traza.push(ev);
+        if(ev.fase==="huella"){ quien=ev;
+          if(!ev.descartada) estEsc("transcribiendo","proc"); }
+        else if(ev.fase==="texto"){ texto=ev.texto||""; traza.stt=ev.s;
+          if(texto) estEsc("¿me hablan a mí?","proc"); }
+        else if(ev.fase==="decision"){ decision=ev; traza.compuerta=ev.s; }
+        else if(ev.fase==="fin"&&ev.error) error=ev.error;
+      }
+      if(done) break;
+    }
+  }catch(e){ error=e.message; }
+  if(error){ di("escucha: "+error,true); return; }
+  const nombre=quien&&quien.nombre?quien.nombre:"¿?";
+  if(quien&&quien.descartada){
+    apunta(`<span class="meta">descartada: ${escapar(quien.motivo||"voz del asistente")}` +
+           (quien.cos!==undefined?` (coseno ${quien.cos})`:"")+`</span>`,"fuera");
+    return;
+  }
+  if(!texto){ apunta(`<span class="meta">(voz sin palabras)</span>`,"fuera"); return; }
+  const cabecera=`<span class="quien">${escapar(nombre)}</span> <span class="dicho">«${escapar(texto)}»</span>`;
+  const tiempos=`huella ${((quien&&quien.s)||0).toFixed(2)}s · stt ${(traza.stt||0).toFixed(2)}s · compuerta ${(traza.compuerta||0).toFixed(2)}s`;
+  if(!decision||!decision.dirigida){
+    apunta(`${cabecera} <span class="meta">no era para mí · ${tiempos}</span>`,"fuera");
+    return;
+  }
+  apunta(`${cabecera} <span class="meta">para mí · ${tiempos}</span>`);
+  if(__escucha.sinPreguntar){       // el arnes de pruebas corta aqui
+    __escucha.traza.push({fase:"preguntaria",texto,hablante:quien&&quien.perfil?nombre:null});
+    if(escucha.activa) estEsc("escuchando");
+    return;
+  }
+  // Interrupcion: si estaba hablando, que se calle y atienda. Se espera a
+  // que la pregunta vieja LIMPIE (cierra su contexto de audio) antes de
+  // lanzar la nueva; son milisegundos y evita pisarse los globales.
+  if(enPregunta&&aborto){ aborto.abort(); if(preguntaEnCurso) await preguntaEnCurso; }
+  estEsc("pensando","pensando");
+  const marcas={};
+  // NO se espera al final del audio: los trozos que el VAD saque mientras
+  // el asistente habla se procesan (asi es como se le puede interrumpir).
+  lanzarPregunta(texto,{hablante:quien&&quien.perfil?nombre:null,marcas}).then(()=>{
+    escucha.ultimaRespuesta=performance.now();
+    if(marcas.sonido!==undefined){
+      const total=(marcas.t0+marcas.sonido*1000-s.fin)/1000;
+      apunta(`<span class="meta">fin de tu voz → primer sonido: ${total.toFixed(2)}s `+
+             `(stt ${(traza.stt||0).toFixed(2)} + compuerta ${(traza.compuerta||0).toFixed(2)} `+
+             `+ LLM y voz ${(marcas.sonido||0).toFixed(2)})</span>`);
+    }
+    if(escucha.activa&&!enPregunta) estEsc("escuchando");
+  });
+}
+async function comprobarHuellas(){
+  try{
+    const d=await fetch("/perfiles").then(r=>r.json());
+    escucha.huellas=!!d.disponible;
+    if(d.cargando) setTimeout(comprobarHuellas,4000);   // el modelo aun carga
+    pintarPerfiles(d);
+  }catch(_){ escucha.huellas=false; }
+}
+if(!window.isSecureContext||!navigator.mediaDevices){
+  $("esc").disabled=true;
+  $("esc").title="el navegador solo da micrófono en HTTPS o en localhost; "+
+    "desde otra máquina esta página va por HTTP y no puede escuchar";
+}
+$("esc").addEventListener("click",async()=>{
+  if(escucha.activa) return apagarEscucha();
+  let flujo;
+  try{
+    // echoCancellation es la segunda capa contra la realimentacion: el
+    // navegador resta del microfono lo que el mismo esta reproduciendo.
+    flujo=await navigator.mediaDevices.getUserMedia({audio:{
+      echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  }catch(e){ return di(e.name==="NotAllowedError"||e.name==="SecurityError"
+    ?"micrófono denegado: dale permiso a la página en el navegador"
+    :"micrófono: "+e.message,true); }
+  await comprobarHuellas();
+  prepararVad();
+  const c=new AudioContext();
+  const src=c.createMediaStreamSource(flujo);
+  // ScriptProcessor y no AudioWorklet: esta senalado como obsoleto pero
+  // funciona en todos los navegadores sin servir un modulo aparte, y 2048
+  // muestras (43 ms a 48 kHz) sobran para un VAD de energia. La salida del
+  // nodo son ceros -- no se reproduce nada -- pero hay que conectarlo al
+  // destino o el navegador no lo hace correr.
+  const nodo=c.createScriptProcessor(2048,1,1);
+  nodo.onaudioprocess=e=>{
+    if(!escucha.activa) return;
+    escucha.vad.alimentar(new Float32Array(e.inputBuffer.getChannelData(0)),c.sampleRate);
+  };
+  src.connect(nodo); nodo.connect(c.destination);
+  Object.assign(escucha,{activa:true,ctx:c,flujo,nodo});
+  $("esc").textContent="Apagar escucha continua";
+  $("mic").disabled=true; $("mic").title="la escucha continua ya usa el micrófono";
+  estEsc("escuchando");
+  di(escucha.huellas?"escucha continua activa; háblame cuando quieras."
+    :"escucha continua SIN huellas de voz (falta el modelo): no sabré quién "+
+     "habla y me quedaré sordo mientras hablo yo, en medio dúplex.");
+});
+function apagarEscucha(){
+  escucha.activa=false;
+  try{escucha.nodo&&escucha.nodo.disconnect();}catch(_){}
+  try{escucha.flujo&&escucha.flujo.getTracks().forEach(t=>t.stop());}catch(_){}
+  try{escucha.ctx&&escucha.ctx.close();}catch(_){}
+  escucha.cola.length=0;
+  $("esc").textContent="Activar escucha continua";
+  if(window.isSecureContext&&navigator.mediaDevices){
+    $("mic").disabled=false; $("mic").title="";
+  }
+  estEsc("apagada"); $("vui").style.width="0";
+  di("escucha continua apagada.");
+}
+
+// ---- perfiles: quien es quien -----------------------------------------
+async function pintarPerfiles(d){
+  if(!d){ try{ d=await fetch("/perfiles").then(r=>r.json()); }catch(_){ return; } }
+  const c=$("perfLista"); c.textContent="";
+  if(d.error&&!(d.perfiles||[]).length){
+    c.innerHTML=`<span class="meta">huellas no disponibles: ${escapar(d.error)}</span>`;
+    return;
+  }
+  for(const p of d.perfiles||[]){
+    const fila=document.createElement("div"); fila.className="perfil";
+    const inp=document.createElement("input"); inp.value=p.nombre;
+    inp.addEventListener("change",async()=>{
+      await fetch("/perfiles/renombrar",{method:"POST",
+        headers:{"content-type":"application/json"},
+        body:JSON.stringify({id:p.id,nombre:inp.value})});
+      di("perfil renombrado.");
+    });
+    const t=document.createElement("span"); t.className="tipo";
+    t.textContent=(p.tipo==="asistente"?"el asistente":
+                   p.tipo==="desconocido"?"sin nombre aún":"persona")+
+                  " · "+p.muestras+(p.muestras===1?" muestra":" muestras");
+    fila.append(inp,t); c.appendChild(fila);
+  }
+  if(!(d.perfiles||[]).length)
+    c.innerHTML='<span class="meta">sin perfiles todavía: graba el primero '+
+                'abajo, o simplemente habla con la escucha activa</span>';
+}
+pintarPerfiles();
+$("perfAlta").addEventListener("click",async()=>{
+  const nombre=$("perfNombre").value.trim();
+  if(!nombre) return di("ponle un nombre al perfil antes de grabar",true);
+  let flujo;
+  try{ flujo=await navigator.mediaDevices.getUserMedia({audio:true}); }
+  catch(e){ return di("micrófono: "+e.message,true); }
+  di("grabando 5 s para el perfil de "+nombre+"… habla con normalidad");
+  const c=new AudioContext(); const src=c.createMediaStreamSource(flujo);
+  const nodo=c.createScriptProcessor(2048,1,1); const tomas=[];
+  nodo.onaudioprocess=e=>tomas.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(nodo); nodo.connect(c.destination);
+  await new Promise(r=>setTimeout(r,5000));
+  const rate=c.sampleRate;
+  try{nodo.disconnect();src.disconnect();}catch(_){}
+  flujo.getTracks().forEach(t=>t.stop()); c.close();
+  const n=tomas.reduce((s,t)=>s+t.length,0);
+  const f32=new Float32Array(n); let o=0;
+  for(const t of tomas){ f32.set(t,o); o+=t.length; }
+  di("guardando la huella…");
+  const r=await fetch("/perfiles/matricular",{method:"POST",
+    headers:{"content-type":"application/json"},
+    body:JSON.stringify({nombre,wav:b64(codificarWav(f32,rate))})});
+  const dd=await r.json().catch(()=>({}));
+  if(dd.error) return di(dd.error,true);
+  di("perfil de "+nombre+" guardado ("+dd.muestras+
+     (dd.muestras===1?" muestra":" muestras")+").");
+  pintarPerfiles();
+});
+
+// ---- ganchos de prueba -------------------------------------------------
+// Para probar el bucle SIN microfono ni altavoces: inyectan PCM s16 por el
+// MISMO camino que el microfono (VAD -> /escuchar -> compuerta), y
+// sinPreguntar corta justo antes del LLM grande y de la voz. Los usa el
+// arnes de pruebas del repo; a la pagina no le estorban.
+window.__escucha={traza:[],sinPreguntar:false,hablando:false,interno:escucha,
+  armar(){ if(!escucha.vad) prepararVad();
+           escucha.activa=true; escucha.huellas=true; estEsc("escuchando"); },
+  inyectarB64(cad,rate){
+    const crudo=atob(cad), n=crudo.length>>1, f=new Float32Array(n);
+    for(let i=0;i<n;i++){
+      let v=crudo.charCodeAt(2*i)|(crudo.charCodeAt(2*i+1)<<8);
+      if(v>=32768) v-=65536;
+      f[i]=v/32768;
+    }
+    escucha.vad.alimentar(f,rate||16000);
+  },
+  estado(){ return {chip:$("escEst").textContent,activa:escucha.activa,
+    cola:escucha.cola.length,procesando:escucha.procesando,
+    enVoz:escucha.vad?escucha.vad.enVoz:false,huellas:escucha.huellas}; }};
 </script></body></html>"""
 
 
@@ -556,6 +1017,24 @@ class Puente(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(cuerpo)))
             self.end_headers()
             self.wfile.write(cuerpo)
+        elif self.path == "/perfiles":
+            # `disponible` es si el modelo de huellas esta CARGADO. Tarda ~6 s
+            # en un hilo al arrancar; la pagina vuelve a preguntar si le sale
+            # que no, en vez de darlo por perdido para toda la sesion.
+            if OIDO is None:
+                cuerpo = {"disponible": False, "cargando": False,
+                          "error": "sin modulo de huellas", "perfiles": []}
+            else:
+                est = OIDO.estado()
+                cuerpo = {"disponible": est["disponible"],
+                          "cargando": not est["disponible"] and not est["error"],
+                          "error": est["error"], "perfiles": OIDO.lista()}
+            cuerpo = json.dumps(cuerpo, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(cuerpo)))
+            self.end_headers()
+            self.wfile.write(cuerpo)
         else:
             self.send_error(404)
 
@@ -567,8 +1046,8 @@ class Puente(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(cuerpo)
 
-    def transcribir(self):
-        """Reenvia el audio del microfono al /stt de la API de voz (whisper).
+    def _stt(self, audio: bytes, tipo: str):
+        """(texto, error): reenvia audio al /stt de la API de voz (whisper).
 
         El navegador manda el blob del MediaRecorder tal cual -- webm/opus en
         Chrome, mp4/aac en Safari -- porque voz-api pasa lo que llegue por
@@ -576,11 +1055,6 @@ class Puente(BaseHTTPRequestHandler):
         seria trabajo repetido. La peticion multipart es calcada a la de
         transcribir() en scripts/fidelidad.py, que es la referencia probada.
         """
-        n = int(self.headers.get("content-length", 0))
-        audio = self.rfile.read(n) if n else b""
-        if not audio:
-            return self.responder_json(400, {"error": "sin audio"})
-        tipo = self.headers.get("content-type", "application/octet-stream")
         # La extension del nombre es cosmetica (ffmpeg huele el contenido),
         # pero que al menos no mienta para los formatos conocidos.
         ext = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/mp4": "mp4",
@@ -595,22 +1069,148 @@ class Puente(BaseHTTPRequestHandler):
         pet = urllib.request.Request(
             f"{CFG['voz_api']}/stt", method="POST", data=cuerpo,
             headers={"content-type": f"multipart/form-data; boundary={lim}",
-                     **({"authorization": f"Bearer {CFG['token']}"}
-                        if CFG["token"] else {})})
+                     **({"authorization": f"Bearer {CFG['token_api']}"}
+                        if CFG["token_api"] else {})})
         try:
             d = json.load(urllib.request.urlopen(pet, timeout=120))
         except Exception as e:
-            # 502 y el motivo en claro: "whisper no responde" a secas obliga a
-            # ir a mirar el terminal del puente, y el navegador ya esta abierto.
-            return self.responder_json(
-                502, {"error": f"whisper no responde en {CFG['voz_api']}/stt "
-                               f"({type(e).__name__}: {e}); ¿esta levantado? "
-                               f"cd docker && docker compose up -d whisper voz-api"})
-        self.responder_json(200, {"texto": d.get("texto", "")})
+            # El motivo en claro: "whisper no responde" a secas obliga a ir a
+            # mirar el terminal del puente, y el navegador ya esta abierto.
+            return None, (f"whisper no responde en {CFG['voz_api']}/stt "
+                          f"({type(e).__name__}: {e}); ¿esta levantado? "
+                          f"cd docker && docker compose up -d whisper voz-api")
+        return d.get("texto", ""), None
+
+    def transcribir(self):
+        n = int(self.headers.get("content-length", 0))
+        audio = self.rfile.read(n) if n else b""
+        if not audio:
+            return self.responder_json(400, {"error": "sin audio"})
+        tipo = self.headers.get("content-type", "application/octet-stream")
+        texto, err = self._stt(audio, tipo)
+        if err:
+            return self.responder_json(502, {"error": err})
+        self.responder_json(200, {"texto": texto})
+
+    def escuchar(self):
+        """Una intervencion oida por la escucha continua, de punta a punta.
+
+        Entra JSON {wav: base64, hablando: bool, historial, respondio_hace_s}
+        y sale NDJSON con una linea por fase, SEGUN OCURREN -- la pagina pinta
+        cada estado en cuanto pasa, no al final:
+
+            {"fase":"huella", ...}    quien habla, o descartada (~ms)
+            {"fase":"texto", ...}     lo que dijo whisper
+            {"fase":"decision", ...}  si iba dirigida al asistente
+            {"fase":"fin", ...}
+
+        El ORDEN de las fases es la optimizacion: la huella cuesta ~25 ms y
+        descarta la propia voz del asistente ANTES de pagar la transcripcion
+        entera de whisper y la llamada de la compuerta.
+        """
+        n = int(self.headers.get("content-length", 0))
+        try:
+            pet = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            pet = {}
+        self.send_response(200)
+        self.send_header("content-type", "application/x-ndjson")
+        self.send_header("cache-control", "no-store")
+        # Mismo motivo que en /preguntar: sin longitud conocida, el fin de la
+        # respuesta es el fin de la conexion.
+        self.send_header("connection", "close")
+        self.close_connection = True
+        self.end_headers()
+
+        def linea(**kw):
+            self.wfile.write((json.dumps(kw, ensure_ascii=False) + "\n").encode())
+            self.wfile.flush()
+
+        try:
+            try:
+                wav = base64.b64decode(pet.get("wav") or "")
+            except (ValueError, TypeError):
+                wav = b""
+            if len(wav) < 100:
+                return linea(fase="fin", error="sin audio")
+            hablando = bool(pet.get("hablando"))
+            if OIDO is not None:
+                quien = OIDO.identificar(wav, hablando=hablando)
+            else:
+                # Sin huellas no hay forma de reconocer la propia voz: si el
+                # asistente esta hablando se descarta todo (medio duplex de
+                # servidor, por si la pagina no lo aplico ya).
+                quien = {"descartada": hablando, "perfil": None,
+                         "motivo": "perfiles de voz no disponibles"}
+            linea(fase="huella", **quien)
+            if quien.get("descartada"):
+                return linea(fase="fin", descartada=True)
+
+            t0 = time.perf_counter()
+            texto, err = self._stt(wav, "audio/wav")
+            if err:
+                return linea(fase="fin", error=err)
+            texto = (texto or "").strip()
+            linea(fase="texto", texto=texto,
+                  s=round(time.perf_counter() - t0, 3))
+            if not texto:
+                return linea(fase="fin", vacia=True)
+
+            dirigida, s, crudo = decidir(
+                texto, pet.get("historial"), quien.get("nombre"),
+                CFG["compuerta"], CFG["ollama"], pet.get("respondio_hace_s"))
+            linea(fase="decision", dirigida=dirigida, s=round(s, 3),
+                  crudo=crudo)
+            linea(fase="fin")
+        except (BrokenPipeError, ConnectionResetError):
+            pass                            # el navegador se fue a mitad
+        except Exception as e:
+            try:
+                linea(fase="fin", error=f"{type(e).__name__}: {e}")
+            except OSError:
+                pass
+
+    def perfil_matricular(self):
+        n = int(self.headers.get("content-length", 0))
+        try:
+            pet = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return self.responder_json(400, {"error": "peticion ilegible"})
+        if OIDO is None:
+            return self.responder_json(503, {"error": "sin perfiles de voz"})
+        nombre = (pet.get("nombre") or "").strip()
+        if not nombre:
+            return self.responder_json(400, {"error": "falta el nombre"})
+        try:
+            wav = base64.b64decode(pet.get("wav") or "")
+        except (ValueError, TypeError):
+            wav = b""
+        if len(wav) < 100:
+            return self.responder_json(400, {"error": "sin audio"})
+        d = OIDO.matricular(nombre, wav)
+        self.responder_json(400 if "error" in d else 200, d)
+
+    def perfil_renombrar(self):
+        n = int(self.headers.get("content-length", 0))
+        try:
+            pet = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return self.responder_json(400, {"error": "peticion ilegible"})
+        if OIDO is None:
+            return self.responder_json(503, {"error": "sin perfiles de voz"})
+        if OIDO.renombrar(pet.get("id") or "", pet.get("nombre") or ""):
+            return self.responder_json(200, {"hecho": True})
+        self.responder_json(404, {"error": "no hay tal perfil"})
 
     def do_POST(self):
         if self.path == "/stt":
             return self.transcribir()
+        if self.path == "/escuchar":
+            return self.escuchar()
+        if self.path == "/perfiles/matricular":
+            return self.perfil_matricular()
+        if self.path == "/perfiles/renombrar":
+            return self.perfil_renombrar()
         if self.path != "/preguntar":
             return self.send_error(404)
         n = int(self.headers.get("content-length", 0))
@@ -682,8 +1282,19 @@ class Puente(BaseHTTPRequestHandler):
         # texto se corrompe en pantalla. Aqui la fuente de verdad es una sola.
         def productor():
             nonlocal pendiente, n_frases, dentro
+            # Con historial (escucha continua, o pagina que lo mande) el LLM
+            # ve la conversacion entera y quien dice cada cosa; sin el, el
+            # camino de siempre, que es el probado.
+            historial = pet.get("historial") or []
+            hablante = pet.get("hablante")
+            if historial or hablante:
+                origen = preguntar_con_historial(pet["texto"], historial,
+                                                 modelo, CFG["ollama"],
+                                                 sistema, hablante)
+            else:
+                origen = preguntar(pet["texto"], modelo, CFG["ollama"], sistema)
             try:
-                for trozo in preguntar(pet["texto"], modelo, CFG["ollama"], sistema):
+                for trozo in origen:
                     if parar.is_set():
                         break       # nadie escucha: no seguir gastando el LLM
                     texto = ""
@@ -831,10 +1442,20 @@ class Puente(BaseHTTPRequestHandler):
 
         terminado = False
 
+        # La voz del asistente, PARA APRENDERLA: se guardan los primeros
+        # segundos del PCM que baja de la sesion y al terminar se refresca con
+        # ellos el perfil 'asistente' (oido.py). Es la clave del anti-eco: la
+        # voz GENERADA no casa con el WAV del prompt (coseno 0,24-0,38,
+        # medido), asi que la unica verdad de terreno es lo que suena.
+        dicho_pcm, dicho_tope = [], 20 * 24000 * 2
+
         def al_pcm(carga):
-            nonlocal suena, seg_pcm
+            nonlocal suena, seg_pcm, dicho_tope
             marco(0, carga)
             seg_pcm += len(carga) / 2 / 24000
+            if dicho_tope > 0:
+                dicho_pcm.append(carga[:dicho_tope])
+                dicho_tope -= len(carga)
             if not suena:
                 suena = True
                 avanzar()       # ya se oye algo: repartir lo que sepa la sonda
@@ -979,6 +1600,12 @@ class Puente(BaseHTTPRequestHandler):
                     ws.close()
                 except Exception:
                     pass
+            # Aprender la voz que se acaba de emitir, fuera del camino de la
+            # respuesta: son ~25 ms de huella, pero ni eso se le cobra aqui.
+            if OIDO is not None and dicho_pcm:
+                threading.Thread(target=OIDO.aprender_asistente,
+                                 args=(b"".join(dicho_pcm), 24000),
+                                 daemon=True).start()
 
 
 def main():
@@ -988,6 +1615,12 @@ def main():
                     help="MiniMax-M3 (por defecto) o cualquier modelo de Ollama")
     ap.add_argument("--ollama", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
     ap.add_argument("--voz-url", default=os.environ.get("VOZ_STREAM_URL", "http://127.0.0.1:8082"))
+    # El sintetizador y whisper pueden estar en MAQUINAS distintas -- lo normal
+    # aqui: la voz en la VM y whisper en local -- y cada uno tiene su propio
+    # token. Mandarle a whisper el de la VM da 401 y parece que no esta
+    # levantado cuando si lo esta.
+    ap.add_argument("--token-api", default=os.environ.get("VOZ_API_TOKEN", ""),
+                    help="token de la API de voz (whisper); por defecto, el mismo")
     ap.add_argument("--api-url", default=os.environ.get("VOZ_API_URL", "http://127.0.0.1:8080"),
                     help="la API de voz con /stt (whisper), para el microfono. "
                          "En local: cd docker && docker compose up -d whisper voz-api")
@@ -998,15 +1631,33 @@ def main():
     ap.add_argument("--arranque", type=int, default=15)
     ap.add_argument("--sistema", default="Responde en español, breve y natural, "
                                          "en frases cortas. Sin listas ni markdown.")
+    ap.add_argument("--compuerta",
+                    default=os.environ.get("ASISTENTE_COMPUERTA", "qwen3:4b"),
+                    help="modelo que decide si una frase oida va dirigida al "
+                         "asistente. qwen3:4b en Ollama local por defecto: "
+                         "~0,4 s con think:false. Los MiniMax-* valen pero "
+                         "razonan aunque se les pida que no y tardan 3-6 s "
+                         "(medido); ver scripts/conversacion.py")
+    ap.add_argument("--perfiles",
+                    default=os.environ.get(
+                        "ASISTENTE_PERFILES",
+                        os.path.join(os.path.dirname(os.path.dirname(
+                            os.path.abspath(__file__))), "perfiles_voz.json")),
+                    help="donde guardar los perfiles de voz (JSON)")
     a = ap.parse_args()
     CFG.update(modelo=a.modelo, ollama=a.ollama, voz_url=a.voz_url, token=a.token,
                voz=a.voz, arranque=a.arranque, sistema=a.sistema, cfg=a.cfg,
-               voz_api=a.api_url)
+               voz_api=a.api_url, token_api=a.token_api or a.token,
+               compuerta=a.compuerta)
+    global OIDO
+    OIDO = Oido(a.perfiles)
+    OIDO.precargar()        # ~6 s de carga del modelo, en un hilo aparte
     print(f"asistente en http://127.0.0.1:{a.puerto}")
     print(f"  LLM : {a.modelo}"
           f"{'' if a.modelo.lower().startswith('minimax') else ' via ' + a.ollama}")
     print(f"  voz : {a.voz_url}/tts/sesion/ws (una sesion por respuesta)")
     print(f"  stt : {a.api_url}/stt (el microfono de la pagina; whisper)")
+    print(f"  oido: compuerta {a.compuerta} · perfiles en {a.perfiles}")
     if ws_conectar is None:
         print("  [aviso] falta el paquete 'websockets': el puente sirve la "
               "pagina pero no podra hablar.\n"

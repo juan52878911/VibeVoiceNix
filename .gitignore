@@ -48,3 +48,6 @@ __pycache__/
 # macOS
 .DS_Store
 graphify-out/
+
+# Perfiles de voz del asistente (huellas de locutor; datos locales)
+perfiles_voz.json
