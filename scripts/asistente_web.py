@@ -2158,6 +2158,10 @@ class Puente(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--puerto", type=int, default=8090)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="0.0.0.0 para abrirlo a la red local")
+    ap.add_argument("--tls-cert", default="", help="certificado, para HTTPS")
+    ap.add_argument("--tls-clave", default="", help="clave del certificado")
     ap.add_argument("--modelo", default=os.environ.get("ASISTENTE_MODELO", "MiniMax-M3"),
                     help="MiniMax-M3 (por defecto) o cualquier modelo de Ollama")
     ap.add_argument("--ollama", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
@@ -2238,7 +2242,22 @@ def main():
         print("  [aviso] falta el paquete 'websockets': el puente sirve la "
               "pagina pero no podra hablar.\n"
               "          arranca con pkgs/vibevoice/.venv/bin/python")
-    ThreadingHTTPServer(("127.0.0.1", a.puerto), Puente).serve_forever()
+    srv = ThreadingHTTPServer((a.host, a.puerto), Puente)
+    if a.tls_cert and a.tls_clave:
+        # HTTPS no es por paranoia: el navegador EXIGE contexto seguro para
+        # getUserMedia, y sin el no hay microfono desde otra maquina. En
+        # 127.0.0.1 no hace falta porque localhost cuenta como seguro.
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(a.tls_cert, a.tls_clave)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        print(f"  https activo (certificado propio: el navegador avisara la "
+              f"primera vez; acepta la excepcion y el microfono funcionara)")
+    if a.host not in ("127.0.0.1", "localhost"):
+        print(f"  ABIERTO A LA RED en {a.host}: cualquiera que llegue a este "
+              f"puerto puede usar tu LLM y oir tus perfiles de voz. Red de casa "
+              f"si, internet no.")
+    srv.serve_forever()
 
 
 if __name__ == "__main__":
