@@ -19,6 +19,34 @@ memoria: leer sus pesos a los 17,2 GB/s medidos costaria 20-40 ms, y tardaba
 165. Esos ~130 ms sobrantes eran despacho de Python sobre decenas de
 convoluciones pequenas, y eso es justo lo que elimina un grafo compilado.
 
+DONDE VA EL TIEMPO HOY (GET /crono en voz_stream.py, 684 fotogramas de una
+tanda real, sin solapar y con 6 hilos; un fotograma son 133,3 ms de audio):
+
+    tts_lm      42,1 ms/fotograma  (34%)   2,11 pasadas de 20,0 ms
+    acustico    55,6 ms            (45%)   1 pasada
+    cabeza      15,6 ms            (13%)   6 pasadas de 2,60 ms
+    resto       10,2 ms             (8%)   torch, conector, EOS, Python
+    -------------------------------------
+    generate   123,6 ms                    RTF 0,99
+
+Las 2,11 pasadas de backbone por fotograma no son un error de cuenta: el
+bucle de Microsoft evalua el backbone DOS VECES, con el contexto real y con
+la secuencia negativa del CFG. Ver NEG_CADA en voz_stream.py.
+
+Y ESTA CARGA YA NO ESTA LIMITADA POR MEMORIA. Era el hallazgo que gobernaba
+todo cuando la RAM iba en canal unico; con los dos modulos puestos, las tres
+pruebas que lo comprobarian salen que no:
+
+  - una pasada de backbone de 2 tokens cuesta 1,77x la de 1 token (si mandara
+    la lectura de pesos costaria ~1,0x, que son los mismos 156 MB)
+  - el decodificador con 6 latentes por llamada NO gana sobre 1 por llamada
+    (mismos 344 MB leidos una vez en lugar de seis)
+  - bajar el decodificador de int8 (344 MB) a int4 (212 MB) gana un 7 %, no
+    el 38 % que darian los bytes
+
+Manda el COMPUTO, en seis nucleos a 2,4 GHz con AVX2 y sin VNNI. Lo que queda
+por ganar esta en hacer menos trabajo, no en mover menos bytes.
+
 TRAMPA IMPORTANTE
 OMP_PLACES=cores + OMP_PROC_BIND=close acelera PyTorch un 3% pero RALENTIZA
 esto un 118% (89 ms/llamada sin anclaje, 195 con el). El modulo NixOS lo
@@ -35,7 +63,10 @@ import weakref
 import numpy as np
 import torch
 
-CRONO = {"tts_lm": [0.0, 0], "cabeza": [0.0, 0], "acustico": [0.0, 0]}
+CRONO = {"tts_lm": [0.0, 0], "cabeza": [0.0, 0], "acustico": [0.0, 0],
+         # pasadas del backbone que el agrupado de la rama incondicional se
+         # ahorro: cuentan el tiempo de acumular, no el de inferir
+         "tts_lm_aplazado": [0.0, 0]}
 
 
 def _referencia(obj):
@@ -65,9 +96,17 @@ class SalidaLM:
 class CacheOV:
     """Viaja por model_kwargs; el estado real vive en el InferRequest."""
 
+    __slots__ = ("peticion", "longitud", "_positivo", "_pendientes", "_ultimo")
+
     def __init__(self, peticion, longitud):
         self.peticion = peticion
         self.longitud = longitud
+        # Marca que pone voz_stream.py: True en la rama CONDICIONAL (la unica
+        # que llega a recibir tokens de texto). Se usa para agrupar solo la
+        # otra; ver TtsLmOV.forward.
+        self._positivo = False
+        self._pendientes = []       # (embeds, position_ids) sin procesar aun
+        self._ultimo = None         # hidden de la ultima pasada REAL
 
     def get_seq_length(self, layer_idx=0):
         return self.longitud
@@ -84,9 +123,34 @@ def _tensores_cache(cache, n_capas):
 
 
 class TtsLmOV(torch.nn.Module):
-    """Reemplazo de Qwen2Model(20 capas): IR con estado de OpenVINO."""
+    """Reemplazo de Qwen2Model(20 capas): IR con estado de OpenVINO.
 
-    def __init__(self, ruta_xml, hilos, n_capas=20):
+    AGRUPADO DE LA RAMA INCONDICIONAL (`neg_cada`)
+    El bucle de Microsoft llama a este backbone DOS VECES por fotograma
+    acustico: una con el contexto real (condicional) y otra con la secuencia
+    negativa, que arranca de un solo <|image_pad|> y solo recibe los latentes
+    ya generados -- nunca el texto. Las dos salidas son las que alimentan la
+    guia sin clasificador de la difusion.
+
+    Esa segunda pasada es la mitad del backbone y, medido en la VM, el
+    backbone es el 77 % del reloj de una generacion. No es una rama barata:
+    cuesta lo mismo que la buena, porque el coste de este modelo son sus
+    pesos, no su secuencia.
+
+    `neg_cada > 1` no la SALTA -- eso desincronizaria su cache --, la AGRUPA:
+    los embeds de los fotogramas intermedios se acumulan y entran de golpe en
+    una sola pasada de longitud N. La cache negativa queda BIT A BIT como
+    estaba (la atencion es causal: procesar [x1,x2] de una vez da lo mismo que
+    x1 y luego x2), y una pasada de N tokens cuesta practicamente lo mismo que
+    una de 1 porque hay que leer los mismos 156 MB de pesos.
+
+    LO QUE SI CAMBIA es que la condicion negativa que ve la difusion se queda
+    hasta N-1 fotogramas vieja. Es la rama que NO mira el texto, asi que su
+    hidden se mueve despacio; cuanto cuesta eso en fidelidad esta medido en
+    voz_stream.py (agrupar_rama_negativa).
+    """
+
+    def __init__(self, ruta_xml, hilos, n_capas=20, neg_cada=1):
         super().__init__()
         import openvino as ov
         self._ov = ov
@@ -95,6 +159,7 @@ class TtsLmOV(torch.nn.Module):
                                        {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1,
                                         "PERFORMANCE_HINT": "LATENCY"})
         self.n_capas = n_capas
+        self.neg_cada = max(1, int(neg_cada))
         self.device = torch.device("cpu")
 
     def _arrancar_flujo(self, cache_torch):
@@ -114,19 +179,43 @@ class TtsLmOV(torch.nn.Module):
                 output_hidden_states=None, return_dict=None, cache_position=None, **kw):
         ini = time.perf_counter()
         cache = past_key_values
-        if not isinstance(cache, CacheOV):
+        estrenando = not isinstance(cache, CacheOV)
+        if estrenando:
             cache = self._arrancar_flujo(cache)
         S = inputs_embeds.shape[1]
         if position_ids is not None:
             pos = position_ids.detach().numpy().astype(np.int64)[:, -S:]
         else:
             pos = np.arange(cache.longitud, cache.longitud + S, dtype=np.int64)[None]
+        emb = np.ascontiguousarray(inputs_embeds.detach().float().numpy())
+
+        # ---- rama incondicional agrupada ----
+        # Solo cuando ya hay un hidden anterior que devolver: la primera
+        # pasada de un flujo no se puede aplazar, no habria que responder.
+        if (self.neg_cada > 1 and not cache._positivo and not estrenando
+                and cache._ultimo is not None):
+            cache._pendientes.append((emb, pos))
+            # La longitud avanza AUNQUE no se ejecute: es lo que mantiene
+            # sincronizados los position_ids que prepare_inputs_for_generation
+            # calcula fuera, y por tanto lo que hace que el agrupado sea fiel.
+            cache.longitud += S
+            if len(cache._pendientes) < self.neg_cada:
+                CRONO["tts_lm_aplazado"][0] += time.perf_counter() - ini
+                CRONO["tts_lm_aplazado"][1] += 1
+                return SalidaLM(cache._ultimo, cache)
+            emb = np.ascontiguousarray(
+                np.concatenate([e for e, _ in cache._pendientes], axis=1))
+            pos = np.ascontiguousarray(
+                np.concatenate([p for _, p in cache._pendientes], axis=1))
+            cache._pendientes.clear()
+            S = 0                       # la longitud ya se conto al acumular
+
         res = cache.peticion.infer(
-            {"inputs_embeds": np.ascontiguousarray(inputs_embeds.detach().float().numpy()),
-             "position_ids": np.ascontiguousarray(pos)},
+            {"inputs_embeds": emb, "position_ids": pos},
             share_inputs=True, share_outputs=True)
         h = torch.from_numpy(np.array(res[self.comp.output("hidden")]))
         cache.longitud += S
+        cache._ultimo = h
         CRONO["tts_lm"][0] += time.perf_counter() - ini
         CRONO["tts_lm"][1] += 1
         return SalidaLM(h, cache)
@@ -280,6 +369,7 @@ class AcusticoOV:
         return guardado is None
 
     def decode(self, latents, cache=None, sample_indices=None, use_cache=True, debug=False):
+        ini = time.perf_counter()
         lat = latents.detach().float()
         if lat.shape[1] != 64:          # [1,1,64] -> [1,64,1]
             lat = lat.permute(0, 2, 1)
@@ -290,11 +380,14 @@ class AcusticoOV:
             self.pet.infer({"lat": np.zeros_like(lat)},
                            share_inputs=True, share_outputs=True)
         res = self.pet.infer({"lat": lat}, share_inputs=True, share_outputs=True)
-        return torch.from_numpy(np.array(res[self.comp.output("audio")]))
+        salida = torch.from_numpy(np.array(res[self.comp.output("audio")]))
+        CRONO["acustico"][0] += time.perf_counter() - ini
+        CRONO["acustico"][1] += 1
+        return salida
 
 
 def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None,
-           hilos_acustico=None):
+           hilos_acustico=None, neg_cada=1):
     """hilos_acustico separa el presupuesto del decodificador del resto.
 
     Solo tiene sentido cuando voz_stream.py lo solapa en otro hilo: entonces el
@@ -338,7 +431,7 @@ def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None,
     # El bucle se queda con lo que no se lleve el decodificador. Minimo 1: un
     # reparto mal puesto no debe dejar el camino critico sin hilos.
     hilos_bucle = max(1, hilos - hilos_acustico) if hilos_acustico else hilos
-    modelo.model.tts_language_model = TtsLmOV(ir_lm, hilos_bucle)
+    modelo.model.tts_language_model = TtsLmOV(ir_lm, hilos_bucle, neg_cada=neg_cada)
     if ir_cabeza:
         modelo.model.prediction_head = CabezaOV(ir_cabeza, hilos_bucle)
     else:

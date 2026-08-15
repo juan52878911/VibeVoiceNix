@@ -104,6 +104,33 @@ in
       '';
     };
 
+    precisionAcustico = lib.mkOption {
+      type = lib.types.enum [ "int8" "int4" "fp16" ];
+      default = "int8";
+      description = ''
+        Compresion del decodificador acustico, que es la pieza mas cara del
+        bucle: 55,6 de los 123,6 ms que cuesta un fotograma (45 %).
+
+        MEDIDO en la VM, banco de 12 clips con semilla fija, sin solapar y con
+        6 hilos, y 24 clips mas para la calidad:
+
+          fp16   RTF 1,08   (referencia de calidad)   3,7 GB residentes
+          int8   RTF 0,988  SNR 25,6 dB frente al fp16
+          int4   RTF 0,940  SNR 18,8 dB frente al fp16
+
+        El int4 sale un 4,8 % mas rapido y cuesta 6,8 dB de relacion senal a
+        ruido. NO cambia la locucion: el decodificador es un sumidero -- su
+        salida no vuelve al modelo --, asi que todos los clips duran
+        exactamente lo mismo y dicen lo mismo. El WER no lo nota (11,3 %
+        frente a 12,7 %, dentro del ruido de 24 clips), pero 6,8 dB no son
+        cero: es un cambio de timbre, no una mejora gratis. De ahi que el
+        defecto siga siendo int8 y esto sea una palanca consciente.
+
+        El fp16 esta solo como vara de medir: es el mas lento Y el que mas
+        memoria pide, en una maquina que ya va justa.
+      '';
+    };
+
     precisionCabeza = lib.mkOption {
       type = lib.types.enum [ "int8" "int4" "fp16" ];
       default = "int8";

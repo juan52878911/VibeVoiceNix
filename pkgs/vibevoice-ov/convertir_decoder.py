@@ -52,22 +52,21 @@ gc.collect()
 
 import nncf
 core = ov.Core()
-# Solo int8. NO se genera int4, y no es un olvido:
+# int8 e int4. El int4 necesita group_size=32 y no 128: el decodificador tiene
+# capas de 32 y 64 canales, y agruparlas de 128 en 128 aborta la conversion
+# entera con nncf.errors.InvalidGroupSizeError.
 #
-#  1. Es IMPOSIBLE con este grafo. El decodificador tiene capas de 32 y 64
-#     canales, y agruparlas de 128 en 128 aborta la conversion entera:
-#       nncf.errors.InvalidGroupSizeError: Failed to apply group-wise
-#       quantization with group size value 128.
-#     Bajar el grupo a 32 lo salvaria, como se hizo en convertir_cabeza.py
-#     con 64, pero no merece la pena por lo siguiente.
+# POR QUE EL int4 AQUI TIENE SENTIDO Y EN LA CABEZA NO
+# Este grafo paga por sus bytes. Medido en la VM con el banco aislado, mismo
+# decodificador y 6 hilos:
 #
-#  2. No lo usa NADIE. voz-stream.nix fija VIBEVOICE_IR_ACUSTICO al int8;
-#     no hay opcion que apunte al int4. Eran ~2 minutos y varios GB de E/S
-#     para un fichero muerto que ademas tumbaba el servicio.
+#   decoder fp16   687 MB   70,0 ms
+#   decoder int8   344 MB   42,9 ms
 #
-# Si algun dia se quiere int4 aqui, hay que anadir la opcion en el modulo Y
-# usar group_size=32.
-for modo, gs, ruta in [(nncf.CompressWeightsMode.INT8_ASYM, None, LD + "/decoder_estado_int8.xml")]:
+# Doblar los pesos cuesta 1,63x el tiempo. La cabeza, en cambio, empeoro con
+# int4 (2,86 ms frente a 2,60 en int8) y ademas sesga el fin de frase.
+for modo, gs, ruta in [(nncf.CompressWeightsMode.INT8_ASYM, None, LD + "/decoder_estado_int8.xml"),
+                       (nncf.CompressWeightsMode.INT4_SYM, 32, LD + "/decoder_estado_int4.xml")]:
     mm = core.read_model(LD + "/decoder_estado_fp16.xml")
     kw = dict(mode=modo)
     if gs:

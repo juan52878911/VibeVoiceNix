@@ -63,16 +63,46 @@ in
 
     solaparDecodificador = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      default = !config.services.vibevoice.openvino.enable;
       description = ''
         Saca el decodificador acustico del camino critico y lo corre en su
         propio hilo, a la vez que el resto del bucle.
 
-        ES LA FORMA DE APROVECHAR LOS HILOS QUE SOBRAN. Subir `hilos` no vale
-        -- esta medido que empeora --, porque una sola etapa ya satura el bus
-        de memoria. Solapar DOS etapas si suma, porque no compiten por lo
-        mismo: el bucle (tts_lm + cabeza) se pasa el rato leyendo pesos y el
-        decodificador es convolucion, mas densa en computo.
+        POR DEFECTO APAGADO CUANDO EL MOTOR ES OPENVINO. Se midio en el i7-8700T
+        de la VM, que es lo que quedaba PENDIENTE aqui abajo, y sale al reves
+        que en el Mac: solapar HUNDE este motor.
+
+        La razon es que con OpenVINO cada etapa ya usa la maquina entera. En
+        torch el decodificador desperdiciaba nucleos y solapar los recogia;
+        aqui solapar solo sobresuscribe. Con 11 hilos repartidos 6 al bucle y
+        5 al decodificador sobre 6 nucleos fisicos, las dos etapas se estorban
+        muchisimo mas de lo que sus hilos hacen pensar (ms por llamada, banco
+        aislado con la maquina libre frente al mismo IR dentro del servicio):
+
+                        aislado, 6 hilos   solapando   sin solapar
+          backbone            13,9 ms        46,4 ms      19,5 ms
+          decodificador       41,4 ms        94,6 ms      55,6 ms
+
+        Y ademas el solapado NUNCA llega a servir de nada: la contrapresion
+        medida (lo que el bucle espera al decodificador) es del 0,02 %, o sea
+        que el decodificador jamas era el cuello que se pretendia esconder.
+
+        RTF end-to-end, mismo banco de 12 clips y semilla fija, con los md5
+        iguales en las dos (el audio es EL MISMO BIT A BIT, solo cambia quien
+        ejecuta que):
+
+          solapado, 11 hilos (6/5)   1,011
+          solapado,  6 hilos (3/3)   1,179
+          sin solapar, 6 hilos       0,988   <- el que se queda
+          sin solapar, 8 hilos       1,154
+
+        En el camino torch se deja encendido, que es donde esta medido que gana.
+
+        LA IDEA ERA APROVECHAR LOS HILOS QUE SOBRAN, dando por hecho que el
+        bucle se pasa el rato leyendo pesos y el decodificador es convolucion
+        densa en computo, y que por tanto no compiten por lo mismo. Con el
+        motor torch se cumple. Con OpenVINO no: los dos son computo, y ahi no
+        hay nada que solapar. Ver arriba.
 
         POR QUE ES SEGURO: el decodificador es un SUMIDERO. En el bucle de
         Microsoft la realimentacion pasa por acoustic_connector(speech_latent);
@@ -94,10 +124,11 @@ in
         Cuesta ~40 ms mas de espera al primer sonido (0,12 -> 0,16 s), que es
         la profundidad de la tuberia.
 
-        PENDIENTE DE MEDIR EN EL i7-8700T de la VM, que es donde vive el motor
-        OpenVINO. La ganancia deberia ser parecida o mayor -- alli el
-        decodificador pesa mas en el reparto --, pero eso hay que verlo, no
-        suponerlo.
+        En el i7-8700T de la VM se esperaba una ganancia parecida o mayor,
+        porque alli el decodificador pesa mas en el reparto. Medido, sale lo
+        contrario; los numeros estan al principio de esta descripcion. Es el
+        cuarto caso en este proyecto en que una proyeccion razonable se cae al
+        medirla.
       '';
     };
 
@@ -156,7 +187,8 @@ in
         VIBEVOICE_OV_CODIGO = "${pkgs.vibevoiceOvCodigo}";
         VIBEVOICE_IR_LM = "${ov.directorioIR}/tts_lm_estado_${ov.precisionLM}.xml";
         VIBEVOICE_IR_CABEZA = "${ov.directorioIR}/cabeza_${ov.precisionCabeza}.xml";
-        VIBEVOICE_IR_ACUSTICO = "${ov.directorioIR}/decoder_estado_int8.xml";
+        VIBEVOICE_IR_ACUSTICO =
+          "${ov.directorioIR}/decoder_estado_${ov.precisionAcustico}.xml";
       }
       # El anclaje a nucleos acelera PyTorch un 3% pero RALENTIZA OpenVINO un
       # 118% (medido: 89 ms/llamada sin anclaje, 195 con el). El mismo ajuste,
@@ -189,6 +221,60 @@ in
         RestrictNamespaces = true;
         LockPersonality = true;
         SystemCallArchitectures = "native";
+      };
+    };
+
+    # Devuelve a RAM lo que el pico de carga empujo al swap.
+    #
+    # Cargar el modelo pica ~4,6 GB en una maquina de 4,9, asi que al terminar
+    # de arrancar el proceso se queda con ~100-340 MB fuera de RAM -- MEDIDO,
+    # se ve en /proc/<pid>/status -- y ahi no son datos frios: son pesos que
+    # el bucle lee en cada fotograma, y cada uno cuesta un fallo de pagina
+    # mayor. `vm.swappiness=1` (ver disko.nix) reduce esto pero no lo evita:
+    # el pico es real y el kernel tiene que sacar algo.
+    #
+    # swapoff -a lo relee entero a RAM y swapon -a lo vuelve a poner vacio.
+    # Medido: RTF 1,082 -> 1,058 con el mismo audio bit a bit.
+    #
+    # SOLO SI CABE. Si el swap usado no entra en la memoria disponible,
+    # swapoff mataria algo; en ese caso no se toca nada y se avisa. Y no se
+    # marca como fallo: es un saneo oportunista, no un requisito de arranque.
+    systemd.services.voz-stream-sin-swap = {
+      description = "Devuelve a RAM las paginas que el arranque de voz-stream empujo al swap";
+      after = [ "voz-stream.service" ];
+      requires = [ "voz-stream.service" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        # El pico esta en la CARGA, y voz-stream es Type=simple: systemd lo da
+        # por arrancado en cuanto existe el proceso, dos minutos antes de que
+        # el modelo este dentro. Sin esperar a /health esto correria justo
+        # antes del pico, que es cuando no sirve de nada.
+        TimeoutStartSec = "12min";
+        ExecStart = pkgs.writeShellScript "voz-stream-sin-swap" ''
+          set -u
+          for _ in $(seq 1 120); do
+            if ${pkgs.curl}/bin/curl -fsS -m 3 \
+                 "http://127.0.0.1:${toString cfg.puerto}/health" >/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+          usado=$(${pkgs.gawk}/bin/awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{print (t-f)}' /proc/meminfo)
+          libre=$(${pkgs.gawk}/bin/awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+          if [ "$usado" -eq 0 ]; then
+            echo "no hay nada en swap"
+            exit 0
+          fi
+          # margen de 512 MB: MemAvailable es una estimacion, no una promesa
+          if [ "$usado" -ge $((libre - 524288)) ]; then
+            echo "en swap hay $((usado/1024)) MB y solo quedan $((libre/1024)) MB disponibles: no se toca"
+            exit 0
+          fi
+          echo "devolviendo $((usado/1024)) MB del swap a RAM"
+          ${pkgs.util-linux}/bin/swapoff -a && ${pkgs.util-linux}/bin/swapon -a
+        '';
       };
     };
 

@@ -127,13 +127,38 @@ in
         DPMSolverMultistepScheduler, disenado para pocos pasos, y viene
         configurado a 20.
 
-        Medido con int8: 20 pasos RTF 2,75 · 8 pasos 2,18 · 6 pasos 2,18 ·
-        4 pasos 2,11. De 6 a 4 solo se gana un 3%, asi que 6 deja margen de
-        calidad casi gratis.
+        Medido con int8 en su dia: 20 pasos RTF 2,75 · 8 pasos 2,18 · 6 pasos
+        2,18 · 4 pasos 2,11. De 6 a 4 solo se ganaba un 3 %, asi que 6 dejaba
+        margen de calidad casi gratis.
 
-        Por debajo de 6 apenas se gana: la cabeza de difusion (84 MB) deja de
-        dominar y pasa a mandar el backbone (869 MB), que no depende de los
+        CON EL MOTOR OPENVINO YA NO ES ASI. Comparacion pareada, alternando 6
+        y 4 en tandas seguidas para que la deriva de la maquina no sesgue el
+        resultado (decodificador int4, sin solapar, 6 hilos, semilla fija):
+
+          tanda    pasos 6   pasos 4
+            1       0,964     0,890
+            2       0,932     0,889
+            3       0,937     0,901
+          media     0,944     0,893
+
+        Un 5,4 % consistente, y es lo que separa el "casi tiempo real" del
+        "tiempo real". La cabeza de difusion pasa de 15,6 a 10,6 ms por
+        fotograma; el resto del bucle no se entera.
+
+        LA CALIDAD NO SE RESIENTE, medido con 24 clips (6 frases x 4
+        semillas), transcritos con whisper:
+
+                      WER medio   frases exactas   deriva de tono   recorte
+          6 pasos       12,7 %         58 %          -3,81 st        0,000 %
+          4 pasos        9,8 %         79 %          -3,13 st        0,000 %
+
+        El unico clip descarrilado con 4 pasos sale de la semilla 42, que
+        tambien descarrila TRES clips con 6 pasos: es la semilla, no los
         pasos.
+
+        El defecto se queda en 6 porque bajarlo cambia la locucion (otro
+        audio, otra duracion) y esa decision es del que despliega, no de la
+        biblioteca. Ponlo en 4 si el objetivo es RTF < 0,9.
       '';
     };
 

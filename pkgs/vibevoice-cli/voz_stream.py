@@ -409,6 +409,33 @@ SOLAPAR_DECODER = os.environ.get("VIBEVOICE_SOLAPAR_DECODER", "1") not in ("0", 
 HILOS_DECODER = int(os.environ.get("VIBEVOICE_HILOS_DECODER", "0")) or max(1, HILOS // 2)
 
 
+# --------------------------------------------------------------------- crono --
+# CUAL DE LAS DOS TUBERIAS ES EL CUELLO
+# Con el decodificador solapado, sumar los tiempos por componente ya no dice
+# donde va el reloj de pared: el bucle (tts_lm + cabeza) y el decodificador
+# corren A LA VEZ, asi que la suma pasa de 100 %. Lo que hace falta saber es
+# quien espera a quien:
+#
+#   contrapresion  segundos que el BUCLE pasa bloqueado en cola.put() porque el
+#                  decodificador no da abasto -> el cuello es el decodificador
+#   hambre         segundos que el WORKER pasa esperando trabajo -> el cuello
+#                  es el bucle
+#
+# Se acumula siempre (dos perf_counter() por fotograma, ~0,2 us) y se lee por
+# GET /crono, que ademas lo pone a cero: asi cada banco mide SU generacion y no
+# arrastra la anterior.
+CRONO_TUBERIA = {"generate": 0.0, "generaciones": 0, "audio_s": 0.0,
+                 "contrapresion": 0.0, "trabajo_worker": 0.0,
+                 "hambre_worker": 0.0, "decodes": 0}
+
+
+def crono_cero() -> dict:
+    previo = dict(CRONO_TUBERIA)
+    for k in CRONO_TUBERIA:
+        CRONO_TUBERIA[k] = 0.0 if isinstance(CRONO_TUBERIA[k], float) else 0
+    return previo
+
+
 class _Trabajo:
     """Un decode encolado y su emision, que se deciden en hilos distintos.
 
@@ -462,12 +489,17 @@ class DecodificadorSolapado:
     # ---- hilo trabajador ----
     def _bucle(self):
         while True:
+            espera = time.perf_counter()
             trabajo = self._cola.get()
+            CRONO_TUBERIA["hambre_worker"] += time.perf_counter() - espera
             try:
                 if trabajo is None:
                     return
                 if self._fallo is None:
+                    faena = time.perf_counter()
                     salida = self._decode(*trabajo.args, **trabajo.kw)
+                    CRONO_TUBERIA["trabajo_worker"] += time.perf_counter() - faena
+                    CRONO_TUBERIA["decodes"] += 1
                     if tuple(salida.shape) != tuple(trabajo.bufer.shape):
                         raise RuntimeError(
                             "el decodificador cambio de forma: esperaba "
@@ -501,7 +533,9 @@ class DecodificadorSolapado:
         self._trabajos[id(bufer)] = trabajo
         # put() bloquea cuando la cola esta llena: es la contrapresion que evita
         # que el bucle se adelante sin limite al decodificador.
+        frenado = time.perf_counter()
         self._cola.put(trabajo)
+        CRONO_TUBERIA["contrapresion"] += time.perf_counter() - frenado
         return bufer
 
     def emitir(self, bufer, streamer, indices) -> None:
@@ -604,7 +638,9 @@ def cargar_modelo():
                 # con el bucle; si no, cada etapa tiene la maquina entera para
                 # ella durante su turno y partir los hilos solo la frenaria.
                 hilos_acustico=HILOS_DECODER if SOLAPAR_DECODER else None,
+                neg_cada=NEG_CADA,
             )
+            marcar_rama_condicional(modelo)
             # El freno tambien aqui: sample_speech_tokens sigue siendo la de
             # torch con este motor (solo cambian los grafos que llama), y la
             # rampa de volumen se midio en LOS DOS motores.
@@ -867,6 +903,85 @@ def reforzar_guia_arranque(modelo) -> None:
     print(f"[arranque] guia reforzada al empezar: cfg {CFG_ARRANQUE} con rampa "
           f"de {CFG_ARRANQUE_FOTOGRAMAS} fotogramas (la primera palabra ya no "
           f"se mastica)", flush=True)
+
+
+# ------------------------------------------- la rama incondicional, agrupada --
+# UNA pasada del backbone cada N latentes en la rama negativa del CFG.
+#
+# EL HALLAZGO: el bucle de Microsoft llama a tts_language_model DOS VECES por
+# fotograma acustico. Una con el contexto real y otra con la secuencia
+# negativa -- que arranca de un solo <|image_pad|> y NUNCA recibe texto, solo
+# los latentes ya generados. Medido con GET /crono en la VM, dentro de una
+# tanda real de 12 clips (684 fotogramas):
+#
+#   backbone (tts_lm)     1445 llamadas   45,7 ms cada una   77 % del reloj
+#   cabeza de difusion    4104 llamadas    2,7 ms            13 %
+#   decodificador          684 llamadas   93,6 ms      SOLAPADO, fuera del
+#                                                      camino critico
+#   contrapresion del decodificador: 0,02 % -> el bucle NUNCA le espera
+#
+# 1445/684 = 2,11 pasadas de backbone por fotograma. Una de cada dos es la
+# incondicional, y cuesta lo mismo que la buena.
+#
+# LA APUESTA ERA que agrupar N fotogramas en UNA pasada de N tokens saldria
+# casi gratis, porque el coste del modelo serian sus 156 MB de pesos y no la
+# longitud de la secuencia. MEDIDO, NO SE CUMPLE: una pasada de dos tokens
+# cuesta 35,3 ms frente a los 20,0 de una de uno, o sea 1,77x. Este backbone
+# esta limitado por COMPUTO, no por memoria, y por eso agrupar apenas ahorra.
+#
+#   neg_cada   RTF     WER medio   audio generado
+#      1       0,940     12,7 %      referencia
+#      2       0,914     15,2 %      +7,9 % mas largo
+#      3       0,911       --        +7,6 % mas largo
+#
+# Un 2,6 % de RTF a cambio de 2,5 puntos de WER y locuciones un 8 % mas largas
+# -- la condicion negativa desfasada retrasa el fin de frase. NO COMPENSA, y
+# por eso el defecto es 1. Se deja la palanca porque el diagnostico (dos
+# pasadas de backbone por fotograma) vale mas que el resultado, y porque en
+# una CPU con VNNI, donde el computo dejaria de mandar, la cuenta podria
+# salir distinta.
+#
+# 1 = comportamiento original bit a bit.
+NEG_CADA = int(os.environ.get("VIBEVOICE_NEG_CADA", "1"))
+
+
+def marcar_rama_condicional(modelo) -> None:
+    """Le pone la marca `_positivo` a la cache de la rama CONDICIONAL.
+
+    Sin esto TtsLmOV no puede distinguir las dos ramas: a ambas les llega una
+    pasada de un token con su propia cache. La marca sale del unico dato que
+    las separa de verdad -- `tts_text_masks` con algun 1, o sea tokens de
+    texto, que la rama negativa no ve jamas.
+
+    La primera llamada de cada generate() con texto va ANTES que cualquier
+    llamada negativa (ver el bucle de generate en
+    modeling_vibevoice_streaming_inference.py), asi que para cuando la negativa
+    aparece la condicional ya esta marcada y no hay ambiguedad.
+
+    Se instala SIEMPRE, tambien con NEG_CADA=1: cuesta un `.max()` sobre un
+    tensor de un elemento por pasada y es lo que permite mover el agrupado por
+    peticion (PeticionTTS.neg_cada) sin reiniciar el servicio. Medir cambiando
+    variables de entorno ya salio caro una vez en este proyecto -- el modulo de
+    Nix las fija en el servicio y pisa las del gestor.
+    """
+    original = modelo.forward_tts_lm
+
+    def forward_tts_lm_marcado(*a, **kw):
+        mascara = kw.get("tts_text_masks")
+        salida = original(*a, **kw)
+        if mascara is not None and bool(mascara.max()):
+            cache = getattr(salida, "past_key_values", None)
+            if cache is not None:
+                try:
+                    cache._positivo = True
+                except AttributeError:
+                    pass            # cache de torch: el agrupado no aplica
+        return salida
+
+    modelo.forward_tts_lm = forward_tts_lm_marcado
+    if NEG_CADA > 1:
+        print(f"[arranque] rama incondicional agrupada: una pasada del backbone "
+              f"cada {NEG_CADA} fotogramas", flush=True)
 
 
 # ---------------------------------------------------- latentes a examen --
@@ -1286,7 +1401,23 @@ def _ajustar_pasos(pasos: Optional[int]) -> None:
     _estado["pasos_ahora"] = quiere
 
 
-def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
+def _ajustar_neg_cada(cada: Optional[int]) -> None:
+    """Agrupado de la rama incondicional, por peticion. Con el candado tomado.
+
+    Se toca el atributo del backbone y no una variable de entorno A PROPOSITO:
+    el modulo de Nix fija las variables en la unidad de systemd y pisa las que
+    ponga quien lance el banco, asi que medir cambiando el entorno da cuatro
+    audios identicos y una tarde perdida. Esto es un parametro de la peticion,
+    y el md5 lo delata si no ha hecho efecto."""
+    lm = getattr(getattr(_estado.get("modelo"), "model", None),
+                 "tts_language_model", None)
+    if lm is None or not hasattr(lm, "neg_cada"):
+        return
+    lm.neg_cada = max(1, NEG_CADA if cada is None else cada)
+
+
+def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None,
+                neg_cada=None):
     """Cuerpo sincrono de la sintesis; corre en un hilo del executor."""
     procesador = _estado["procesador"]
     solapado = _estado.get("solapado")
@@ -1295,6 +1426,7 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
     try:
         with _candado_modelo:
             _ajustar_pasos(pasos)
+            _ajustar_neg_cada(neg_cada)
             # Antes de generar, no despues: el ruido se sortea dentro de
             # generate().
             if semilla is not None:
@@ -1307,6 +1439,7 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
             )
             if EN_GPU:
                 entradas = a_dispositivo(entradas)
+            reloj = time.perf_counter()
             with torch.no_grad():
                 _estado["modelo"].generate(
                     **entradas,
@@ -1322,6 +1455,8 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
                     all_prefilled_outputs=copy.deepcopy(base),
                     audio_streamer=streamer,
                 )
+            CRONO_TUBERIA["generate"] += time.perf_counter() - reloj
+            CRONO_TUBERIA["generaciones"] += 1
     except GeneracionCancelada:
         # Se avisa: cuando esto salta por error, callarlo cuesta horas.
         print("[aviso] generacion cancelada por el cliente", flush=True)
@@ -2561,6 +2696,12 @@ class PeticionTTS(BaseModel):
     # ardilla o a resaca. De ahi el rango cerrado.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
+    # Agrupado de la rama incondicional del CFG: una pasada del backbone cada
+    # N fotogramas en vez de una por fotograma. Ver NEG_CADA y TtsLmOV. None =
+    # lo que diga VIBEVOICE_NEG_CADA. Va por peticion para poder medirlo sin
+    # reiniciar el servicio ni pelearse con las variables de la unidad.
+    neg_cada: Optional[int] = Field(None, ge=1, le=6)
+
 
 class PeticionSesion(BaseModel):
     """Texto que se le mete a una sesion viva. La voz y los ajustes solo se
@@ -2607,6 +2748,14 @@ def health() -> dict:
         "rtf_esperado": RTF_MEDIDO,
         "ocupado": _candado.locked() or _candado_modelo.locked(),
         "auth": "bearer" if TOKEN else "abierta",
+        # Que IR y que ajustes hay puestos DE VERDAD. Sin esto, comprobar un
+        # despliegue exige leer la unidad de systemd y creerse que nadie ha
+        # dejado un drop-in por medio.
+        "ir": {"lm": Path(IR_LM).name, "cabeza": Path(IR_CABEZA).name,
+               "acustico": Path(IR_ACUSTICO).name} if MOTOR == "openvino" else {},
+        "hilos": {"total": HILOS, "decoder": HILOS_DECODER,
+                  "solapado": SOLAPAR_DECODER},
+        "neg_cada": NEG_CADA,
         "sesiones": {"activas": SESIONES_ACTIVAS,
                      "abiertas": sorted(_SESIONES),
                      "espera_texto_s": ESPERA_TEXTO,
@@ -2620,6 +2769,57 @@ def health() -> dict:
                                  "prerrollo": RESPIRO_PRERROLLO},
                      "websocket": "/tts/sesion/ws"},
     }
+
+
+@app.get("/crono")
+def crono(reset: bool = True) -> dict:
+    """Reparto del tiempo de la ULTIMA tanda de generaciones, y lo pone a cero.
+
+    Se lee despues de un banco, no durante: mezcla todas las generate() que
+    hayan pasado desde el ultimo reset. `motor` son los tiempos por componente
+    del camino OpenVINO (suman mas del 100 % del reloj de pared, porque el
+    decodificador corre en otro hilo); `tuberia` dice quien espera a quien.
+    """
+    datos = {"tuberia": dict(CRONO_TUBERIA)}
+    try:                                    # solo existe con motor openvino
+        import motor as _motor
+        datos["motor"] = {k: {"s": v[0], "n": v[1],
+                              "ms": (v[0] / v[1] * 1000) if v[1] else 0.0}
+                          for k, v in _motor.CRONO.items()}
+        if reset:
+            for v in _motor.CRONO.values():
+                v[0], v[1] = 0.0, 0
+    except Exception as e:                  # noqa: BLE001
+        datos["motor"] = {"sin_datos": str(e)}
+    m = datos.get("motor") or {}
+    t = datos["tuberia"]
+    if t["generaciones"] and isinstance(m.get("tts_lm"), dict):
+        # Lo que NO es ninguna de las tres piezas compiladas: el LM de texto en
+        # torch, el conector acustico, el clasificador de EOS y el despacho de
+        # Python. Es la partida que nadie mira y en la que hay que buscar
+        # cuando las tres piezas ya no dan mas.
+        piezas = sum(m[k]["s"] for k in ("tts_lm", "cabeza", "acustico"))
+        fot = m["acustico"]["n"] or 1
+        datos["reparto_ms_por_fotograma"] = {
+            "generate": 1000 * t["generate"] / fot,
+            "tts_lm": 1000 * m["tts_lm"]["s"] / fot,
+            "cabeza": 1000 * m["cabeza"]["s"] / fot,
+            "acustico": 1000 * m["acustico"]["s"] / fot,
+            "resto": 1000 * (t["generate"] - piezas) / fot,
+            "fotogramas": fot,
+        }
+    if t["generaciones"]:
+        datos["resumen"] = {
+            "generate_s": t["generate"],
+            "contrapresion_pct": 100 * t["contrapresion"] / t["generate"],
+            "worker_ocupado_pct": 100 * t["trabajo_worker"] / t["generate"],
+            "worker_hambre_pct": 100 * t["hambre_worker"] / t["generate"],
+            "decode_ms": 1000 * t["trabajo_worker"] / max(1, t["decodes"]),
+            "decodes": t["decodes"],
+        }
+    if reset:
+        crono_cero()
+    return datos
 
 
 @app.get("/voces")
@@ -2649,7 +2849,7 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
                 None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
-                pet.semilla, pet.pasos,
+                pet.semilla, pet.pasos, pet.neg_cada,
             )
             try:
                 yield cabecera_wav_flujo(ritmo)

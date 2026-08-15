@@ -119,6 +119,23 @@
     # Motor OpenVINO: RTF 1,09 frente a 2,19 de PyTorch. La primera activacion
     # genera los grafos (~15 min, pico de 4,6 GB de RAM); despues arranca solo.
     openvino.enable = true;
+
+    # 6 Y NO LA AUTODETECCION. Aqui la autodeteccion se equivoca, y no por un
+    # fallo suyo: el hipervisor presenta las 12 vCPU con `core id` distinto y
+    # sin `physical id`, asi que dentro de la VM parecen 12 nucleos fisicos y
+    # no 6 con sus hermanos SMT. detectar_hilos() cuenta 12, deja uno libre y
+    # sale con 11, que es sobresuscribir al doble.
+    #
+    # Medido con el IR real y la maquina libre (ms por llamada, menor mejor):
+    #
+    #   hilos      1      2      3      4      5      6      8     11     12
+    #   backbone  31,3   19,7   16,4   14,5   14,4   14,0   16,2   20,4   20,2
+    #   decoder  157,7   87,8   60,8   50,8   43,2   43,3   51,8   97,0   46,8
+    #
+    # A partir de 6 no hay nada que ganar y sí que perder: los hilos 7 a 12
+    # son hermanos SMT de los seis primeros y se pelean por la misma unidad
+    # AVX2. End-to-end, sin solapar: 6 hilos 0,988 · 8 hilos 1,154.
+    hilos = 6;
   };
 
   services.voz-stream = {
