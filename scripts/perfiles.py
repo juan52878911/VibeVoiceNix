@@ -107,6 +107,16 @@ CATEGORIAS = {
                   "error y hay que cerrarla con algo.",
     "negacion":   "no se ha podido: averia del LLM o de la voz. Mejor eso "
                   "que un cartel rojo y silencio.",
+    "consultando": "una herramienta esta consultando y el modelo NO dijo nada "
+                   "antes de llamarla. Cuando si lo dice ('voy a mirar tu "
+                   "calendario') no suena: seria pisarle con una coletilla "
+                   "peor y mas generica que la suya.",
+    "confirmando": "el remate de una accion confirmada por voz: 'Enviado.', "
+                   "'Borrada.'. NO es una coletilla intercambiable como las "
+                   "demas -- se elige POR TEXTO (Catalogo.buscar), porque "
+                   "decir 'apuntado' cuando lo que se hizo fue borrar seria "
+                   "mentir. Al estar pregenerado, el remate suena en el acto "
+                   "en vez de costar una locucion entera.",
 }
 
 # El perfil de serie. Se escribe a disco con `perfiles.py init` y es lo que se
@@ -201,6 +211,20 @@ def huella(texto: str, voz: dict) -> str:
 
 
 # ------------------------------------------------------------- el fichero --
+def dominios_de(perfil: dict) -> list:
+    """Los dominios de herramienta HABILITADOS de un perfil.
+
+    Un perfil no lista herramientas sueltas sino areas ('calendario',
+    'correo'...). Lo que se reparte entre asistentes son areas -- el del
+    servidor no tiene por que poder mandar correos -- y asi añadir una
+    herramienta nueva a un area no obliga a tocar los tres perfiles."""
+    ds = []
+    for h in perfil.get("herramientas") or []:
+        if h.get("habilitada"):
+            ds += (h.get("config") or {}).get("dominios") or []
+    return sorted(set(ds))
+
+
 def cargar(ruta=None) -> dict:
     """Lee el fichero de perfiles. Si no existe, devuelve el de serie."""
     if ruta is None:
@@ -456,6 +480,39 @@ class Politica:
                 return cat
         return None
 
+    # LAS OTRAS TRES NO VAN POR PLAZO, VAN POR SUCESO, y por eso no caben en
+    # toca(): no hay un reloj que las dispare, hay algo que pasa.
+    #
+    #   CONSULTANDO cuando arranca una herramienta y el modelo no habia dicho
+    #   nada antes de llamarla. Si dijo "voy a mirar tu calendario" NO suena:
+    #   esa frase ya es el relleno, y encima es mejor que cualquiera de los
+    #   nuestros porque habla de lo que se esta consultando de verdad.
+    #
+    #   NEGACION cuando la respuesta se cae SIN HABER SONADO NADA: una
+    #   herramienta que revienta, el LLM que no contesta, la sesion de voz que
+    #   se rompe antes del primer PCM. Sin esto el asistente se queda callado
+    #   y el usuario no sabe si le ha oido.
+    #
+    #   CERRANDO cuando la locucion se corta A MITAD, con audio ya sonando: el
+    #   freno de descarrile, el plazo de silencio, un error de la sesion
+    #   despues del primer PCM. Es el unico caso en que añadir palabras que el
+    #   LLM no dijo MEJORA la cosa: la alternativa es una frase que se corta
+    #   sola en seco, que suena a averia. En un final normal no se usa, y esa
+    #   es la diferencia con negacion: negacion es "no ha salido", cerrando es
+    #   "salio a medias y lo remato".
+    #
+    # Son excluyentes por construccion (`hay_audio` decide cual de las dos) y
+    # no se repiten, como las de plazo.
+    def por_suceso(self, categoria: str) -> str | None:
+        """La categoria si toca y hay audio para ella, o None."""
+        if self.cat is None or categoria in self.sonados:
+            return None
+        return categoria if self.cat.hay(categoria) else None
+
+    def remate(self, hay_audio: bool) -> str | None:
+        """Que decir cuando la respuesta se ha ido al traste."""
+        return self.por_suceso("cerrando" if hay_audio else "negacion")
+
     def apuntar(self, categoria: str, transcurrido: float, ms: float) -> None:
         """Se acaba de mandar uno: hasta que termine no se manda otro."""
         self.sonados.append(categoria)
@@ -478,6 +535,18 @@ class Catalogo:
 
     def hay(self, categoria: str) -> bool:
         return bool(self.cats.get(categoria))
+
+    def buscar(self, categoria: str, texto: str) -> dict | None:
+        """El relleno con ESE texto exacto, o None.
+
+        Existe por 'confirmando': ahi el audio no es intercambiable. Si el
+        usuario acaba de decir que si a borrar una nota, el remate tiene que
+        ser 'Borrada.' y no un 'Apuntado.' elegido al azar de la misma
+        categoria."""
+        for x in self.cats.get(categoria) or []:
+            if x["texto"].strip().lower() == (texto or "").strip().lower():
+                return x
+        return None
 
     def elegir(self, categoria: str, azar=None) -> dict | None:
         import random

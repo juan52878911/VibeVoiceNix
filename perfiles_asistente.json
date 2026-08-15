@@ -1,11 +1,12 @@
 {
  "version": 1,
  "perfil_por_defecto": "general",
+ "_nota": "TRES PERFILES, Y LO QUE CAMBIA ENTRE ELLOS ES TODO: voz, semilla, registro, coletillas y JUEGO DE HERRAMIENTAS. Un perfil no es un tema de color: es otro asistente. El juego de herramientas va por 'dominios' (scripts/herramientas.py) y no por nombre suelto, porque lo que se reparte entre asistentes son areas -- el del servidor no tiene por que poder mandar correos -- y asi añadir una herramienta a un area no obliga a tocar los tres perfiles.",
  "perfiles": {
   "general": {
    "nombre": "General",
-   "descripcion": "El asistente de casa, sin especialidad.",
-   "_nota": "Perfil de arranque. Copia este bloque y cambia voz, sistema y rellenos para tener otro.",
+   "descripcion": "El asistente de casa. Lo ve todo: agenda, correo, servidor, notas, recordatorios y busqueda web.",
+   "_nota": "El de arranque y el que hay que usar para probar la experiencia entera. Copia este bloque y cambia voz, sistema, rellenos y dominios para tener otro.",
    "voz": {
     "voz": "sp-Spk1_man",
     "semilla": 11,
@@ -35,6 +36,18 @@
      "Un momento más.",
      "Casi lo tengo."
     ],
+    "consultando": [
+     "Lo estoy mirando.",
+     "Un segundo, que lo consulto.",
+     "Voy a por ello."
+    ],
+    "confirmando": [
+     "Hecho.",
+     "Enviado.",
+     "Apuntado.",
+     "Borrada.",
+     "Vale, lo dejo."
+    ],
     "cerrando": [
      "Y eso es todo.",
      "Ya está.",
@@ -46,12 +59,21 @@
      "Ahora mismo no puedo."
     ]
    },
-   "herramientas": []
+   "herramientas": [
+    {
+     "id": "casa_completo",
+     "tipo": "interno",
+     "descripcion": "Las seis areas simuladas: calendario, correo, servidor, notas, recordatorios y web. Los datos viven en herramientas_simuladas.json.",
+     "habilitada": true,
+     "config": {"dominios": ["calendario", "correo", "servidor", "notas", "recordatorios", "web"]},
+     "esquema": {"parametros": {}}
+    }
+   ]
   },
   "servidor": {
    "nombre": "Servidor",
-   "descripcion": "Vigila la VM y los servicios: estado, disco, unidades caidas.",
-   "_nota": "Segundo perfil, y esta aqui para demostrar que lo que cambia entre perfiles es TODO: otra voz, otra semilla, otro registro y otros rellenos. Los rellenos hablan de lo que este perfil hace de verdad ('mirando el estado'), que es justo lo que no se puede compartir entre asistentes distintos. Las herramientas van declaradas y DESHABILITADAS: nada las consume todavia, estan para que el formato no haya que rehacerlo cuando lleguen.",
+   "descripcion": "Vigila la VM y los servicios: estado, disco, unidades caidas, y las notas de los proyectos que van con ello.",
+   "_nota": "Segundo perfil, y esta aqui para demostrar que lo que cambia entre perfiles es TODO: otra voz, otra semilla, otro registro, otras coletillas y OTRO JUEGO DE HERRAMIENTAS. Este no puede mandar correos ni tocar la agenda, y no por prudencia: es que ese no es su trabajo. Las coletillas hablan de lo que este perfil hace de verdad ('mirando el estado'), que es justo lo que no se puede compartir entre asistentes distintos.",
    "voz": {
     "voz": "sp-Spk3_man",
     "semilla": 7,
@@ -78,6 +100,16 @@
      "Sigo consultando.",
      "Todavía está respondiendo."
     ],
+    "consultando": [
+     "Consultando la unidad.",
+     "Leyendo el estado."
+    ],
+    "confirmando": [
+     "Hecho.",
+     "Apuntado.",
+     "Borrada.",
+     "Vale, lo dejo."
+    ],
     "cerrando": [
      "Eso es todo por ahora.",
      "Sin novedad."
@@ -89,20 +121,81 @@
    },
    "herramientas": [
     {
-     "id": "estado_servidor",
-     "tipo": "http",
-     "descripcion": "Lee el estado de las unidades de systemd y la carga de la VM.",
-     "habilitada": false,
-     "config": {"url": "http://192.168.2.54:8082/health"},
-     "esquema": {"parametros": {"unidad": {"tipo": "texto", "obligatorio": false}}}
+     "id": "vigilancia",
+     "tipo": "interno",
+     "descripcion": "Estado de la maquina y notas de proyecto. Sin correo ni agenda: no es su trabajo.",
+     "habilitada": true,
+     "config": {"dominios": ["servidor", "notas"]},
+     "esquema": {"parametros": {}}
     },
     {
      "id": "obsidian_notas",
      "tipo": "mcp",
-     "descripcion": "Busca y escribe notas en la boveda de Obsidian.",
+     "descripcion": "El MCP de Obsidian de verdad. Sigue DESHABILITADO: cuando se enchufe, sustituye a la parte 'notas' de la herramienta interna de arriba.",
      "habilitada": false,
      "config": {},
      "esquema": {"parametros": {"consulta": {"tipo": "texto", "obligatorio": true}}}
+    }
+   ]
+  },
+  "agenda": {
+   "nombre": "Agenda",
+   "descripcion": "El secretario: calendario, correo y recordatorios. Es el que mas escribe, y por tanto el que mas confirma en voz alta.",
+   "_nota": "Tercer perfil, y esta para enseñar LA REGLA DE SEGURIDAD. Es el unico que concentra las cuatro acciones de escritura (crear evento, mandar correo, apuntar recordatorio) sin ninguna herramienta de lectura tecnica que distraiga, asi que probando con este se ve el ciclo entero -- pides algo, te lo repite, dices que si, lo hace -- sin nada mas de por medio. Voz distinta (sp-Spk5_man) para que se note el cambio de perfil sin mirar la pantalla.",
+   "voz": {
+    "voz": "sp-Spk5_man",
+    "semilla": 23,
+    "cfg_scale": 3.5,
+    "pasos": 6
+   },
+   "sistema": "Eres el secretario de casa: agenda, correo y recordatorios. Hablas en castellano, con frases cortas, y siempre dices primero la hora o el nombre y despues el detalle. Nada de listas ni markdown: esto se dice en voz alta.",
+   "vocabulario": {
+    "registro": "amable y eficiente, de usted a nadie pero sin confianzas",
+    "terminos": ["agenda", "recordatorio", "remitente", "asunto", "hueco"]
+   },
+   "rellenos": {
+    "afirmacion": [
+     "Voy.",
+     "Ahora te lo digo.",
+     "Marchando."
+    ],
+    "pensando": [
+     "Mirando la agenda.",
+     "A ver qué tienes.",
+     "Un segundo, que lo busco."
+    ],
+    "esperando": [
+     "Sigo buscando.",
+     "Un momento más, que hay bastante."
+    ],
+    "consultando": [
+     "Consultando la agenda.",
+     "Mirando el correo."
+    ],
+    "confirmando": [
+     "Hecho.",
+     "Enviado.",
+     "Apuntado.",
+     "Borrada.",
+     "Vale, lo dejo."
+    ],
+    "cerrando": [
+     "Y ya está.",
+     "Eso es todo."
+    ],
+    "negacion": [
+     "No he podido con eso.",
+     "Eso no me ha salido."
+    ]
+   },
+   "herramientas": [
+    {
+     "id": "secretaria",
+     "tipo": "interno",
+     "descripcion": "Calendario, correo y recordatorios, con sus cuatro acciones de escritura. Sin servidor ni busqueda web.",
+     "habilitada": true,
+     "config": {"dominios": ["calendario", "correo", "recordatorios"]},
+     "esquema": {"parametros": {}}
     }
    ]
   }

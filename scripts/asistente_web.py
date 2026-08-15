@@ -188,6 +188,7 @@ from conversacion import RECUERDO_COMPUERTA, decidir, preguntar_con_historial  #
 from interrupcion import clasificar, que_decir  # noqa: E402
 from oido import Oido  # noqa: E402
 import perfiles  # noqa: E402
+import herramientas  # noqa: E402
 
 try:
     from websockets.exceptions import ConnectionClosed
@@ -201,6 +202,13 @@ except ImportError:  # pragma: no cover - solo para poder dar un error legible
 CFG = {}
 # Los perfiles de voz (scripts/oido.py). None si main() no llego a crearlos.
 OIDO = None
+# El ejecutor de herramientas (scripts/herramientas.py). Uno solo para todo el
+# proceso: es donde viven las confirmaciones pendientes, y una accion
+# preparada tiene que sobrevivir de una peticion HTTP a la siguiente -- cada
+# /preguntar es una conexion nueva, asi que si el estado viviera en el handler
+# no habria confirmacion que valiera. Se reparte por 'sesion', que manda la
+# pagina: dos pestañas no se pisan la una a la otra.
+HERRAMIENTAS = None
 
 # Sin ruido del socket durante esto, se da por rota la sesion. El plazo largo
 # es a proposito: el servicio deja de emitir mientras espera texto -- hasta
@@ -234,7 +242,11 @@ ADELANTO_TEXTO = 2 * VENTANA_TEXTO
 MINIMAX_MODELOS = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed",
                    "MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
 
-PAGINA = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+# r"""...""" y no """...""": el JavaScript de dentro lleva expresiones
+# regulares con \s, y Python las lee como secuencias de escape suyas. Sin la r
+# el aviso es solo un SyntaxWarning hoy, pero en una version futura es un error
+# y ademas el navegador recibiria otra cosa de la que esta escrita aqui.
+PAGINA = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Asistente de voz</title><style>
 :root{--f:#0d0f13;--p:#161a21;--b:#242a35;--t:#e8eaed;--s:#98a2b3;--a:#d99a4e}
@@ -316,6 +328,24 @@ select{background:var(--f);color:var(--t);border:1px solid var(--b);
 .perfil .tipo{font-size:.72rem;color:#6b7280;white-space:nowrap}
 #perfNombre{background:var(--f);color:var(--t);border:1px solid var(--b);
  border-radius:6px;padding:.5rem}
+/* HERRAMIENTAS. Dos filas de fichas: arriba lo que este perfil PUEDE hacer,
+   abajo lo que ha hecho en la respuesta en curso. El color no decora: rojizo
+   es «esta escribe», y por tanto «esta te va a preguntar antes». */
+.herrs{display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.7rem}
+.herrs:empty{display:none}
+.hf{font-size:.72rem;padding:.2rem .55rem;border-radius:99px;
+ border:1px solid var(--b);color:var(--s);white-space:nowrap;
+ font-variant-numeric:tabular-nums}
+.hf.esc{border-color:#7a3b32;color:#e0a196}
+.hf.usando{border-color:#7a5b1e;color:#f0c274;animation:latir 1.1s ease-in-out infinite}
+.hf.ok{border-color:#2f6f4f;color:#7fd6a8}
+.hf.mal{border-color:#8f3227;color:#e0725f}
+.hf.conf{border-color:#7a3b32;color:#e0a196;animation:latir 1.1s ease-in-out infinite}
+/* La acción a medias. Es lo único de la página que sale con marco: es lo
+   único que puede cambiar algo fuera del asistente. */
+.pend{margin-top:.9rem;padding:.8rem 1rem;border:1px solid #7a3b32;
+ border-radius:8px;background:#26191680;font-size:.9rem}
+.pend b{color:#e0a196;font-weight:600}
 </style></head><body><main>
 <header><h1>Asistente de voz</h1>
 <p class="sub">Escribe y responde hablando. Los tres tiempos de abajo separan
@@ -330,10 +360,21 @@ a otra en vez de reiniciarse en cada punto.</p></header>
     <button id="ir">Preguntar</button>
     <button id="mic" class="sec">Hablar</button>
     <button id="parar" class="sec" hidden>Parar</button>
+    <select id="perfil" title="quién contesta: cambia la voz, las coletillas y las herramientas"></select>
     <select id="modelo"></select>
     <label style="color:var(--s);font-size:.88rem">
       <input type="checkbox" id="pensar"> dejar que razone
     </label>
+  </div>
+  <p class="nota" id="perfilNota"></p>
+  <div class="herrs" id="herrJuego"></div>
+  <div class="pend" id="pend" hidden>
+    <div><b id="pendTexto"></b></div>
+    <div class="fila" style="margin-top:.5rem">
+      <span class="meta">Contesta «sí» o «no» por voz, o usa el botón. Nada
+      se ha hecho todavía.</span>
+      <button id="pendNo" class="sec">Cancelar</button>
+    </div>
   </div>
   <p class="nota">«Hablar» graba del micrófono, lo transcribe con whisper y deja
   el texto en el cuadro de arriba <b>para revisarlo</b> antes de preguntar.
@@ -376,6 +417,7 @@ todo voz: la sesión no emite nada hasta poder leer dos ventanas de texto (10
 tokens), así que si la primera frase se queda corta, parte de este tiempo es el
 modelo esperando a la segunda."><div class="n" id="h4">—</div><div class="e">solo la voz</div></div>
   </div>
+  <div class="herrs" id="herrUso"></div>
   <div class="resp" id="texto"></div>
   <div class="ley">
     <span><i class="t pend">escribiendo</i> el LLM aún redacta</span>
@@ -449,26 +491,43 @@ let ctx,aborto,cabeza=0;
 const rellenos={buffers:{}, cat:{}, prebufer:0.15, listo:false};
 let finRelleno=0;          // instante (reloj de ctx) en que calla el relleno
 let huecos=0, huecoMs=0;   // microcortes del reproductor, acumulados
-async function cargarRellenos(){
+// Los perfiles de asistente, tal y como los sirve /asistentes. `perfil` es
+// el activo, y cambiarlo cambia TRES cosas de golpe -- voz, coletillas y
+// juego de herramientas -- que es lo que hace que suene a otro asistente.
+let asistentes=null, perfil=null;
+// Una sesión por pestaña: es la clave con la que el puente guarda la acción
+// que está esperando un sí. Dos pestañas abiertas no se pisan la confirmación.
+const sesion=(crypto.randomUUID?crypto.randomUUID():String(Math.random())).slice(0,12);
+async function cargarRellenos(cual){
   try{
-    const r=await fetch("/asistentes"); if(!r.ok) return;
-    const d=await r.json();
-    rellenos.prebufer=d.prebufer_s||rellenos.prebufer;
-    const p=(d.perfiles||{})[d.actual]; if(!p) return;
+    if(!asistentes){
+      const r=await fetch("/asistentes"); if(!r.ok) return;
+      asistentes=await r.json();
+      rellenos.prebufer=asistentes.prebufer_s||rellenos.prebufer;
+    }
+    perfil=cual||perfil||asistentes.actual;
+    const p=(asistentes.perfiles||{})[perfil]; if(!p) return;
+    // Los buffers van por id (hash del texto+voz), así que los de un perfil no
+    // chocan con los de otro y cambiar de perfil no obliga a volver a bajar
+    // los que ya estaban. Lo que se rehace es `cat`: qué ids valen AHORA.
+    rellenos.cat={};
     const ac=new (window.AudioContext||window.webkitAudioContext)();
     for(const [clase,lista] of Object.entries(p.rellenos||{})){
-      rellenos.cat[clase]=[];
+      rellenos.cat[clase]={};
       for(const x of lista){
         try{
-          const b=await (await fetch(x.url)).arrayBuffer();
-          rellenos.buffers[x.id]=await ac.decodeAudioData(b);
-          rellenos.cat[clase].push(x.id);
+          if(!rellenos.buffers[x.id]){
+            const b=await (await fetch(x.url)).arrayBuffer();
+            rellenos.buffers[x.id]=await ac.decodeAudioData(b);
+          }
+          rellenos.cat[clase][x.texto]=x.id;
         }catch(_){}
       }
     }
     await ac.close();
     rellenos.listo=Object.keys(rellenos.buffers).length>0;
-    if(rellenos.listo) di("rellenos listos ("+Object.keys(rellenos.buffers).length+")");
+    if(rellenos.listo) di("perfil «"+p.nombre+"»: "+
+      Object.values(rellenos.cat).reduce((n,o)=>n+Object.keys(o).length,0)+" coletillas listas");
   }catch(_){}
 }
 // Suena YA, en el mismo nodo de ganancia y el mismo reloj que el habla: por
@@ -476,9 +535,15 @@ async function cargarRellenos(){
 function sonarRelleno(actx,gan,id){
   const buf=rellenos.buffers[id]; if(!buf||!actx||actx.state==="closed") return 0;
   const src=actx.createBufferSource(); src.buffer=buf; src.connect(gan);
-  const cuando=Math.max(actx.currentTime+0.02, finRelleno);
+  // `cabeza` entra en la cuenta desde que hay rellenos que suenan DESPUES del
+  // habla y no antes: 'cerrando' remata una locución cortada y 'confirmando'
+  // es la respuesta entera. Sin ella, un cierre se reproducía encima de lo
+  // que todavía quedaba encolado. Antes no hacía falta porque todos los
+  // rellenos eran previos al primer PCM y ahí cabeza vale 0.
+  const cuando=Math.max(actx.currentTime+0.02, finRelleno, cabeza);
   src.start(cuando);
   finRelleno=cuando+buf.duration;
+  cabeza=Math.max(cabeza,finRelleno);
   return finRelleno;
 }
 for(const [r,v] of [["cfg","vcfg"],["vel","vvel"],["pasos","vpasos"]]){
@@ -508,7 +573,57 @@ function di(t,e){$("est").className="est"+(e?" err":"");$("est").textContent=t}
 // Los rellenos, en cuanto la pagina existe. Si el puente aun los esta
 // generando (primer arranque, ~30 s de VM) esto vuelve vacio y se reintenta
 // una vez: no hay nada que romper, solo una mejora que llega o no llega.
-cargarRellenos().then(()=>{ if(!rellenos.listo) setTimeout(cargarRellenos,45000); });
+cargarRellenos().then(pintarPerfil).then(()=>{
+  if(!rellenos.listo) setTimeout(()=>cargarRellenos(perfil).then(pintarPerfil),45000); });
+
+// ---- el perfil activo -----------------------------------------------------
+// Hasta ahora solo se podía elegir con --asistente al arrancar el puente, o
+// sea reiniciándolo. Aquí se cambia en caliente y cambian a la vez la voz, las
+// coletillas y las herramientas: son las tres cosas que hacen a un asistente
+// distinto de otro, y separarlas no tendría sentido.
+function pintarPerfil(){
+  if(!asistentes) return;
+  const sel=$("perfil");
+  if(!sel.options.length){
+    sel.innerHTML=Object.entries(asistentes.perfiles||{})
+      .map(([k,p])=>`<option value="${k}"${k===perfil?" selected":""}>${escapar(p.nombre)}</option>`).join("");
+    sel.addEventListener("change",async()=>{
+      await cargarRellenos(sel.value); pintarPerfil(); refrescarPendiente();
+    });
+  }
+  const p=(asistentes.perfiles||{})[perfil]; if(!p) return;
+  $("perfilNota").innerHTML=escapar(p.descripcion||"")+
+    ' <span class="meta">· voz '+escapar(p.voz.voz)+', semilla '+p.voz.semilla+'</span>';
+  // La voz del perfil manda sobre los mandos de abajo, pero se DEJAN tocar:
+  // el perfil es un punto de partida, no una jaula.
+  for(const [id,v] of [["voz",p.voz.voz],["cfg",p.voz.cfg_scale],
+                       ["pasos",p.voz.pasos],["semilla",p.voz.semilla]])
+    if(v!==undefined&&v!==null&&$(id)) $(id).value=v;
+  for(const [r,o] of [["cfg","vcfg"],["pasos","vpasos"]])
+    $(o).textContent=r==="pasos"?$(r).value:(+$(r).value).toFixed(2);
+  const c=$("herrJuego");
+  c.innerHTML=(p.juego||[]).map(h=>
+    `<span class="hf${h.escribe?" esc":""}" title="${escapar(h.descripcion)}">`+
+    `${h.escribe?"✎ ":""}${escapar(h.nombre)}</span>`).join("")||
+    '<span class="hf">sin herramientas: contesta solo con lo que sabe</span>';
+}
+// ---- la acción que espera un sí -------------------------------------------
+async function refrescarPendiente(){
+  try{
+    const d=await fetch("/herramientas?sesion="+sesion).then(r=>r.json());
+    pintarPendiente(d.pendiente);
+  }catch(_){}
+}
+function pintarPendiente(p){
+  $("pend").hidden=!p;
+  if(p) $("pendTexto").textContent="Voy a "+p.resumen+". ¿Lo hago?";
+}
+$("pendNo").addEventListener("click",async()=>{
+  await fetch("/herramientas/cancelar",{method:"POST",
+    headers:{"content-type":"application/json"},body:JSON.stringify({sesion})});
+  pintarPendiente(null); di("acción cancelada: no se ha hecho nada.");
+});
+refrescarPendiente();
 
 // ---- instruccion de sistema -------------------------------------------
 // Vive en el NAVEGADOR (localStorage), no en el puente: asi cada navegador
@@ -664,6 +779,28 @@ function reanudar(motivo,c){
   lanzarPregunta("",{decir:c.restante,continuaDe:c.dicho,sinApunte:true});
   return true;
 }
+// ---- las fichas de herramienta -------------------------------------------
+// Misma idea que los cuatro estados por trozo: el color dice EN QUÉ FASE está
+// cada herramienta ahora mismo. Una ficha por llamada, que va cambiando de
+// estado en vez de apilarse, para que se lea de un vistazo qué se consultó.
+const fichas={};
+function herramienta(ev){
+  const c=$("herrUso");
+  let f=fichas[ev.id];
+  if(!f){ f=document.createElement("span"); fichas[ev.id]=f; c.appendChild(f); }
+  const clases={llamando:"usando",hecho:"ok",confirmar:"conf",
+                error:"mal",confirmada:"ok",descartada:"mal",tope:"mal"};
+  f.className="hf "+(clases[ev.fase]||"");
+  const marca={llamando:"⋯",hecho:"",confirmar:"⏸",error:"✕",
+               confirmada:"✔",descartada:"✖"}[ev.fase]||"";
+  f.textContent=(marca?marca+" ":"")+(ev.nombre||"")+
+    (ev.fase==="llamando"?"":(ev.resumen?" · "+ev.resumen.replace(/^[⏸✔✖]\s*/,""):""));
+  if(f.textContent.length>110) f.textContent=f.textContent.slice(0,107)+"…";
+  f.title=(ev.args?JSON.stringify(ev.args):"")+(ev.error?"  "+ev.error:"");
+  if(ev.fase==="confirmar"&&ev.resumen)
+    pintarPendiente({resumen:ev.resumen.replace(/^⏸\s*/,"").replace(/ — esperando el sí$/,"")});
+  if(ev.fase==="confirmada"||ev.fase==="descartada") pintarPendiente(null);
+}
 function lanzarPregunta(q,extra){
   preguntaEnCurso=preguntarVoz(q,extra||{}).finally(()=>{preguntaEnCurso=null;});
   return preguntaEnCurso;
@@ -672,6 +809,7 @@ async function preguntarVoz(q,extra){
   $("ir").disabled=true; $("parar").hidden=false; enPregunta=true;
   ["h1","h2","h3","h4"].forEach(i=>$(i).textContent="—");
   trozos=[]; pendiente=""; pintar(); di("preguntando…");
+  $("herrUso").textContent=""; for(const k in fichas) delete fichas[k];
   const actx=new AudioContext(); const ab=new AbortController();
   const gan=actx.createGain(); gan.connect(actx.destination);
   // El arnes de pruebas inyecta audio por el camino del servidor y NO quiere
@@ -687,6 +825,11 @@ async function preguntarVoz(q,extra){
   // es gratis pero mueve el tono. Se congela al empezar para que moverla a
   // mitad no descuadre el reloj de encolado.
   const vel=+$("vel").value;
+  // Lo que el modelo tiene que LEER de este turno cuando lo dijo el programa
+  // y no él. Se apunta en el historial en vez del texto para que no lo imite:
+  // ver el bloque LO QUE DICE EL PROGRAMA NO ENTRA EN EL HUECO DEL MODELO en
+  // scripts/herramientas.py, con los números de por qué.
+  let notaTurno=null;
   const t0=performance.now(); let resto=new Uint8Array(0), primero=0, hitos={};
   const marcas=extra.marcas||{}; marcas.t0=t0;
   let respuesta="";
@@ -708,6 +851,9 @@ async function preguntarVoz(q,extra){
         // se resuelva AQUI, en paralelo con el LLM, en vez de en /escuchar.
         decir:extra.decir||null,
         compuerta:extra.compuerta||null,
+        // El perfil y la sesión: quién contesta, y con qué confirmación a
+        // medias se está hablando.
+        perfil:perfil, sesion:sesion,
         voz:$("voz").value, cfg:+$("cfg").value,
         pasos:+$("pasos").value,
         semilla:$("semilla").value===""?null:+$("semilla").value})});
@@ -751,7 +897,24 @@ async function preguntarVoz(q,extra){
             case "relleno":
               sonarRelleno(actx,gan,ev.id);
               marcas.relleno=marcas.relleno||ev.s;
+              // 'confirmando' NO es una coletilla que tape un hueco: es la
+              // respuesta entera, ya grabada. Cuenta como primer sonido, y es
+              // el camino más rápido que tiene esto -- ni LLM ni sesión de voz.
+              if(ev.clase==="confirmando"&&!primero){
+                primero=ev.s; marcas.sonido=ev.s; marcas.pregrabado=true;
+                $("h3").textContent=ev.s.toFixed(2)+"s (pregrabado)";
+              }
               if(!primero) di("…"+ev.texto);
+              break;
+            // ---- herramientas: qué se está usando y con qué resultado -----
+            case "herramienta":  herramienta(ev); break;
+            case "pendiente":
+              if(ev.nota) notaTurno=ev.nota;
+              if(ev.estado==="resuelta"||ev.estado==="descartada") pintarPendiente(null);
+              break;
+            case "herramientas_resumen":
+              if(ev.nota) notaTurno=ev.nota;
+              pintarPendiente(ev.pendiente?{resumen:ev.pendiente}:null);
               break;
             case "error":       di(ev.texto,true);   break;
           }
@@ -833,7 +996,8 @@ async function preguntarVoz(q,extra){
     ultimoDicho=antes+donde.dicho;
     corte={dicho:antes+donde.dicho,restante:donde.restante};
   }else if(respuesta.trim()){
-    historial.push({rol:"asistente",texto:antes+respuesta.trim()});
+    historial.push({rol:"asistente",texto:antes+respuesta.trim(),
+                    nota:notaTurno||undefined});
     ultimoDicho=antes+respuesta.trim();
   }
   while(historial.length>24) historial.shift();
@@ -1471,12 +1635,26 @@ def estado_asistentes() -> dict:
     salida = {}
     for nombre, p in datos["perfiles"].items():
         cats = (m["perfiles"].get(nombre) or {}).get("categorias", {})
+        # Las herramientas CONCRETAS que le tocan a este perfil, no solo los
+        # bloques declarados: es lo que la pagina pinta para que se vea de un
+        # vistazo que puede y que no puede hacer cada asistente, y sobre todo
+        # cuales de ellas escriben.
+        # Con --sin-herramientas la lista va VACIA aunque el perfil las
+        # declare: la pagina tiene que enseñar lo que este asistente puede
+        # hacer AHORA, no lo que podria si estuvieran encendidas.
+        dominios = perfiles.dominios_de(p) if HERRAMIENTAS is not None else []
+        juego = [{"nombre": h["nombre"], "dominio": h["dominio"],
+                  "escribe": h["escribe"], "descripcion": h["descripcion"]}
+                 for h in herramientas.CATALOGO
+                 if h["nombre"] in herramientas.por_dominios(dominios)]
         salida[nombre] = {
             "nombre": p.get("nombre", nombre),
             "descripcion": p.get("descripcion", ""),
             "voz": p["voz"],
             "sistema": p.get("sistema", ""),
             "vocabulario": p.get("vocabulario", {}),
+            "dominios": dominios,
+            "juego": juego,
             "herramientas": [{"id": h["id"], "tipo": h["tipo"],
                               "habilitada": bool(h.get("habilitada")),
                               "descripcion": h.get("descripcion", "")}
@@ -1630,6 +1808,24 @@ class Puente(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(cuerpo)))
             self.end_headers()
             self.wfile.write(cuerpo)
+        elif self.path.startswith("/herramientas"):
+            # EL CATALOGO Y LO QUE HAY A MEDIAS. La pagina lo pinta para que se
+            # vea sin abrir un fichero que puede hacer cada perfil, cuales de
+            # esas cosas ESCRIBEN, y si hay una accion esperando un si.
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            ses = (q.get("sesion") or ["web"])[0]
+            p = HERRAMIENTAS.pendiente(ses) if HERRAMIENTAS else None
+            self.responder_json(200, {
+                "disponible": HERRAMIENTAS is not None,
+                "datos": str(HERRAMIENTAS.sim.ruta) if HERRAMIENTAS else None,
+                "catalogo": [{"nombre": h["nombre"], "dominio": h["dominio"],
+                              "escribe": h["escribe"],
+                              "descripcion": h["descripcion"],
+                              "sustituir_por": h["sustituir_por"]}
+                             for h in herramientas.CATALOGO],
+                "pendiente": ({"nombre": p["nombre"], "resumen": p["resumen"]}
+                              if p else None),
+                "ultimas": (HERRAMIENTAS.registro[-8:] if HERRAMIENTAS else [])})
         elif self.path == "/asistentes":
             # LOS PERFILES DE ASISTENTE, que no son los de VOZ. /perfiles ya
             # estaba cogido por las huellas de oido.py y son cosas distintas:
@@ -1900,6 +2096,16 @@ class Puente(BaseHTTPRequestHandler):
             return self.escuchar()
         if self.path == "/barrera":
             return self.barrera()
+        if self.path == "/herramientas/cancelar":
+            # El boton de "no" de la pagina. Existe porque una accion a medias
+            # tiene que poder tirarse SIN hablar: si el asistente entendio mal
+            # y ya esta preguntando si manda un correo, lo ultimo que apetece
+            # es tener que discutirlo por voz.
+            n = int(self.headers.get("content-length", 0))
+            d = json.loads(self.rfile.read(n) or b"{}")
+            ses = d.get("sesion") or "web"
+            había = HERRAMIENTAS.cancelar(ses) if HERRAMIENTAS else False
+            return self.responder_json(200, {"cancelada": había})
         if self.path == "/perfiles/matricular":
             return self.perfil_matricular()
         if self.path == "/perfiles/renombrar":
@@ -1946,10 +2152,37 @@ class Puente(BaseHTTPRequestHandler):
             return
 
         modelo = pet.get("modelo") or CFG["modelo"]
+        # ---- que perfil habla, y con que herramientas --------------------
+        # El perfil manda tres cosas a la vez y conviene verlas juntas: su
+        # voz (mas abajo, al abrir la sesion), sus coletillas (catalogo) y su
+        # juego de herramientas (dominios). Cambiar de perfil en la pagina
+        # cambia las tres de golpe, que es lo que hace que suene a OTRO
+        # asistente y no al mismo con otro sombrero.
+        perfil = pet.get("perfil") or CFG.get("perfil")
+        datos_perfil = ((_ASISTENTES["datos"] or {}).get("perfiles") or {}).get(perfil) or {}
+        dominios = perfiles.dominios_de(datos_perfil)
+        esquemas = (herramientas.esquemas_anthropic(
+            herramientas.por_dominios(dominios)) if dominios and HERRAMIENTAS
+            else None)
+        sesion_herr = pet.get("sesion") or "web"
+        historial_pet = pet.get("historial") or []
+
         # La instruccion de sistema puede venir de la pagina: es la forma de
         # dirigir al LLM sin reiniciar el puente. Vacia o en blanco, vale la
-        # de serie del arranque (--sistema).
-        sistema = (pet.get("sistema") or "").strip() or CFG["sistema"]
+        # del PERFIL, y si el perfil no trae, la de serie del arranque.
+        sistema = ((pet.get("sistema") or "").strip()
+                   or datos_perfil.get("sistema") or CFG["sistema"])
+        registro = (datos_perfil.get("vocabulario") or {}).get("registro")
+        if registro:
+            sistema += f" Habla en un registro {registro}."
+        if esquemas:
+            # El anexo de herramientas va SIEMPRE detras y no lo puede pisar
+            # la pagina: la regla de que escribir se confirma no es una
+            # preferencia de estilo que se cambie desde una casilla de texto.
+            sistema += " " + herramientas.instrucciones()
+            notas = herramientas.notas_recientes(historial_pet)
+            if notas:
+                sistema += " " + notas
         # "/no_think" es un truco de qwen bajo Ollama y se añade DESPUES de
         # elegir la instruccion, venga de donde venga. MiniMax manda el
         # razonamiento en bloques aparte, asi que ahi no pinta nada.
@@ -2006,10 +2239,100 @@ class Puente(BaseHTTPRequestHandler):
         # consulta desde el bucle de abajo -- que da una vuelta cada 20 ms --
         # y NO desde un hilo, porque emitir marcos desde dos hilos a la vez
         # partiria el flujo binario que lee el navegador.
-        perfil = pet.get("perfil") or CFG.get("perfil")
         catalogo = _ASISTENTES["catalogos"].get(perfil)
         politica = (perfiles.Politica(catalogo, con_compuerta=bool(compuerta))
                     if catalogo is not None else None)
+
+        # ---- ¿es esto el sí de una acción que quedó esperando? -----------
+        # Se mira ANTES de tocar el LLM, y si lo es no se toca: el veredicto
+        # sale de una lista cerrada de palabras (herramientas.clasificar_
+        # respuesta) y el remate es una frase fija. Eso quita del camino la
+        # vuelta entera de MiniMax -- 1,2-2 s -- justo en el momento en que
+        # menos se perdona esperar, que es despues de haber dicho "sí".
+        #
+        # Y el que decide NO es el modelo. Ver la cabecera de herramientas.py:
+        # dejarselo a el acababa con un «hecho, borrada» sobre algo que no se
+        # habia borrado.
+        confirmacion, descartada = None, None
+        if HERRAMIENTAS is not None and not pet.get("decir"):
+            pend = HERRAMIENTAS.pendiente(sesion_herr)
+            if pend:
+                v = herramientas.clasificar_respuesta(pet.get("texto", ""))
+                # UN «SÍ» QUE NO IBA PARA MÍ NO ES UN SÍ. Con el microfono
+                # siempre abierto, en una habitacion con gente, alguien dice
+                # que si a otra persona y eso mandaria el correo. Aqui SI se
+                # espera a la compuerta antes de tocar nada -- es el unico
+                # sitio de todo el puente donde vale la pena pagar sus
+                # 0,47-0,70 s en el camino critico, porque lo que hay al otro
+                # lado no se deshace.
+                #
+                # Y si no contesta a tiempo, NO se confirma: el pendiente se
+                # queda como estaba y el usuario puede repetir el sí. La
+                # duda cae siempre del lado de no escribir.
+                if compuerta and v in ("si", "no"):
+                    limite = time.time() + 3.0
+                    while not veredicto and time.time() < limite:
+                        time.sleep(0.02)
+                    if not veredicto.get("dirigida"):
+                        v = "esperar"
+                        evento(tipo="pendiente", estado="sigue",
+                               resumen=pend["resumen"],
+                               motivo="el sí no iba dirigido al asistente"
+                                      if veredicto else
+                                      "la compuerta no contestó a tiempo")
+                if v in ("si", "no"):
+                    res, resumen, frase = HERRAMIENTAS.confirmar(sesion_herr,
+                                                                 v == "si")
+                    confirmacion = {"frase": frase, "resumen": resumen,
+                                    "nombre": pend["nombre"], "si": v == "si",
+                                    "nota": herramientas.nota_de_remate(
+                                        pend["resumen"], v == "si")}
+                elif v != "esperar":
+                    # NI SÍ NI NO: se descarta y se sigue como pregunta nueva.
+                    # Es la unica salida honesta -- "¿y qué hora es?" no es un
+                    # sí a mandar un correo -- y ademas la segura: en la duda,
+                    # no se escribe.
+                    HERRAMIENTAS.cancelar(sesion_herr)
+                    descartada = pend["resumen"]
+                    evento(tipo="pendiente", estado="descartada",
+                           resumen=pend["resumen"],
+                           motivo="ni sí ni no: se descarta",
+                           nota=herramientas.nota_de_remate(pend["resumen"],
+                                                            False))
+            HERRAMIENTAS.turno(sesion_herr)
+        if confirmacion:
+            evento(tipo="herramienta", fase="confirmada" if confirmacion["si"]
+                   else "descartada", nombre=confirmacion["nombre"],
+                   resumen=confirmacion["resumen"], escribe=True,
+                   s=round(time.time() - t0, 3))
+            evento(tipo="pendiente", estado="resuelta",
+                   nota=confirmacion["nota"])
+            # EL REMATE YA ESTA GRABADO. "Enviado." es una de las frases del
+            # catalogo del perfil (categoria 'confirmando'), asi que el
+            # navegador la tiene decodificada desde que abrio la pagina: se
+            # dice sin LLM, sin sesion de voz y sin tocar la VM. Es el unico
+            # sitio de todo esto donde la respuesta entera cabe en un relleno,
+            # y es justo donde mas se agradece -- despues de decir "sí" nadie
+            # quiere esperar dos segundos a saber si se ha mandado.
+            pre = (catalogo.buscar("confirmando", confirmacion["frase"])
+                   if catalogo is not None else None)
+            if pre:
+                evento(tipo="hito", hito="token", s=round(time.time() - t0, 3))
+                evento(tipo="trozo", id=0, texto=confirmacion["frase"],
+                       pendiente="")
+                evento(tipo="relleno", clase="confirmando", id=pre["id"],
+                       ms=pre["ms"], texto=pre["texto"],
+                       url=f"/rellenos/{pre['fichero']}",
+                       s=round(time.time() - t0, 3))
+                evento(tipo="hecho", id=0, s=round(time.time() - t0, 3))
+                return
+        if descartada:
+            # Que la accion se ha caido se le dice AL MODELO, y en el bloque de
+            # sistema. Si no, ve en el historial que le pidieron un correo, no
+            # ve ninguna respuesta suya (la pregunta de confirmacion se quita
+            # con su pareja, ver _mensajes) y lo vuelve a preparar dos turnos
+            # despues, con el usuario hablando ya de otra cosa.
+            sistema += " " + herramientas.nota_de_remate(descartada, False)
 
         # El productor manda SIEMPRE el pendiente que queda tras extraer un
         # trozo, en vez de que la pagina intente descontarlo por su cuenta.
@@ -2020,14 +2343,26 @@ class Puente(BaseHTTPRequestHandler):
             # Con historial (escucha continua, o pagina que lo mande) el LLM
             # ve la conversacion entera y quien dice cada cosa; sin el, el
             # camino de siempre, que es el probado.
-            historial = pet.get("historial") or []
+            historial = historial_pet
             hablante = pet.get("hablante")
-            if pet.get("decir"):
+            if confirmacion:
+                # El sí ya esta resuelto y la frase es fija; se llega aqui solo
+                # si el perfil no tenia el WAV pregenerado de ese remate.
+                origen = iter([confirmacion["frase"]])
+            elif pet.get("decir"):
                 # TEXTO FIJO, SIN LLM. Es como se dice el «¿qué pasa?» de una
                 # interrupcion: no hay nada que redactar, y meter un LLM en
                 # medio costaria 1,15-6,5 s que la frase no aprovecha. Se cuela
                 # por el mismo troceador y la misma sesion de voz que el resto.
                 origen = iter([pet["decir"]])
+            elif esquemas:
+                # CON HERRAMIENTAS. El generador produce texto igual que los
+                # otros, y ademas diccionarios con lo que va pasando; se
+                # distinguen por el tipo unas lineas mas abajo, asi que el
+                # troceador de frases no se entera de que hay herramientas.
+                origen = herramientas.ciclo(
+                    pet["texto"], historial, modelo, sistema, hablante,
+                    esquemas, HERRAMIENTAS, sesion_herr, CFG["ollama"])
             elif historial or hablante:
                 origen = preguntar_con_historial(pet["texto"], historial,
                                                  modelo, CFG["ollama"],
@@ -2038,6 +2373,14 @@ class Puente(BaseHTTPRequestHandler):
                 for trozo in origen:
                     if parar.is_set():
                         break       # nadie escucha: no seguir gastando el LLM
+                    if isinstance(trozo, dict):
+                        # Un suceso de herramienta. Va por la cola de TEXTO y
+                        # no por la de frases: no es algo que se diga, es algo
+                        # que se pinta, y tiene que llegar a la pagina aunque
+                        # la voz vaya atascada.
+                        cola_texto.put(("herramienta", time.time() - t0,
+                                        trozo, pendiente))
+                        continue
                     texto = ""
                     for parte in re.split(r"(<[^>]{0,20}>)", trozo):
                         if ABRE_PENSAMIENTO.fullmatch(parte or ""):
@@ -2048,7 +2391,7 @@ class Puente(BaseHTTPRequestHandler):
                             texto += parte or ""
                     if not texto:
                         continue
-                    pendiente += limpiar(texto)
+                    pendiente += herramientas.sin_json(limpiar(texto))
                     frases, pendiente = trocear(pendiente, primera=n_frases == 0,
                                                 minimo_primera=CFG["arranque"])
                     cola_texto.put(("token", time.time() - t0, texto, pendiente))
@@ -2068,17 +2411,68 @@ class Puente(BaseHTTPRequestHandler):
         threading.Thread(target=productor, daemon=True).start()
         visto = set()
 
+        # Lo que han hecho las herramientas en esta respuesta, para el resumen
+        # final y para poder afirmar en las pruebas que se llamo a la que
+        # tocaba. `dijo_algo` es lo que decide si el relleno 'consultando'
+        # tiene sentido: ver mas abajo.
+        usadas, fallos_herr, dijo_algo = [], [], False
+
         def drenar_texto():
             """Saca los tokens pendientes sin bloquear. Se llama en cada vuelta
             del bucle para que el redactado no se congele mientras baja audio."""
+            nonlocal dijo_algo
             while True:
                 try:
-                    _, s_t, texto, pend = cola_texto.get_nowait()
+                    clase, s_t, dato, pend = cola_texto.get_nowait()
                 except queue.Empty:
                     return
+                if clase == "herramienta":
+                    ev = dict(dato, s=round(s_t, 3))
+                    if ev.get("fase") == "llamando":
+                        usadas.append(ev.get("nombre"))
+                        # EL RELLENO 'consultando' SOLO SI EL MODELO NO HABLO.
+                        # Cuando el propio modelo ha escrito "voy a mirar tu
+                        # calendario", esa frase YA es el relleno, y es mejor
+                        # que cualquiera de los nuestros porque nombra lo que
+                        # de verdad se esta consultando. Meterle una coletilla
+                        # detras seria decir dos veces lo mismo y peor.
+                        if (politica is not None and not dijo_algo
+                                and not suena):
+                            cual = politica.por_suceso("consultando")
+                            if cual:
+                                elegido = catalogo.elegir(cual)
+                                if elegido:
+                                    politica.apuntar(cual, s_t, elegido["ms"])
+                                    evento(tipo="relleno", clase=cual,
+                                           id=elegido["id"], ms=elegido["ms"],
+                                           texto=elegido["texto"],
+                                           url=f"/rellenos/{elegido['fichero']}",
+                                           s=round(s_t, 3))
+                    elif ev.get("fase") == "error":
+                        # LA HERRAMIENTA REVENTO. Aqui es donde 'negacion'
+                        # gana su sitio: el modelo va a tardar otra vuelta
+                        # entera en enterarse y redactar la disculpa, y
+                        # mientras tanto el usuario esta oyendo silencio
+                        # despues de haberle pedido algo. Un "no he podido con
+                        # eso" a tiempo vale mas que la frase perfecta tarde.
+                        fallos_herr.append(ev.get("nombre"))
+                        if politica is not None and not suena:
+                            cual = politica.por_suceso("negacion")
+                            if cual:
+                                elegido = catalogo.elegir(cual)
+                                if elegido:
+                                    politica.apuntar(cual, s_t, elegido["ms"])
+                                    evento(tipo="relleno", clase=cual,
+                                           id=elegido["id"], ms=elegido["ms"],
+                                           texto=elegido["texto"],
+                                           url=f"/rellenos/{elegido['fichero']}",
+                                           s=round(s_t, 3))
+                    evento(**ev)
+                    continue
+                dijo_algo = True
                 if "token" not in visto:
                     visto.add("token"); evento(tipo="hito", hito="token", s=s_t)
-                evento(tipo="token", texto=texto, pendiente=pend)
+                evento(tipo="token", texto=dato, pendiente=pend)
 
         # ---- por que trozo va el modelo -----------------------------------
         # La pagina pinta cuatro estados por trozo y hay que seguir sabiendo
@@ -2227,6 +2621,11 @@ class Puente(BaseHTTPRequestHandler):
                 terminado = True
 
         ws = None
+        # `roto` es "la locucion no llego a su final normal" y `se_fue` es "el
+        # navegador colgo". Se distinguen porque en el segundo caso no hay a
+        # quien decirle nada: mandar un relleno de cierre a una conexion muerta
+        # solo sirve para llenar el registro de errores.
+        roto, se_fue = False, False
         try:
             # compression=None: el PCM son muestras, no texto -- deflate solo
             # anadiria CPU en los dos extremos sin quitar bytes.
@@ -2345,6 +2744,7 @@ class Puente(BaseHTTPRequestHandler):
                     evento(tipo="error",
                            texto=f"la sesion de voz lleva {SILENCIO_MAXIMO:.0f} s "
                                  f"sin decir nada; se corta")
+                    roto = True
                     break
                 # El descarrile no calla: emite. Si baja bastante mas audio del
                 # que el texto acusado puede justificar, la locucion perdio su
@@ -2355,17 +2755,62 @@ class Puente(BaseHTTPRequestHandler):
                            texto=f"{seg_pcm:.0f} s de audio para {acusados} "
                                  f"tokens de texto: la locucion descarrilo y se "
                                  f"corta")
+                    roto = True
                     break
             drenar_texto()
             for idx in emitidos:            # lo que quede a medias, cerrado
                 marcar(idx, "hecho")
         except (BrokenPipeError, ConnectionResetError):
-            pass                            # el navegador se fue a mitad
+            se_fue = True                   # el navegador se fue a mitad
         except Exception as e:
+            roto = True
             try:
                 evento(tipo="error", texto=f"{type(e).__name__}: {e}")
             except OSError:
                 pass
+        # ---- 'cerrando' y 'negacion': los dos rellenos que faltaban -------
+        # Aqui es donde tienen sentido, y no antes, porque hasta este punto no
+        # se sabe COMO ha acabado la respuesta. La regla, entera:
+        #
+        #   la locucion se rompio  +  ya sonaba algo  ->  CERRANDO
+        #     Es el unico caso en que meterle palabras que el LLM no dijo
+        #     mejora la cosa. La alternativa es una frase que se corta en seco
+        #     a mitad, que no suena a "se acabo": suena a averia. Un "y eso es
+        #     todo" cierra la cadencia y el usuario sabe que le toca hablar.
+        #     En un final NORMAL no se usa -- a la tercera vez, una coletilla
+        #     de cierre pegada a cada respuesta cansa mas que el silencio.
+        #
+        #   la locucion se rompio  +  no sono nada  ->  NEGACION
+        #     Callarse del todo despues de que te pregunten es lo peor que
+        #     puede hacer: el usuario no sabe si le has oido, y repite. "No he
+        #     podido con eso" cuesta 1 s y cierra la duda.
+        #
+        # Son excluyentes por `suena`, y ninguno de los dos suena si la
+        # respuesta salio bien.
+        try:
+            if roto and not se_fue and politica is not None:
+                cual = politica.remate(suena)
+                elegido = catalogo.elegir(cual) if cual else None
+                if elegido:
+                    politica.apuntar(cual, time.time() - t0, elegido["ms"])
+                    evento(tipo="relleno", clase=cual, id=elegido["id"],
+                           ms=elegido["ms"], texto=elegido["texto"],
+                           url=f"/rellenos/{elegido['fichero']}",
+                           s=round(time.time() - t0, 3))
+            if not se_fue and (usadas or fallos_herr):
+                p = (HERRAMIENTAS.pendiente(sesion_herr) or {}) if HERRAMIENTAS else {}
+                evento(tipo="herramientas_resumen", usadas=usadas,
+                       fallos=fallos_herr, pendiente=p.get("resumen"),
+                       # La NOTA con la que la pagina tiene que apuntar esta
+                       # respuesta en el historial. Ver _mensajes en
+                       # herramientas.py: la pregunta de confirmacion la
+                       # escribio el programa, y si entra en el historial como
+                       # si la hubiera dicho el modelo, el modelo aprende a
+                       # contestar asi y deja de llamar a las herramientas.
+                       nota=(herramientas.nota_de_pregunta(p["resumen"])
+                             if p.get("resumen") else None))
+        except OSError:
+            pass
         finally:
             # Cerrar el socket es lo que desmonta la sesion en el servidor: al
             # caerse, abortar() corta la generate() en curso y la saca del
@@ -2464,6 +2909,16 @@ def main():
                          "18,7 ms por el websocket directo): subirlo a ciegas "
                          "solo costaria latencia. El margen de verdad lo dan "
                          "los rellenos, que son 0,7-2,4 s de bufer gratis")
+    ap.add_argument("--datos-herramientas", default=None,
+                    help="el JSON con los datos SIMULADOS de las herramientas "
+                         "(scripts/herramientas.py). Por defecto "
+                         "herramientas_simuladas.json en la raiz del repo. Se "
+                         "relee solo cuando cambia, asi que se puede editar "
+                         "con el asistente en marcha")
+    ap.add_argument("--sin-herramientas", action="store_true",
+                    help="apaga el uso de herramientas. El asistente vuelve a "
+                         "contestar solo con lo que sabe, que es como estaba "
+                         "antes de que existieran")
     ap.add_argument("--sin-solapar", action="store_true",
                     help="devuelve la compuerta a su sitio de antes -- delante "
                          "del LLM y en fila -- en vez de correrla en paralelo. "
@@ -2476,7 +2931,17 @@ def main():
                compuerta=a.compuerta, whisper=a.whisper_url.rstrip("/"),
                prompt_stt=a.prompt_stt, solapar=not a.sin_solapar,
                perfil=a.asistente, prebufer=a.prebufer)
-    global OIDO
+    global OIDO, HERRAMIENTAS
+    # Las herramientas, ANTES de servir nada: si el JSON de datos esta roto es
+    # mejor enterarse en el arranque que a la tercera pregunta. Cuesta leer un
+    # fichero, no retrasa nada.
+    if not a.sin_herramientas:
+        try:
+            HERRAMIENTAS = herramientas.Ejecutor(a.datos_herramientas)
+            HERRAMIENTAS.sim.datos      # fuerza la lectura y valida el JSON
+        except Exception as e:
+            HERRAMIENTAS = None
+            print(f"  [aviso] sin herramientas: {type(e).__name__}: {e}")
     OIDO = Oido(a.perfiles)
     OIDO.precargar()        # ~6 s de carga del modelo, en un hilo aparte
     # Los perfiles de asistente y sus rellenos. En un hilo y sin poder tumbar
@@ -2501,6 +2966,13 @@ def main():
         print(f"  perf: {', '.join(sorted(_ASISTENTES['datos']['perfiles']))} "
               f"(activo: {CFG.get('perfil')}) · rellenos en "
               f"{CFG.get('rellenos_dir')} · prebufer {a.prebufer:.2f} s")
+    if HERRAMIENTAS is not None:
+        n_esc = len(herramientas.ESCRITURAS)
+        print(f"  herr: {len(herramientas.CATALOGO)} herramientas SIMULADAS "
+              f"({n_esc} escriben y se confirman por voz) · datos en "
+              f"{HERRAMIENTAS.sim.ruta}")
+    else:
+        print("  herr: apagadas")
     print(f"  oido: compuerta {a.compuerta}"
           f"{' (en paralelo con el LLM)' if not a.sin_solapar else ' (en fila)'}"
           f" · perfiles en {a.perfiles}")

@@ -1,0 +1,473 @@
+{
+ "version": 1,
+ "_nota": "LOS DATOS DE MENTIRA DEL ASISTENTE. Todo lo que el asistente 'sabe' sale de aqui y solo de aqui: scripts/herramientas.py no lleva un dato incrustado. Editalo con el asistente parado o en marcha (se relee solo cuando cambia la fecha de modificacion) y la proxima pregunta ya contesta con lo nuevo. Los dias van RELATIVOS a hoy ('dia': 0 es hoy, 1 manana, -1 ayer) para que el ejemplo no caduque: la fecha de verdad se calcula al consultar.",
+ "usuario": {
+  "nombre": "Juan",
+  "correo": "juan@casa.lan",
+  "zona": "Europe/Madrid"
+ },
+ "contactos": {
+  "_nota": "La agenda. Sirve para que 'mandale un correo a Elena' no se quede en 'dame su direccion': el ejecutor resuelve el nombre y el modelo no tiene que saberse ninguna direccion de memoria.",
+  "gente": [
+   {
+    "nombre": "Elena Cardona",
+    "alias": [
+     "elena",
+     "elena de finanzas",
+     "finanzas"
+    ],
+    "correo": "elena.cardona@empresa.com",
+    "de": "trabajo"
+   },
+   {
+    "nombre": "Diego Peña",
+    "alias": [
+     "diego"
+    ],
+    "correo": "diego.pena@empresa.com",
+    "de": "trabajo"
+   },
+   {
+    "nombre": "Marta Iglesias",
+    "alias": [
+     "marta"
+    ],
+    "correo": "marta.iglesias@empresa.com",
+    "de": "trabajo"
+   },
+   {
+    "nombre": "Rubén Ortiz",
+    "alias": [
+     "ruben"
+    ],
+    "correo": "ruben.ortiz@empresa.com",
+    "de": "trabajo"
+   },
+   {
+    "nombre": "Ana Ruiz",
+    "alias": [
+     "ana"
+    ],
+    "correo": "ana.ruiz.mail@gmail.com",
+    "de": "amigos"
+   },
+   {
+    "nombre": "Bea",
+    "alias": [
+     "bea",
+     "beatriz"
+    ],
+    "correo": "bea.morales@gmail.com",
+    "de": "amigos"
+   }
+  ]
+ },
+ "calendario": {
+  "_nota": "Un dia cargado, uno flojo y uno vacio. El vacio importa: si todos los dias tuvieran algo, no se veria nunca como suena 'no tienes nada'.",
+  "eventos": [
+   {
+    "dia": 0,
+    "hora": "09:30",
+    "fin": "10:00",
+    "titulo": "Daily del equipo",
+    "donde": "Meet",
+    "con": [
+     "Marta",
+     "Diego",
+     "Rubén"
+    ],
+    "estado": "confirmado"
+   },
+   {
+    "dia": 0,
+    "hora": "12:00",
+    "fin": "13:00",
+    "titulo": "Revisión del presupuesto de infraestructura",
+    "donde": "Sala 2",
+    "con": [
+     "Elena (finanzas)"
+    ],
+    "estado": "confirmado",
+    "nota": "llevar el desglose del coste de la VM"
+   },
+   {
+    "dia": 0,
+    "hora": "17:30",
+    "fin": "18:15",
+    "titulo": "Fisioterapia",
+    "donde": "Clínica Arturo Soria",
+    "con": [],
+    "estado": "confirmado"
+   },
+   {
+    "dia": 1,
+    "hora": "08:15",
+    "fin": "08:45",
+    "titulo": "Analítica en ayunas",
+    "donde": "Centro de salud",
+    "con": [],
+    "estado": "confirmado",
+    "nota": "no desayunar"
+   },
+   {
+    "dia": 1,
+    "hora": "16:00",
+    "fin": "17:30",
+    "titulo": "Entrevista técnica con candidato de plataforma",
+    "donde": "Meet",
+    "con": [
+     "Marta",
+     "candidato: Alberto Sanz"
+    ],
+    "estado": "provisional",
+    "nota": "Marta aún no ha aceptado"
+   },
+   {
+    "dia": 3,
+    "hora": "11:00",
+    "fin": "12:00",
+    "titulo": "Postmortem del corte de red del sábado",
+    "donde": "Sala 1",
+    "con": [
+     "Diego",
+     "Rubén",
+     "Elena (finanzas)"
+    ],
+    "estado": "confirmado"
+   },
+   {
+    "dia": 6,
+    "hora": "20:00",
+    "fin": "23:00",
+    "titulo": "Cena de cumpleaños de Ana",
+    "donde": "Casa de Ana",
+    "con": [
+     "Ana",
+     "Bea"
+    ],
+    "estado": "confirmado"
+   }
+  ]
+ },
+ "correo": {
+  "_nota": "Cinco sin leer con formas distintas: uno que pide algo hoy, uno de una maquina, uno comercial que no merece respuesta, uno personal y uno largo con hilo. Asi el asistente tiene que ELEGIR que contar y no puede limitarse a leer la lista.",
+  "mensajes": [
+   {
+    "id": "m1",
+    "de": "Elena Cardona <elena.cardona@empresa.com>",
+    "asunto": "Desglose de coste de la VM antes de las 12",
+    "hace": "hace 40 minutos",
+    "leido": false,
+    "importante": true,
+    "resumen": "Pide el desglose de coste mensual de la VM para la reunión de las 12. Dice que con el total no le vale, que lo quiere partido en cómputo, disco y respaldo."
+   },
+   {
+    "id": "m2",
+    "de": "backup@casa.lan",
+    "asunto": "[casa] Respaldo nocturno: 1 aviso",
+    "hace": "hace 6 horas",
+    "leido": false,
+    "importante": false,
+    "resumen": "El respaldo terminó, pero el volumen de fotos se saltó 214 ficheros por permisos. El resto, correcto."
+   },
+   {
+    "id": "m3",
+    "de": "Ofertas Fibra Total <no-reply@fibratotal.es>",
+    "asunto": "Tu velocidad puede ser 5 veces mayor",
+    "hace": "hace 3 horas",
+    "leido": false,
+    "importante": false,
+    "resumen": "Publicidad. Ni pide nada ni espera respuesta."
+   },
+   {
+    "id": "m4",
+    "de": "Ana <ana.ruiz.mail@gmail.com>",
+    "asunto": "¿Te vienes el sábado?",
+    "hace": "ayer por la tarde",
+    "leido": false,
+    "importante": false,
+    "resumen": "Confirma la cena del sábado y pregunta si llevas postre o bebida."
+   },
+   {
+    "id": "m5",
+    "de": "Diego Peña <diego.pena@empresa.com>",
+    "asunto": "Re: Re: postmortem del corte del sábado",
+    "hace": "ayer a las 19:12",
+    "leido": false,
+    "importante": true,
+    "resumen": "Hilo de siete mensajes. La conclusión es que el corte fue del router del proveedor, no de la VM, y que el postmortem del jueves lo lleva él. Te pide dos gráficas de latencia."
+   },
+   {
+    "id": "m6",
+    "de": "Marta Iglesias <marta.iglesias@empresa.com>",
+    "asunto": "Entrevista de mañana",
+    "hace": "hace 2 días",
+    "leido": true,
+    "importante": false,
+    "resumen": "Avisa de que igual llega diez minutos tarde a la entrevista."
+   }
+  ]
+ },
+ "servidor": {
+  "_nota": "NO esta todo en verde a proposito. Un servicio caido y un disco al 78 % es lo que de verdad hace util a un asistente de servidor: si siempre dijera 'todo bien' no haria falta preguntarle.",
+  "maquina": "voz.casa.lan (192.168.2.54)",
+  "arriba_desde": "hace 11 días",
+  "carga": [
+   0.42,
+   0.61,
+   0.55
+  ],
+  "nucleos": 6,
+  "memoria": {
+   "total_gb": 16,
+   "usada_gb": 9.4,
+   "swap_gb": 0.3
+  },
+  "disco": [
+   {
+    "punto": "/",
+    "total_gb": 60,
+    "usado_gb": 46.8,
+    "porcentaje": 78
+   },
+   {
+    "punto": "/var/lib/voz",
+    "total_gb": 40,
+    "usado_gb": 12.1,
+    "porcentaje": 30
+   }
+  ],
+  "servicios": [
+   {
+    "nombre": "voz-stream",
+    "estado": "activo",
+    "desde": "hace 11 días",
+    "nota": "RTF 0,95 en la última sesión"
+   },
+   {
+    "nombre": "voz-api",
+    "estado": "parado",
+    "desde": "hace 2 horas",
+    "nota": "parado a mano, no es una caída"
+   },
+   {
+    "nombre": "whisper",
+    "estado": "parado",
+    "desde": "hace 2 horas",
+    "nota": "parado a mano, no es una caída"
+   },
+   {
+    "nombre": "respaldo-nocturno",
+    "estado": "fallido",
+    "desde": "esta madrugada a las 03:14",
+    "nota": "214 ficheros sin permisos en el volumen de fotos; salió con código 1"
+   },
+   {
+    "nombre": "ollama",
+    "estado": "activo",
+    "desde": "hace 11 días",
+    "nota": ""
+   }
+  ],
+  "avisos": [
+   "La unidad respaldo-nocturno lleva dos noches saliendo con error por permisos.",
+   "La raíz va por el 78 %: al ritmo de la última semana quedan unos 20 días."
+  ]
+ },
+ "notas": {
+  "_nota": "La boveda de proyectos. Una nota parada desde hace meses es tan verosimil como una al dia, y da juego para 'que tengo abandonado'.",
+  "documentos": [
+   {
+    "titulo": "VibeVoiceNix — voz local",
+    "carpeta": "proyectos",
+    "tocada": "hoy",
+    "etiquetas": [
+     "homelab",
+     "nixos",
+     "voz"
+    ],
+    "resumen": "Stack de voz en NixOS. Lo último cerrado: interrumpirle al hablar y el ciclo de 5-10 s bajado a 1,07 s. Pendiente: decidir si el asistente vive en la VM o en el Mac.",
+    "pendientes": [
+     "Decidir dónde vive el puente",
+     "Medir el coste de tener whisper siempre arriba"
+    ]
+   },
+   {
+    "titulo": "Mudanza del NAS",
+    "carpeta": "proyectos",
+    "tocada": "hace 4 días",
+    "etiquetas": [
+     "homelab",
+     "almacenamiento"
+    ],
+    "resumen": "Pasar los 6 TB del NAS viejo al nuevo sin parar el respaldo. Hecho el inventario; falta la ventana de copia.",
+    "pendientes": [
+     "Pedir ventana de 8 horas un sábado",
+     "Comprobar que el disco 3 no tiene sectores pendientes"
+    ]
+   },
+   {
+    "titulo": "Presupuesto infra 2026",
+    "carpeta": "trabajo",
+    "tocada": "ayer",
+    "etiquetas": [
+     "trabajo",
+     "dinero"
+    ],
+    "resumen": "Coste mensual: cómputo 41 €, disco 12 €, respaldo 7 €. Total 60 €. Elena quiere el desglose, no el total.",
+    "pendientes": [
+     "Mandar el desglose a Elena antes de la reunión"
+    ]
+   },
+   {
+    "titulo": "Huerto de la terraza",
+    "carpeta": "personal",
+    "tocada": "hace 5 meses",
+    "etiquetas": [
+     "personal"
+    ],
+    "resumen": "Riego por goteo con temporizador. Se quedó a medias en el reparto de los goteros.",
+    "pendientes": [
+     "Comprar 4 goteros de 2 l/h"
+    ]
+   }
+  ]
+ },
+ "recordatorios": {
+  "_nota": "Uno vencido, uno para hoy y dos sin fecha. El vencido es el que hace que valga la pena preguntar.",
+  "lista": [
+   {
+    "id": "r1",
+    "texto": "Mandar a Elena el desglose de coste de la VM",
+    "cuando": "hoy a las 11:30",
+    "dia": 0,
+    "hecho": false,
+    "vencido": false
+   },
+   {
+    "id": "r2",
+    "texto": "Renovar el certificado del router",
+    "cuando": "anteayer",
+    "dia": -2,
+    "hecho": false,
+    "vencido": true
+   },
+   {
+    "id": "r3",
+    "texto": "Comprar postre para la cena del sábado",
+    "cuando": "sin fecha",
+    "dia": null,
+    "hecho": false,
+    "vencido": false
+   },
+   {
+    "id": "r4",
+    "texto": "Pedir cita para la revisión del coche",
+    "cuando": "sin fecha",
+    "dia": null,
+    "hecho": false,
+    "vencido": false
+   },
+   {
+    "id": "r5",
+    "texto": "Llevar el desglose impreso a la sala 2",
+    "cuando": "hoy a las 11:50",
+    "dia": 0,
+    "hecho": true,
+    "vencido": false
+   }
+  ]
+ },
+ "web": {
+  "_nota": "Resultados de mentira para unas cuantas consultas y una respuesta generica para el resto, para que cualquier busqueda devuelva algo con forma de busqueda en vez de un error. Cuando esto se cambie por una busqueda de verdad, lo unico que cambia es de donde salen estas listas.",
+  "consultas": {
+   "openvino": {
+    "resumen": "OpenVINO 2025.3 añadió cuantización int4 para modelos de difusión en CPU, con mejoras de entre el 20 % y el 35 % en Intel de 8ª generación en adelante.",
+    "resultados": [
+     {
+      "titulo": "OpenVINO 2025.3 release notes",
+      "sitio": "docs.openvino.ai",
+      "extracto": "int4 weight compression para pipelines de difusión; soporte AVX2 sin AMX."
+     },
+     {
+      "titulo": "Benchmarking VibeVoice on CPU-only hosts",
+      "sitio": "github.com/discussions",
+      "extracto": "RTF 0,95 en un i7-8700T con 6 hilos y pasos=6."
+     },
+     {
+      "titulo": "¿Merece la pena la iGPU para inferencia?",
+      "sitio": "foro.hardware.es",
+      "extracto": "En UHD 630 sale entre 2 y 3 veces más lento que la CPU."
+     }
+    ]
+   },
+   "nixos": {
+    "resumen": "NixOS 25.11 salió en noviembre; el cambio que más afecta a un homelab es que systemd-boot ya no acepta entradas generadas a mano fuera de /boot/loader.",
+    "resultados": [
+     {
+      "titulo": "NixOS 25.11 release notes",
+      "sitio": "nixos.org",
+      "extracto": "Cambios incompatibles en systemd-boot y en services.nginx.virtualHosts."
+     },
+     {
+      "titulo": "Actualizar un flake sin romper el arranque",
+      "sitio": "discourse.nixos.org",
+      "extracto": "nixos-rebuild boot y reiniciar, en vez de switch, cuando cambia el gestor de arranque."
+     }
+    ]
+   },
+   "paella": {
+    "resumen": "Para una paella de marisco de 4 personas se cuentan 400 g de arroz bomba y 1 litro de caldo, y el arroz no se remueve una vez repartido.",
+    "resultados": [
+     {
+      "titulo": "Paella de marisco paso a paso",
+      "sitio": "recetasderechupete.com",
+      "extracto": "Proporción 1 a 2,5 con arroz bomba; 18 minutos de cocción y 5 de reposo."
+     },
+     {
+      "titulo": "Los errores típicos de la paella",
+      "sitio": "directoalpaladar.com",
+      "extracto": "Removerlo, taparlo y pasarse de caldo son los tres que más se repiten."
+     }
+    ]
+   },
+   "tiempo": {
+    "resumen": "En Madrid, hoy máxima de 31 grados y mínima de 18, cielo despejado. Mañana bajan tres grados y entra nubosidad por la tarde.",
+    "resultados": [
+     {
+      "titulo": "Predicción para Madrid",
+      "sitio": "aemet.es",
+      "extracto": "Despejado, 31/18. Mañana intervalos nubosos por la tarde, 28/17."
+     }
+    ]
+   }
+  },
+  "generica": {
+   "resumen": "Los resultados coinciden en lo básico y se contradicen en los detalles; ninguno es una fuente de primera mano.",
+   "resultados": [
+    {
+     "titulo": "Resultado principal",
+     "sitio": "es.wikipedia.org",
+     "extracto": "Entrada de enciclopedia con el contexto general del asunto."
+    },
+    {
+     "titulo": "Guía práctica",
+     "sitio": "blog-tecnico.example",
+     "extracto": "Artículo de blog con pasos concretos, sin fecha visible."
+    },
+    {
+     "titulo": "Hilo de discusión",
+     "sitio": "foro.example",
+     "extracto": "Varias respuestas que no se ponen de acuerdo; la mejor votada es de 2022."
+    }
+   ]
+  }
+ },
+ "escrituras": {
+  "_nota": "Aqui se APUNTA lo que el asistente ha creado o mandado en esta demo, para que al preguntarle luego se acuerde. Es un registro, no una integracion: nada sale de este fichero. Se puede vaciar a mano cuando moleste.",
+  "eventos_creados": [],
+  "correos_enviados": [],
+  "recordatorios_creados": [],
+  "notas_borradas": []
+ }
+}

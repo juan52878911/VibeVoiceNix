@@ -573,6 +573,16 @@ python scripts/fidelidad.py      # banco: texto -> voz -> whisper -> texto, mide
 python scripts/narrador.py       # pone voz a un LLM según escribe
 python scripts/asistente.py      # Ollama -> voz, en la terminal
 
+# Las herramientas del asistente: el catálogo, una llamada suelta y el ciclo
+# entero (el modelo decide, se ejecuta, se le devuelve, contesta).
+pkgs/vibevoice/.venv/bin/python scripts/herramientas.py listar
+pkgs/vibevoice/.venv/bin/python scripts/herramientas.py llamar leer_correo filtro=importantes
+pkgs/vibevoice/.venv/bin/python scripts/herramientas.py ciclo "¿qué tengo mañana?"
+
+# Y la prueba de punta a punta: levanta un puente propio en el 8099, manda
+# preguntas y lee los mismos marcos que el navegador. No reproduce nada.
+pkgs/vibevoice/.venv/bin/python scripts/herramientas_extremo.py
+
 # El de la página habla por la sesión de WebSocket, así que necesita el
 # paquete `websockets`: hay que arrancarlo con el venv, no con el python suelto.
 pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py
@@ -598,6 +608,35 @@ compuerta; «para» le deja callado; «sigue» retoma por donde iba. Y si la
 interrupción no era para él, vuelve solo a su frase. Al cortarse guarda **lo
 que llegó a decir y lo que le quedaba** por separado, que es lo que hace que
 «detalla eso último» signifique algo.
+
+**Y usa herramientas.** Calendario, correo, estado del servidor, notas de
+proyectos, recordatorios y búsqueda web: el modelo decide cuál le hace falta,
+se ejecuta, se le devuelve el resultado y contesta con él por voz. Los **datos
+son simulados** y viven en un fichero editable (`herramientas_simuladas.json`);
+el mecanismo —uso de herramientas nativo de la API de Anthropic contra
+MiniMax— es el de verdad.
+
+Lo que **escribe o envía** (crear un evento, mandar un correo, apuntar un
+recordatorio, borrar una nota) **se confirma en voz alta antes**. Y no por
+prompt: las herramientas de escritura literalmente no ejecutan nada, la única
+función que escribe está detrás de una acción anotada, y el sí lo clasifica una
+lista cerrada de palabras sin pasar por el modelo. Un malentendido de whisper
+—9,7 % de WER medio, medido aquí— no puede acabar en un correo enviado.
+
+```
+«¿Qué tengo mañana?»            -> consultar_calendario -> contesta
+«Mándale un correo a Elena…»    -> prepara, no envía    -> «voy a enviar un correo
+                                                           a Elena Cardona, asunto…
+                                                           ¿lo hago?»
+«sí»                            -> lo envía             -> «Enviado.»  (0,004 s:
+                                                           es un WAV pregrabado)
+```
+
+El perfil se elige **en la página**: `General` lo ve todo, `Servidor` solo la
+máquina y las notas, `Agenda` solo agenda, correo y recordatorios. Cambiar de
+perfil cambia la voz, las coletillas y el juego de herramientas a la vez.
+
+**El detalle completo:** [docs/asistente-herramientas.md](docs/asistente-herramientas.md)
 
 La página manda **cada frase a la misma sesión** en vez de una petición por
 frase, así que la respuesta entera es una sola locución. La velocidad distinta
@@ -686,6 +725,7 @@ Este README es el resumen. El detalle está en [`docs/`](docs/):
 | [opciones.md](docs/opciones.md) | todas las opciones NixOS, sus aserciones y configuraciones de ejemplo |
 | [rendimiento.md](docs/rendimiento.md) | las mediciones de Piper, whisper y la iGPU contra la CPU |
 | [hardware-y-portabilidad.md](docs/hardware-y-portabilidad.md) | GPU por passthrough, RAM y llevar el stack al Mac |
+| [asistente-herramientas.md](docs/asistente-herramientas.md) | el asistente con herramientas: qué pedirle, por qué escribir se confirma en voz alta, qué está simulado y cómo cambiarlo por lo real |
 
 ## Licencias
 
