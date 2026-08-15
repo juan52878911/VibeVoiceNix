@@ -187,6 +187,7 @@ from asistente import ABRE_PENSAMIENTO, CIERRA_PENSAMIENTO, limpiar, preguntar  
 from conversacion import RECUERDO_COMPUERTA, decidir, preguntar_con_historial  # noqa: E402
 from interrupcion import clasificar, que_decir  # noqa: E402
 from oido import Oido  # noqa: E402
+import perfiles  # noqa: E402
 
 try:
     from websockets.exceptions import ConnectionClosed
@@ -422,6 +423,64 @@ modelo esperando a la segunda."><div class="n" id="h4">—</div><div class="e">s
 </main><script>
 const $=i=>document.getElementById(i);
 let ctx,aborto,cabeza=0;
+
+// ---- RELLENOS Y BUFER DE REPRODUCCION ------------------------------------
+// Los WAV pregenerados (scripts/perfiles.py) se bajan y se DECODIFICAN al
+// cargar la pagina, una vez. Pedirlos en el momento de usarlos metria en el
+// camino critico la misma latencia que vienen a tapar: son ~30 KB cada uno,
+// pero decodificar y viajar cuesta decenas de ms justo cuando no sobran.
+//
+// EL BUFER, QUE ES LA OTRA MITAD DEL ASUNTO -- Y SE MIDIO ANTES DE TOCARLO
+// El reproductor encola con reloj propio (`cabeza`): cada trozo se programa
+// donde termina el anterior, y si llega TARDE se oye un hueco. La sospecha
+// era que 0,15 s de margen se quedaban cortos. MEDIDO no se quedan: en una
+// locucion de 8,53 s por este mismo camino (puente -> HTTP -> marcos) el
+// flujo NUNCA se retrasa -- retraso maximo acumulado 0,0 ms, cero huecos con
+// prebufer 0,00 -- y por el websocket directo contra la VM el peor retraso
+// son 18,7 ms. El motivo es que el respiro INSERTA aire que no cuesta
+// generar, y eso deja el RTF que ve el reproductor en 0,88-0,98: el flujo
+// gana terreno en vez de perderlo. Subir el prebufer "por si acaso" solo
+// habria retrasado el primer sonido 0,45 s en cada respuesta.
+//
+// Asi que el margen de verdad no se compra con latencia: lo REGALAN los
+// rellenos. Mientras suena una coletilla de 0,7-2,4 s, el audio real esta
+// bajando; cuando arranca, lleva ese segundo largo acumulado. De ahi que
+// `cabeza` sea max(ahora + prebufer, fin del relleno) y no una cosa u otra.
+const rellenos={buffers:{}, cat:{}, prebufer:0.15, listo:false};
+let finRelleno=0;          // instante (reloj de ctx) en que calla el relleno
+let huecos=0, huecoMs=0;   // microcortes del reproductor, acumulados
+async function cargarRellenos(){
+  try{
+    const r=await fetch("/asistentes"); if(!r.ok) return;
+    const d=await r.json();
+    rellenos.prebufer=d.prebufer_s||rellenos.prebufer;
+    const p=(d.perfiles||{})[d.actual]; if(!p) return;
+    const ac=new (window.AudioContext||window.webkitAudioContext)();
+    for(const [clase,lista] of Object.entries(p.rellenos||{})){
+      rellenos.cat[clase]=[];
+      for(const x of lista){
+        try{
+          const b=await (await fetch(x.url)).arrayBuffer();
+          rellenos.buffers[x.id]=await ac.decodeAudioData(b);
+          rellenos.cat[clase].push(x.id);
+        }catch(_){}
+      }
+    }
+    await ac.close();
+    rellenos.listo=Object.keys(rellenos.buffers).length>0;
+    if(rellenos.listo) di("rellenos listos ("+Object.keys(rellenos.buffers).length+")");
+  }catch(_){}
+}
+// Suena YA, en el mismo nodo de ganancia y el mismo reloj que el habla: por
+// eso no puede solaparse con ella ni con otro relleno. Devuelve cuando acaba.
+function sonarRelleno(actx,gan,id){
+  const buf=rellenos.buffers[id]; if(!buf||!actx||actx.state==="closed") return 0;
+  const src=actx.createBufferSource(); src.buffer=buf; src.connect(gan);
+  const cuando=Math.max(actx.currentTime+0.02, finRelleno);
+  src.start(cuando);
+  finRelleno=cuando+buf.duration;
+  return finRelleno;
+}
 for(const [r,v] of [["cfg","vcfg"],["vel","vvel"],["pasos","vpasos"]]){
   const e=$(r), o=$(v);
   e.addEventListener("input",()=>o.textContent=
@@ -446,6 +505,10 @@ fetch("/modelos").then(r=>r.json()).then(m=>{
   $("modelo").innerHTML=m.map((x,i)=>`<option${i===0?" selected":""}>${x}</option>`).join("");
 });
 function di(t,e){$("est").className="est"+(e?" err":"");$("est").textContent=t}
+// Los rellenos, en cuanto la pagina existe. Si el puente aun los esta
+// generando (primer arranque, ~30 s de VM) esto vuelve vacio y se reintenta
+// una vez: no hay nada que romper, solo una mejora que llega o no llega.
+cargarRellenos().then(()=>{ if(!rellenos.listo) setTimeout(cargarRellenos,45000); });
 
 // ---- instruccion de sistema -------------------------------------------
 // Vive en el NAVEGADOR (localStorage), no en el puente: asi cada navegador
@@ -614,7 +677,7 @@ async function preguntarVoz(q,extra){
   // El arnes de pruebas inyecta audio por el camino del servidor y NO quiere
   // oirlo salir por los altavoces. Con el nodo de ganancia sale gratis.
   if(window.__escucha&&__escucha.mudo) gan.gain.value=0;
-  ctx=actx; cabeza=0; aborto=ab; ganancia=gan; agachado=false;
+  ctx=actx; cabeza=0; aborto=ab; ganancia=gan; agachado=false; finRelleno=0;
   // La cuenta de falsas alarmas se lleva POR LOCUCION: si en la anterior el
   // microfono oyo al altavoz dos veces, esta empieza otra vez con margen.
   barrera.falsos=0;
@@ -684,6 +747,12 @@ async function preguntarVoz(q,extra){
             case "sintetizando": marca(ev.id,"sint"); break;  // entregado a la sesion
             case "sonando":     marca(ev.id,"son");  break;  // el modelo va por aqui
             case "hecho":       marca(ev.id,"fin");  break;  // ya dicho
+            // El puente dice QUE relleno y CUANDO; aqui solo se encola.
+            case "relleno":
+              sonarRelleno(actx,gan,ev.id);
+              marcas.relleno=marcas.relleno||ev.s;
+              if(!primero) di("…"+ev.texto);
+              break;
             case "error":       di(ev.texto,true);   break;
           }
           continue;
@@ -698,12 +767,27 @@ async function preguntarVoz(q,extra){
           if(hitos.frase) $("h4").textContent=(primero-hitos.frase).toFixed(2)+"s";
           di("hablando…"); enAudio=true;
           if(escucha.activa) estEsc("hablando","hablando");
-          cabeza=actx.currentTime+0.15; }
+          // EL BUFER, Y POR QUE DETRAS DEL RELLENO. `cabeza` es donde se
+          // programa el primer trozo real. Dos cosas mandan: que haya
+          // acumulado bastante audio para aguantar un tropiezo de red
+          // (prebufer) y que no se pise con la coletilla que este sonando.
+          // Cuando ha habido relleno, el prebufer sale GRATIS: mientras se
+          // oia, el audio real estaba bajando.
+          cabeza=Math.max(actx.currentTime+rellenos.prebufer,finRelleno); }
         const buf=actx.createBuffer(1,f32.length,24000);
         buf.copyToChannel(f32,0);
         const src=actx.createBufferSource(); src.buffer=buf; src.connect(gan);
         src.playbackRate.value=vel;
-        if(cabeza<actx.currentTime) cabeza=actx.currentTime;
+        // AQUI SE OYE EL MICROCORTE, y hasta ahora no se contaba. Si el trozo
+        // llega despues de que el anterior haya terminado de sonar, el bufer
+        // se agoto y entre uno y otro queda un hueco de silencio. Se apunta
+        // para poder MEDIRLO desde la consola (__escucha.estado().huecos) en
+        // vez de discutir si se oye o no: en las medidas de esta red salen
+        // cero, y si alguna vez salen no habra que adivinar de donde vienen.
+        if(cabeza<actx.currentTime){
+          huecos++; huecoMs+=(actx.currentTime-cabeza)*1000;
+          cabeza=actx.currentTime;
+        }
         // A otra velocidad el trozo dura otra cosa: si no se divide, el
         // siguiente se encola tarde y se oye un hueco en cada empalme.
         src.start(cabeza); cabeza+=buf.duration/vel;
@@ -1318,8 +1402,97 @@ window.__escucha={traza:[],sinPreguntar:false,hablando:false,mudo:false,
     enVoz:escucha.vad?escucha.vad.enVoz:false,huellas:escucha.huellas,
     enPregunta,enAudio,agachado,callarMs:barrera.ms,
     ganancia:ganancia?ganancia.gain.value:null,
+    // Los microcortes del reproductor y el catalogo cargado, para poder
+    // medirlos desde la consola en vez de fiarse del oido.
+    huecos,huecoMs:Math.round(huecoMs),
+    rellenos:{listo:rellenos.listo,prebufer:rellenos.prebufer,
+              n:Object.keys(rellenos.buffers).length},
     historial:historial.slice(-4)}; }};
 </script></body></html>"""
+
+
+# --------------------------------------------------------------------------
+# PERFILES DE ASISTENTE Y RELLENOS
+#
+# El core esta en scripts/perfiles.py (formato, cache por hash, politica de
+# cuando suena cada cosa). Aqui solo queda lo que es propio del puente:
+# arrancar la generacion sin bloquear, servir los WAV y disparar los eventos.
+#
+# POR QUE LA GENERACION VA EN UN HILO Y NO EN main()
+# Sintetizar 29 rellenos son ~30 s de VM la primera vez. Bloquear el arranque
+# del puente por eso significaria que el asistente no responde durante medio
+# minuto por una MEJORA, y ademas que si la VM esta apagada no arranca nunca.
+# En un hilo: la pagina levanta al instante y los rellenos aparecen cuando
+# aparecen. Los arranques siguientes no sintetizan nada (la cache va por hash
+# del contenido), asi que el hilo termina en milisegundos.
+#
+# Y SI LA VOZ NO ESTA, NO PASA NADA: perfiles.generar() no lanza, apunta los
+# fallos y devuelve lo que tenga. El asistente funciona sin rellenos.
+_ASISTENTES = {"datos": None, "manifiesto": None, "catalogos": {}, "error": None}
+
+
+def arrancar_perfiles(ruta, cache, url, token, generar=True) -> None:
+    """Carga el fichero de perfiles y, en segundo plano, genera lo que falte."""
+    try:
+        datos = perfiles.cargar(ruta)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        _ASISTENTES["error"] = f"{type(e).__name__}: {e}"
+        print(f"[perfiles] no se pudo leer el fichero: {e}", flush=True)
+        return
+    _ASISTENTES["datos"] = datos
+    dir_cache = perfiles.directorio_cache(cache)
+    CFG["rellenos_dir"] = str(dir_cache)
+
+    def faena():
+        try:
+            if generar:
+                m = perfiles.generar(datos, url, token, dir_cache)
+            else:
+                ruta_m = dir_cache / "catalogo.json"
+                m = json.loads(ruta_m.read_text()) if ruta_m.exists() else \
+                    {"perfiles": {}, "fallos": []}
+        except Exception as e:                       # noqa: BLE001
+            _ASISTENTES["error"] = f"{type(e).__name__}: {e}"
+            print(f"[perfiles] generacion fallida: {e}", flush=True)
+            return
+        _ASISTENTES["manifiesto"] = m
+        _ASISTENTES["catalogos"] = {
+            n: perfiles.Catalogo(m, n, dir_cache) for n in datos["perfiles"]}
+
+    threading.Thread(target=faena, daemon=True).start()
+
+
+def estado_asistentes() -> dict:
+    """Lo que la pagina necesita: quien es cada perfil y que WAV precargar."""
+    datos = _ASISTENTES["datos"]
+    if datos is None:
+        return {"listo": False, "error": _ASISTENTES["error"], "perfiles": {}}
+    m = _ASISTENTES["manifiesto"] or {"perfiles": {}}
+    salida = {}
+    for nombre, p in datos["perfiles"].items():
+        cats = (m["perfiles"].get(nombre) or {}).get("categorias", {})
+        salida[nombre] = {
+            "nombre": p.get("nombre", nombre),
+            "descripcion": p.get("descripcion", ""),
+            "voz": p["voz"],
+            "sistema": p.get("sistema", ""),
+            "vocabulario": p.get("vocabulario", {}),
+            "herramientas": [{"id": h["id"], "tipo": h["tipo"],
+                              "habilitada": bool(h.get("habilitada")),
+                              "descripcion": h.get("descripcion", "")}
+                             for h in p.get("herramientas") or []],
+            "rellenos": {c: [{"id": x["id"], "ms": x["ms"], "texto": x["texto"],
+                              "url": f"/rellenos/{x['fichero']}"}
+                             for x in v] for c, v in cats.items()},
+        }
+    return {"listo": _ASISTENTES["manifiesto"] is not None,
+            "error": _ASISTENTES["error"],
+            "actual": CFG.get("perfil") or datos.get("perfil_por_defecto"),
+            "por_defecto": datos.get("perfil_por_defecto"),
+            "umbrales": perfiles.UMBRALES,
+            "prebufer_s": CFG.get("prebufer", 0.15),
+            "fallos": (_ASISTENTES["manifiesto"] or {}).get("fallos", []),
+            "perfiles": salida}
 
 
 def _multipart(campos, nombre_fichero, datos, tipo="audio/wav"):
@@ -1457,6 +1630,32 @@ class Puente(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(cuerpo)))
             self.end_headers()
             self.wfile.write(cuerpo)
+        elif self.path == "/asistentes":
+            # LOS PERFILES DE ASISTENTE, que no son los de VOZ. /perfiles ya
+            # estaba cogido por las huellas de oido.py y son cosas distintas:
+            # alli "perfil" es una persona a la que reconocer, aqui es una
+            # personalidad con su voz, su vocabulario y sus rellenos
+            # (scripts/perfiles.py). De aqui saca la pagina la lista de WAV
+            # que tiene que precargar y decodificar al abrirse.
+            self.responder_json(200, estado_asistentes())
+        elif self.path.startswith("/rellenos/"):
+            # El WAV pregenerado, tal cual sale de la cache. La pagina los pide
+            # UNA vez al cargarse y los guarda ya decodificados: pedirlos en el
+            # momento de necesitarlos metria en el camino critico justo la
+            # latencia que vienen a tapar.
+            nombre = os.path.basename(urllib.parse.unquote(self.path[10:]))
+            base = CFG.get("rellenos_dir")
+            ruta = os.path.join(base, nombre) if base else None
+            if (not ruta or not nombre.endswith(".wav")
+                    or not os.path.isfile(ruta)):
+                return self.send_error(404)
+            datos = open(ruta, "rb").read()
+            self.send_response(200)
+            self.send_header("content-type", "audio/wav")
+            self.send_header("content-length", str(len(datos)))
+            self.send_header("cache-control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(datos)
         else:
             self.send_error(404)
 
@@ -1801,6 +2000,17 @@ class Puente(BaseHTTPRequestHandler):
         if compuerta:
             threading.Thread(target=hilo_compuerta, daemon=True).start()
 
+        # ---- los rellenos ------------------------------------------------
+        # El perfil manda: cada uno tiene sus coletillas y su voz (ver
+        # scripts/perfiles.py). La politica solo dice QUE toca y CUANDO; se
+        # consulta desde el bucle de abajo -- que da una vuelta cada 20 ms --
+        # y NO desde un hilo, porque emitir marcos desde dos hilos a la vez
+        # partiria el flujo binario que lee el navegador.
+        perfil = pet.get("perfil") or CFG.get("perfil")
+        catalogo = _ASISTENTES["catalogos"].get(perfil)
+        politica = (perfiles.Politica(catalogo, con_compuerta=bool(compuerta))
+                    if catalogo is not None else None)
+
         # El productor manda SIEMPRE el pendiente que queda tras extraer un
         # trozo, en vez de que la pagina intente descontarlo por su cuenta.
         # Restar longitudes se desalinea en cuanto hay un espacio de mas, y el
@@ -2027,6 +2237,26 @@ class Puente(BaseHTTPRequestHandler):
             resto, cerrado, fin_mandado, ultimo = b"", False, False, time.time()
             while not terminado:
                 drenar_texto()
+                # ¿Toca un relleno? Solo mientras no haya sonado el habla de
+                # verdad: `suena` lo pone al_pcm en el primer PCM y a partir de
+                # ahi toca() devuelve None para siempre. Lo que se manda es el
+                # ID de un WAV que la pagina ya tiene decodificado, no el
+                # audio: pedirlo ahora metria en el camino critico justo la
+                # latencia que el relleno viene a tapar.
+                if politica is not None:
+                    t_r = time.time() - t0
+                    cual = politica.toca(
+                        t_r, suena,
+                        veredicto.get("dirigida") if compuerta else True)
+                    if cual:
+                        elegido = catalogo.elegir(cual)
+                        if elegido:
+                            politica.apuntar(cual, t_r, elegido["ms"])
+                            evento(tipo="relleno", clase=cual,
+                                   id=elegido["id"], ms=elegido["ms"],
+                                   texto=elegido["texto"],
+                                   url=f"/rellenos/{elegido['fichero']}",
+                                   s=round(t_r, 3))
                 # 1) meter en la sesion TODAS las frases que haya listas. No se
                 #    dosifica a proposito: el modelo callado es un silencio en
                 #    mitad de la locucion, y ese es justo el problema que la
@@ -2209,6 +2439,31 @@ def main():
         help="sesgo de vocabulario para el whisper nativo. Es el mismo que "
              "voz-api aplica por su cuenta, y se nota: sin el, 'WireGuard' "
              "sale como 'We The War'")
+    # ---- perfiles de ASISTENTE (no los de voz de --perfiles) --------------
+    ap.add_argument("--asistentes",
+                    default=os.environ.get("VOZ_PERFILES"),
+                    help="fichero JSON con los perfiles de asistente "
+                         "(scripts/perfiles.py). Sin esto se busca "
+                         "perfiles_asistente.json en la raiz del repo, y si "
+                         "tampoco esta se usa el perfil de serie")
+    ap.add_argument("--asistente", default=None,
+                    help="perfil activo. Por defecto, el 'perfil_por_defecto' "
+                         "del fichero")
+    ap.add_argument("--rellenos-cache", default=None,
+                    help="donde viven los WAV pregenerados. Por defecto "
+                         "$VOZ_PERFILES_CACHE, $STATE_DIRECTORY o "
+                         "~/.local/state/voz-perfiles")
+    ap.add_argument("--sin-rellenos", action="store_true",
+                    help="no genera ni usa audios de relleno. El ciclo queda "
+                         "exactamente como antes de que existieran")
+    ap.add_argument("--prebufer", type=float,
+                    default=float(os.environ.get("VOZ_PREBUFER", "0.15")),
+                    help="segundos de audio que la pagina acumula antes de "
+                         "empezar a sonar. SE MIDIO y 0,15 basta en esta red "
+                         "(retraso maximo acumulado 0,0 ms por el puente, "
+                         "18,7 ms por el websocket directo): subirlo a ciegas "
+                         "solo costaria latencia. El margen de verdad lo dan "
+                         "los rellenos, que son 0,7-2,4 s de bufer gratis")
     ap.add_argument("--sin-solapar", action="store_true",
                     help="devuelve la compuerta a su sitio de antes -- delante "
                          "del LLM y en fila -- en vez de correrla en paralelo. "
@@ -2219,10 +2474,17 @@ def main():
                voz=a.voz, arranque=a.arranque, sistema=a.sistema, cfg=a.cfg,
                voz_api=a.api_url, token_api=a.token_api or a.token,
                compuerta=a.compuerta, whisper=a.whisper_url.rstrip("/"),
-               prompt_stt=a.prompt_stt, solapar=not a.sin_solapar)
+               prompt_stt=a.prompt_stt, solapar=not a.sin_solapar,
+               perfil=a.asistente, prebufer=a.prebufer)
     global OIDO
     OIDO = Oido(a.perfiles)
     OIDO.precargar()        # ~6 s de carga del modelo, en un hilo aparte
+    # Los perfiles de asistente y sus rellenos. En un hilo y sin poder tumbar
+    # el arranque: ver el bloque PERFILES DE ASISTENTE Y RELLENOS.
+    arrancar_perfiles(a.asistentes, a.rellenos_cache, a.voz_url, a.token,
+                      generar=not a.sin_rellenos)
+    if _ASISTENTES["datos"] and not a.asistente:
+        CFG["perfil"] = _ASISTENTES["datos"]["perfil_por_defecto"]
     print(f"asistente en http://127.0.0.1:{a.puerto}")
     print(f"  LLM : {a.modelo}"
           f"{'' if a.modelo.lower().startswith('minimax') else ' via ' + a.ollama}")
@@ -2235,6 +2497,10 @@ def main():
         print("        [aviso] sin --whisper-url la escucha continua paga "
               "2,1-2,9 s por frase en whisper.\n"
               "                levanta el nativo con scripts/whisper-mac.sh")
+    if _ASISTENTES["datos"] and not a.sin_rellenos:
+        print(f"  perf: {', '.join(sorted(_ASISTENTES['datos']['perfiles']))} "
+              f"(activo: {CFG.get('perfil')}) · rellenos en "
+              f"{CFG.get('rellenos_dir')} · prebufer {a.prebufer:.2f} s")
     print(f"  oido: compuerta {a.compuerta}"
           f"{' (en paralelo con el LLM)' if not a.sin_solapar else ' (en fila)'}"
           f" · perfiles en {a.perfiles}")

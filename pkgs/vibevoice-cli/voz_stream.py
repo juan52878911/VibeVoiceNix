@@ -646,6 +646,7 @@ def cargar_modelo():
             # rampa de volumen se midio en LOS DOS motores.
             frenar_guia(modelo)
             reforzar_guia_arranque(modelo)
+            demorar_eos(modelo)
             instrumentar_latentes(modelo)
             modelo.set_ddpm_inference_steps(PASOS)
             _estado["solapado"] = solapar_decodificador(modelo)
@@ -677,6 +678,7 @@ def cargar_modelo():
     compartir_embeddings_muertos(modelo)
     frenar_guia(modelo)
     reforzar_guia_arranque(modelo)
+    demorar_eos(modelo)
 
     if EN_GPU:
         modelo.to(DISPOSITIVO)
@@ -903,6 +905,66 @@ def reforzar_guia_arranque(modelo) -> None:
     print(f"[arranque] guia reforzada al empezar: cfg {CFG_ARRANQUE} con rampa "
           f"de {CFG_ARRANQUE_FOTOGRAMAS} fotogramas (la primera palabra ya no "
           f"se mastica)", flush=True)
+
+
+def demorar_eos(modelo) -> None:
+    """Aplaza UN bloque el "se acabo" del clasificador cuando el modelo quiere
+    parar en mitad del decaimiento de la ultima palabra y no queda ventana de
+    donde sacar la cola. El porque y las medidas, en el bloque COLA INSISTIR.
+
+    Se envuelve `forward` del clasificador y no el objeto entero porque
+    tts_eos_classifier es un submodulo registrado: asignarle una funcion suelta
+    lo rechaza nn.Module. Envolver el forward de la instancia lo tapa igual
+    -- __call__ va a self.forward -- y deja el modulo donde estaba.
+
+    NO SE INTENTA ADIVINAR QUE LLAMADA ES LA QUE DECIDE. Upstream consulta el
+    clasificador tres veces por fotograma y solo la tercera manda; distinguirlas
+    desde aqui seria atarse a un orden que no promete nadie. En vez de eso, el
+    streamer ARMA el fotograma (RemateEOS.deja_pasar, que corre una vez por
+    fotograma y antes que las tres llamadas) y mientras esta armado se dice que
+    no hay EOS a QUIEN PREGUNTE. El presupuesto solo se gasta cuando alguna de
+    esas llamadas traia de verdad un EOS: si no, no se ha aplazado nada.
+    """
+    if COLA_INSISTIR <= 0:
+        return
+    if SOLAPAR_DECODER:
+        # Ver el bloque COLA INSISTIR: con el decodificador en otro hilo el
+        # pico del "ultimo fotograma" puede ir por detras, y decidir con el
+        # fotograma equivocado es peor que no decidir.
+        print("[arranque] cola insistente desactivada: el decodificador va "
+              "solapado y el pico del ultimo fotograma llegaria tarde",
+              flush=True)
+        return
+    clasificador = getattr(modelo, "tts_eos_classifier", None)
+    if clasificador is None:
+        print("[aviso] no hay tts_eos_classifier: la cola insistente no se "
+              "instala (revisa si upstream lo renombro)", flush=True)
+        return
+    real = clasificador.forward
+
+    def forward(*a, **kw):
+        logits = real(*a, **kw)
+        if not _REMATE["armado"]:
+            return logits
+        if float(torch.sigmoid(logits.detach()).reshape(-1)[0]) > 0.5:
+            # Esta si traia EOS: el presupuesto se gasta aqui y no antes.
+            # OJO: `armado` NO se baja aqui. Las tres llamadas del fotograma
+            # tienen que ver lo mismo, y la que decide es la ultima: bajarlo
+            # en la primera dejaba pasar el EOS de verdad por la tercera. Lo
+            # vuelve a calcular deja_pasar en el fotograma siguiente, y ahi ya
+            # se encuentra el presupuesto gastado.
+            _REMATE["aplazados"] += 1
+            print(f"[sesion] EOS en el ultimo latente del bloque con el "
+                  f"fotograma aun sonando (pico {_REMATE['pico']:.3f}): se "
+                  f"pide un bloque mas para la cola", flush=True)
+        # Muy negativo: sigmoid(-10) = 4,5e-5, o sea "no hay EOS". El bloque
+        # siguiente vuelve a preguntar y ese ya pasa.
+        return torch.full_like(logits, -10.0)
+
+    clasificador.forward = forward
+    print(f"[arranque] cola insistente: hasta {COLA_INSISTIR} bloque(s) de mas "
+          f"si el EOS cae con la voz por encima de {COLA_FINAL_PICO} "
+          f"(la ultima palabra ya no se corta a mitad)", flush=True)
 
 
 # ------------------------------------------- la rama incondicional, agrupada --
@@ -1350,6 +1412,72 @@ app.add_middleware(
 )
 
 
+class RemateEOS:
+    """El trocito de estado que conserva la COLA de la locucion.
+
+    Lo usan por composicion los dos streamers -- el de /tts/stream y el de las
+    sesiones --, porque el fallo es el mismo en los dos y el arreglo tambien:
+    el clasificador de EOS dispara DESPUES de emitir su fotograma y el bucle de
+    6 latentes sigue dando audio que se estaba tirando. Ver el bloque COLA
+    FINAL de arriba, con la medida.
+
+    Dos reglas y ninguna mas:
+      - el `end(indices)` del clasificador NO cierra: solo levanta la bandera;
+        el que cierra es el `end()` sin indices que generate() hace siempre al
+        salir del bucle (y, si algo revienta, el `finally` de quien sintetiza).
+      - tras el EOS pasan como mucho `cuantos` fotogramas, y se para en cuanto
+        uno de ellos ya es suelo de sala: ese entra -- para aterrizar en
+        silencio y no en mitad del decaimiento -- y los siguientes no.
+    """
+
+    __slots__ = ("cuantos", "pico", "visto", "emitidos", "aterrizado")
+
+    def __init__(self, cuantos: int = None, pico: float = None):
+        self.cuantos = max(0, COLA_FINAL if cuantos is None else int(cuantos))
+        self.pico = COLA_FINAL_PICO if pico is None else float(pico)
+        self.visto = False        # el clasificador ya dijo "se acabo"
+        self.emitidos = 0         # fotogramas de cola emitidos desde entonces
+        self.aterrizado = False   # ya se llego a suelo de sala: no queda cola
+
+    def retener_cierre(self, indices) -> bool:
+        """True si este end() es el del clasificador y hay que aguantarlo."""
+        if indices is None or self.visto or self.cuantos <= 0:
+            return False
+        self.visto = True
+        return True
+
+    def deja_pasar(self, trozo) -> bool:
+        """True si este fotograma todavia debe emitirse. Antes del EOS, todos.
+
+        De paso lleva la cuenta de fotogramas y apunta el pico de este en
+        _REMATE, y ARMA el aplazamiento del EOS cuando toca (ver el bloque
+        COLA INSISTIR): esto corre una vez por fotograma acustico y justo
+        antes de las llamadas al clasificador de ese fotograma, que es lo que
+        lo hace el sitio bueno para decidirlo. Cuesta un abs().max() sobre
+        3200 muestras, nada al lado de los 133 ms que cuesta generarlo."""
+        pico = float(trozo.detach().abs().max())
+        _REMATE["pico"] = pico
+        _REMATE["fotogramas"] += 1
+        # Ultimo latente del bloque de 6 y la voz todavia sonando: si el modelo
+        # decide parar AQUI no queda ni un fotograma de la ventana para la
+        # cola. Se arma para este fotograma y solo para este.
+        _REMATE["armado"] = (
+            COLA_INSISTIR > 0
+            and _REMATE["aplazados"] < COLA_INSISTIR
+            and _REMATE["fotogramas"] % LATENTES_VENTANA == 0
+            and pico >= COLA_FINAL_PICO)
+        if not self.visto:
+            return True
+        if self.aterrizado or self.emitidos >= self.cuantos:
+            return False
+        self.emitidos += 1
+        if pico < self.pico:
+            # Suelo de sala: la palabra ya termino de apagarse. Este entra
+            # (es el silencio en el que aterriza la locucion) y se cierra.
+            self.aterrizado = True
+        return True
+
+
 class StreamerCancelable:
     """Envuelve AsyncAudioStreamer anadiendo cancelacion cooperativa.
 
@@ -1360,13 +1488,17 @@ class StreamerCancelable:
     cliente que se va dejaria la CPU 20 s generando audio para nadie.
     """
 
-    def __init__(self):
+    def __init__(self, cola_final: int = None):
         from vibevoice.modular import AsyncAudioStreamer
         self.interno = AsyncAudioStreamer(batch_size=1, stop_signal=None)
         self.cancelado = False
         # generate() ya cerro el flujo por su cuenta. Lo que llegue despues
         # sobra, pero NO es que el cliente se haya ido.
         self.terminado = False
+        # La cola de la ultima palabra (ver el bloque COLA FINAL). Ojo: ahora
+        # `terminado` se pone unos fotogramas MAS TARDE que el EOS, que es
+        # justo de lo que se trata.
+        self.remate = RemateEOS(cola_final)
 
     def put(self, trozos, indices):
         # Solo aborta si el que se fue es el CLIENTE.
@@ -1382,9 +1514,20 @@ class StreamerCancelable:
         # de 6, que es 1 de cada 6. De ahi que pareciera aleatorio.
         if self.cancelado and not self.terminado:
             raise GeneracionCancelada()
+        if self.terminado:
+            return
+        # batch_size 1: un solo trozo por llamada, y su indice es siempre 0.
+        if not self.remate.deja_pasar(trozos[0]):
+            return
         self.interno.put(trozos, indices)
 
     def end(self, indices=None):
+        # El EOS del clasificador no cierra: quedan por bajar los fotogramas en
+        # los que se apaga la ultima palabra. Cierra el end() sin indices que
+        # generate() hace al salir del bucle -- o el `finally` de _sintetizar,
+        # que tambien llama sin indices.
+        if self.remate.retener_cierre(indices):
+            return
         self.terminado = True
         self.interno.end(indices)
 
@@ -1440,6 +1583,9 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None,
             if EN_GPU:
                 entradas = a_dispositivo(entradas)
             reloj = time.perf_counter()
+            # El estado del remate es por generate(): en que latente del bloque
+            # va, como sono el ultimo fotograma y si ya se aplazo el EOS.
+            remate_cero()
             with torch.no_grad():
                 _estado["modelo"].generate(
                     **entradas,
@@ -1799,6 +1945,135 @@ RESPIRO_PICO = float(os.environ.get("VIBEVOICE_RESPIRO_PICO", "0.03"))
 # a 24 kHz; ahi la senal esta todavia en el suelo, asi que el empalme no suena.
 RESPIRO_PRERROLLO = int(os.environ.get("VIBEVOICE_RESPIRO_PRERROLLO", "240"))
 
+# LA COLA DE LA LOCUCION: EL EOS LLEGA UN FOTOGRAMA ANTES DE QUE LA VOZ CALLE
+#
+# EL SINTOMA: "todos los audios terminan abruptamente y la ultima palabra no se
+# entiende bien como termina". Y NO era el respiro: medido con las mismas tres
+# frases y dos semillas, el audio con `respiro` y sin el termina EXACTAMENTE
+# igual -- los ultimos 12 fotogramas tienen el mismo RMS muestra a muestra y la
+# ultima muestra fuerte cae en el mismo sitio. El respiro alarga pausas de
+# ENTRE frases; en el final no toca nada, porque el recorte solo entra pasados
+# RESPIRO_TOPE callados seguidos y la locucion se acaba antes.
+#
+# LA CAUSA ESTA EN EL BUCLE DE MICROSOFT
+# (modeling_vibevoice_streaming_inference.py, lineas 770-853). Por cada ventana
+# de texto se generan TTS_SPEECH_WINDOW_SIZE = 6 latentes, y el orden dentro de
+# la vuelta es:
+#
+#     speech_latent = sample_speech_tokens(...)     # se genera el fotograma
+#     audio_chunk   = acoustic_tokenizer.decode(...)
+#     audio_streamer.put(audio_chunk, ...)          # se emite
+#     ...
+#     if tts_eos_logits[0] > 0.5:                   # <- el EOS se mira DESPUES
+#         finished_tags[...] = True
+#         audio_streamer.end(diffusion_indices)
+#
+# El clasificador de EOS mira el estado DESPUES de emitir el fotograma, y el
+# `for` de los 6 latentes NO se rompe: sigue generando y llamando a put() con
+# los que queden (upstream solo deja de guardarlos en `audio_chunks`). O sea
+# que tras el EOS se generan, se pagan y se DECODIFICAN hasta 5 fotogramas mas
+# -- 0,67 s -- que el streamer tiraba a la basura: AudioStreamer.put() los
+# ignora por `finished_flags`, y ColaAudioSesion.put() por `self.cerrado`.
+#
+# Y en esos fotogramas esta la caida de la ultima palabra. El decodificador
+# acustico es CAUSAL: las muestras del fotograma k salen de los latentes hasta
+# k, asi que la cola de una consonante que se apaga a caballo de la frontera
+# vive en el fotograma k+1. Tirarlo es cortar la palabra en su decaimiento, que
+# es exactamente "no se entiende bien como termina".
+#
+# MEDIDO en la VM (openvino, 6 pasos, cfg 3,5, sp-Spk1_man, 3 frases), antes:
+#
+#   semilla   ultima muestra >= 0,03   cola tras ella   pico de los ultimos 5 ms
+#     11              a 4,6 ms del fin      4,6 ms        0,0322  (-29,8 dBFS)
+#
+# Es decir: el fichero se acaba con la voz a -30 dBFS, tres veces por encima
+# del suelo de sala. Eso no es un final, es un corte.
+#
+# EL ARREGLO: NO CERRAR EN EL EOS, SINO UNOS FOTOGRAMAS DESPUES
+# El streamer se queda el EOS del clasificador (`end(indices)`) sin cerrar,
+# emite hasta COLA_FINAL fotogramas mas y cierra de verdad con el `end()` sin
+# indices que generate() hace siempre al salir del bucle. Cuesta CERO: esos
+# fotogramas ya se generaban y se decodificaban igual, solo que se tiraban.
+#
+# Y no se emiten a ciegas: en cuanto uno de ellos es suelo de sala de verdad
+# (pico por debajo de COLA_FINAL_PICO) se cierra ahi mismo, con ese fotograma
+# dentro. Asi la locucion acaba SIEMPRE aterrizando en silencio -- la cola
+# natural entera y ni un fotograma mas de relleno.
+COLA_FINAL = int(os.environ.get("VIBEVOICE_COLA_FINAL", "5"))
+# Pico por debajo del cual un fotograma de la cola ya es suelo de sala y no hay
+# nada mas que esperar. El mismo umbral que separa "silencio" de "aqui dentro
+# hay voz" en el respiro, por el mismo motivo y con la misma medida.
+COLA_FINAL_PICO = float(os.environ.get("VIBEVOICE_COLA_FINAL_PICO",
+                                       str(RESPIRO_PICO)))
+
+# LO QUE LA VENTANA NO DA: CUANDO EL EOS CAE EN EL ULTIMO LATENTE
+# La cola de arriba es gratis porque se aprovecha lo que la ventana de 6 ya
+# genero. Pero si el EOS cae en el latente numero 6 no queda NADA que
+# aprovechar, y ahi el final sigue en seco. Medido en 20 locuciones (4 textos
+# x 5 semillas): 13 se llevaron su fotograma de cola y 7 no, y los 3 finales
+# que seguian cortando con la voz por encima de -35 dBFS estaban entre esos 7.
+# Es 1 de cada 6 por pura aritmetica de la ventana.
+#
+# EL ARREGLO: pedirle UN bloque mas, y solo cuando de verdad hace falta. El
+# clasificador de EOS se envuelve para APLAZAR una sola vez su "se acabo", y
+# solo si se dan las dos condiciones a la vez:
+#
+#   - el EOS cae en el ultimo latente del bloque (no queda cola que heredar), y
+#   - el fotograma que se acaba de emitir todavia SUENA (pico >= COLA_FINAL_PICO):
+#     el modelo quiere parar en mitad del decaimiento de una palabra.
+#
+# Aplazado el EOS, generate() abre otro bloque de 6 -- ya sin texto que leer --
+# y de ahi sale la cola de verdad, que el streamer corta en cuanto aterriza en
+# suelo de sala. Solo se aplaza UNA vez por generate(): pase lo que pase, el
+# modelo se para en el bloque siguiente y el freno de MARGEN_EOS ni se entera
+# (6 posiciones contra un margen de 30 + 1,0x el texto).
+#
+# SE MIDIO Y NO VALE: VIENE APAGADO. La idea era buena y el mecanismo funciona
+# -- salta cuando tiene que saltar --, pero lo que el modelo hace con el bloque
+# de mas no es siempre apagar la palabra. Banco de 20 locuciones (4 textos x 5
+# semillas) con el aplazamiento puesto, frente al original:
+#
+#   19 de 20   igual o mejor (la cola mediana sube de 97 a 252 ms)
+#    1 de 20   PEOR, y de la mala manera: 4,27 s -> 6,13 s de audio. Al no
+#              dejarle parar, el modelo no remató la palabra: EMPEZO OTRA. Son
+#              1,9 s de habla que el texto no pedia, y encima esa locucion
+#              termino cortada a -17,9 dBFS, que es peor que el fallo original.
+#
+# Inventarse contenido es un precio que un arreglo de la cola no puede pagar:
+# el fallo que se venia a corregir se oye mal, pero al menos dice lo que ponia.
+# Asi que el defecto es 0 y esto queda como palanca para volver a medirlo
+# (VIBEVOICE_COLA_INSISTIR=1) si algun dia hay forma de distinguir "esta
+# apagando la palabra" de "esta arrancando otra" antes de emitirlo.
+#
+# Lo que SI se queda es la cola gratis de arriba (COLA_FINAL), que no puede
+# inventar nada porque no le pide al modelo ni un fotograma de mas.
+#
+# CON EL DECODIFICADOR SOLAPADO NO SE ACTIVA NUNCA. La condicion mira el pico
+# del ultimo fotograma emitido, y con VIBEVOICE_SOLAPAR_DECODER=1 ese pico lo
+# rellena otro hilo que puede ir uno o dos fotogramas por detras: se estaria
+# decidiendo con el fotograma equivocado. Mejor no hacer nada que hacerlo mal.
+COLA_INSISTIR = int(os.environ.get("VIBEVOICE_COLA_INSISTIR", "0"))
+
+# Lo que el streamer sabe y el clasificador de EOS necesita: como sono el
+# ultimo fotograma y en que latente del bloque va. Un dict de modulo basta
+# porque _candado_modelo garantiza UNA generacion a la vez; lo pone a cero
+# quien arranca cada generate().
+#
+# QUIEN CUENTA LOS FOTOGRAMAS ES EL STREAMER, NO EL CLASIFICADOR. La primera
+# version contaba llamadas al clasificador y estaba MAL: upstream lo llama
+# TRES veces por fotograma -- una dentro del forward_tts_lm de la rama buena
+# (linea 466, su `logits`), otra en el de la rama negativa, y la que de verdad
+# decide en la linea 848 --, asi que "una llamada = un fotograma" no se
+# cumple. Se vio en el banco: el aplazamiento saltaba 18 veces de 40 y el
+# audio salia BIT A BIT EL MISMO, porque caia en una llamada cuyo resultado
+# generate() ni mira. put() del streamer, en cambio, es exactamente uno por
+# fotograma acustico y ocurre ANTES de las tres llamadas de ese fotograma.
+_REMATE = {"pico": 0.0, "fotogramas": 0, "aplazados": 0, "armado": False}
+
+
+def remate_cero() -> None:
+    _REMATE.update(pico=0.0, fotogramas=0, aplazados=0, armado=False)
+
 _SESIONES: dict = {}
 _FIN = object()   # centinela: se acabo el audio de la sesion
 
@@ -2112,7 +2387,7 @@ class ColaAudioSesion:
     cuenta: solo expone el EOS, que es justo lo que falla en un descarrile.
     """
 
-    def __init__(self, lazo, cola, texto=None, respiro=False):
+    def __init__(self, lazo, cola, texto=None, respiro=False, cola_final=None):
         self.lazo, self.cola = lazo, cola
         # El TextoEnCurso de ESTA generate(): la fuente de la senal de
         # prorroga. Sin el (None) no se retiene nunca, put() como siempre.
@@ -2133,10 +2408,16 @@ class ColaAudioSesion:
         self.respiro = respiro
         self._callado_seguido = 0
         self._sonado = False      # ya salio algun fotograma con voz dentro
+        # La cola de la ultima palabra (ver el bloque COLA FINAL). Aqui vive el
+        # arreglo del "final en seco": el EOS del clasificador ya no cierra la
+        # cola, la cierra el end() sin indices del final de generate().
+        self.remate = RemateEOS(cola_final)
 
     def put(self, trozos, indices):
-        # Tras end() lo que llegue sobra: generate() no sale del bucle de 6
-        # latentes aunque el EOS salte a mitad, y esos ultimos son silencio.
+        # Tras el cierre de verdad lo que llegue sobra. OJO: el cierre ya NO es
+        # el EOS del clasificador -- generate() sigue dando hasta 5 fotogramas
+        # mas del bucle de 6 latentes, y ahi esta el decaimiento de la ultima
+        # palabra; los deja pasar `remate` (bloque COLA FINAL).
         if self.cerrado:
             return
         # UNICO punto de corte que ofrece generate(): no mira ningun flag
@@ -2148,6 +2429,8 @@ class ColaAudioSesion:
             raise GeneracionCancelada()
         for i, idx in enumerate(indices):
             if int(idx) != 0:
+                continue
+            if not self.remate.deja_pasar(trozos[i]):
                 continue
             trozo = trozos[i].detach().float().cpu()
             if not self.respiro:
@@ -2176,10 +2459,16 @@ class ColaAudioSesion:
                     self._emitir(trozo)
                 continue
             self._emitir(trozo)
-            # El aire va ENTRE frases, no delante de la primera: el silencio de
-            # cabecera solo retrasa el primer sonido, que es la latencia que
-            # mas se nota. De ahi `_sonado`.
-            if self._callado_seguido == RESPIRO_FOTOGRAMAS and self._sonado:
+            # El aire va ENTRE frases: ni delante de la primera ni detras de la
+            # ultima. Delante solo retrasaria el primer sonido, que es la
+            # latencia que mas se nota (de ahi `_sonado`); detras -- ya con el
+            # EOS visto, o sea dentro de la cola final -- son 267 ms de silencio
+            # pegados al final que nadie oye como pausa y que solo retrasan el
+            # turno del que escucha. Medido: sin esta guarda, una locucion corta
+            # se llevaba 400 ms de cola (1 fotograma de aterrizaje + 2 de aire
+            # insertado) donde bastan 133.
+            if (self._callado_seguido == RESPIRO_FOTOGRAMAS and self._sonado
+                    and not self.remate.visto):
                 for extra in _alargar_pausa(trozo):
                     self._emitir(extra)
 
@@ -2197,6 +2486,12 @@ class ColaAudioSesion:
         # fin del bucle de generate()): lo retenido era el remate de verdad y
         # se suelta entero. Mismo hilo y misma via que put(), asi que el orden
         # con lo ya emitido se conserva. Un descarrile no pasa por aqui.
+        #
+        # El EOS del clasificador (el unico end() que llega CON indices) no
+        # cierra: se aguanta para que baje la cola de la ultima palabra, y
+        # cierra el end() sin indices con el que generate() sale del bucle.
+        if self.remate.retener_cierre(indices):
+            return
         self.cerrado = True
         if self.retenidos:
             # Que quede en el log: un EOS que llego DESPUES del umbral de
@@ -2216,7 +2511,7 @@ class SesionViva:
     """Una generate() viva en su hilo, con una cola de texto por delante."""
 
     def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo,
-                 respiro=True):
+                 respiro=True, cola_final=None):
         self.nombre = nombre
         self.voz = voz
         self.cfg_scale = cfg_scale
@@ -2226,6 +2521,10 @@ class SesionViva:
         # por sesion Y por servicio: el campo `respiro` de la peticion manda,
         # pero VIBEVOICE_RESPIRO=0 lo apaga globalmente.
         self.respiro = bool(respiro) and RESPIRO_ACTIVO
+        # Fotogramas de cola tras el EOS (bloque COLA FINAL). None = el defecto
+        # del servicio; va por sesion para poder medir el antes y el despues
+        # sin reiniciar nada, que es como se midio.
+        self.cola_final = cola_final
         self.lazo = lazo
         self.cola = asyncio.Queue()
         self.visto = time.time()
@@ -2533,7 +2832,8 @@ class SesionViva:
         # Con el alimentador puesto: es quien le dice a la cola cuando la
         # locucion entra en prorroga y hay que retener (ver ColaAudioSesion).
         audio = ColaAudioSesion(self.lazo, self.cola, texto=al,
-                                respiro=self.respiro)
+                                respiro=self.respiro,
+                                cola_final=self.cola_final)
         with self._cond:
             # Bajo el candado y comprobando abortada: si el cliente se fue entre
             # que se armo la cola y que se registra, abortar() no la habria
@@ -2571,6 +2871,7 @@ class SesionViva:
             # cola de verdad, que es a la que abortar() le pone `cancelado` y
             # de la que se leen los `retenidos` al salir.
             destino = StreamerSolapado(solapado, audio) if solapado else audio
+            remate_cero()   # por generate(), igual que en _sintetizar
             with torch.no_grad():
                 _estado["modelo"].generate(
                     **entradas,
@@ -2702,6 +3003,12 @@ class PeticionTTS(BaseModel):
     # reiniciar el servicio ni pelearse con las variables de la unidad.
     neg_cada: Optional[int] = Field(None, ge=1, le=6)
 
+    # Fotogramas de cola que se emiten tras el EOS del clasificador, donde se
+    # apaga la ultima palabra (ver el bloque COLA FINAL). 0 = el corte en seco
+    # de antes; None = lo que diga VIBEVOICE_COLA_FINAL. Va por peticion para
+    # poder medir el antes y el despues con el MISMO binario.
+    cola_final: Optional[int] = Field(None, ge=0, le=6)
+
 
 class PeticionSesion(BaseModel):
     """Texto que se le mete a una sesion viva. La voz y los ajustes solo se
@@ -2719,6 +3026,9 @@ class PeticionSesion(BaseModel):
     # CREAR la sesion, como la voz. respiro=False da el audio pelado del
     # modelo, bit a bit el de /tts/stream con " ".join: ni alargue ni recorte.
     respiro: bool = True
+    # Cola de la ultima palabra; ver el bloque COLA FINAL. Como la voz, solo se
+    # mira al CREAR la sesion.
+    cola_final: Optional[int] = Field(None, ge=0, le=6)
     # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
     fin: bool = False
 
@@ -2756,6 +3066,11 @@ def health() -> dict:
         "hilos": {"total": HILOS, "decoder": HILOS_DECODER,
                   "solapado": SOLAPAR_DECODER},
         "neg_cada": NEG_CADA,
+        # La cola de la ultima palabra, que es global a las dos vias (ver el
+        # bloque COLA FINAL). Fuera de "sesiones" porque /tts/stream la lleva
+        # igual.
+        "cola_final": {"fotogramas": COLA_FINAL, "umbral_pico": COLA_FINAL_PICO,
+                       "insistir": COLA_INSISTIR and not SOLAPAR_DECODER},
         "sesiones": {"activas": SESIONES_ACTIVAS,
                      "abiertas": sorted(_SESIONES),
                      "espera_texto_s": ESPERA_TEXTO,
@@ -2844,7 +3159,7 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
         # El candado se toma DENTRO del generador: si hay otra sintesis en
         # curso, esta espera su turno sin bloquear el bucle de eventos.
         async with _candado:
-            streamer = StreamerCancelable()
+            streamer = StreamerCancelable(pet.cola_final)
             lazo = asyncio.get_running_loop()
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
@@ -2939,7 +3254,7 @@ async def sesion_texto(nombre: str, pet: PeticionSesion,
     if nueva:
         s = SesionViva(nombre, pet.voz or VOZ_DEFECTO, pet.cfg_scale,
                        pet.semilla, pet.pasos, asyncio.get_running_loop(),
-                       respiro=pet.respiro)
+                       respiro=pet.respiro, cola_final=pet.cola_final)
         _SESIONES[nombre] = s
     elif pet.voz is not None and pet.voz != s.voz:
         raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
@@ -3105,6 +3420,9 @@ class AbrirSesionWS(BaseModel):
     # Pausa de verdad en cada punto (ver el bloque RESPIRO). False = la
     # locucion de antes, bit a bit.
     respiro: bool = True
+    # Cola de la ultima palabra; ver el bloque COLA FINAL. 0 vuelve al corte en
+    # seco de antes, que es contra lo que se midio.
+    cola_final: Optional[int] = Field(None, ge=0, le=6)
     # Aceptado solo para poder dar un error claro; ver el bloque VELOCIDAD.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
@@ -3329,7 +3647,7 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
             nombre = None
             return
         s = SesionViva(nombre, cfg.voz, cfg.cfg_scale, cfg.semilla, cfg.pasos,
-                       lazo, respiro=cfg.respiro)
+                       lazo, respiro=cfg.respiro, cola_final=cfg.cola_final)
         # El audio ya sale por aqui: que GET /tts/sesion/{id}/audio no lo robe.
         s.escuchando = True
         _SESIONES[nombre] = s
