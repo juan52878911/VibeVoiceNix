@@ -1912,6 +1912,78 @@ _COLA_PUNTUACION = re.compile(r"[^\s\w]+$")
 #   pico max descartado  0,1452 -> 0,0290  (deja de tirarse voz)
 #   costuras con ataque perdido  9/54 -> 0/54
 #
+# EL AIRE NO ERA SUELO DE SALA: ERA EL ATAQUE DE LA PALABRA SIGUIENTE, Y AL
+# REVES (2026-08-15)
+#
+# EL SINTOMA, textual: "la respiracion entre cada frase es algo que no es muy
+# realista, me da un poco de risa porque lo lee muy raro".
+#
+# Y no era una impresion. El fotograma que se repetia en espejo NO es suelo de
+# sala: es el fotograma de la COSTURA, y este bloque ya sabia desde el 6 de
+# agosto que ahi dentro esta el ataque de la palabra siguiente -- por eso el
+# recorte del tope decide con el PICO y no con la media. Lo que no se hizo fue
+# aplicar esa misma prueba al ALARGUE. Medido sobre la locucion de 6 frases con
+# la que se vio el fallo (sp-Spk1_man, semilla 11, 3 pausas), fotograma a
+# fotograma:
+#
+#   fotograma copiado   rms      pico     centro temporal de la energia
+#   pausa 1 (fot 21)    0,00507  0,03522  0,929
+#   pausa 2 (fot 42)    0,00504  0,03223  0,915
+#   pausa 3 (fot 62)    0,00175  0,00739  0,352
+#   suelo de sala de verdad (interior de una pausa que el modelo GENERA con
+#   "\n\n")             0,00188  0,00674  ~0,5
+#
+# Centro temporal 0,93 quiere decir que casi toda la energia del fotograma esta
+# en su ULTIMO decimo. Y la envolvente por bloques de 10 ms lo remata: los
+# primeros 110 ms van entre -56 y -64 dBFS (eso si es suelo) y los ultimos 20
+# suben a -47,9 y -37,3. Eso es el arranque de una palabra, no una respiracion.
+# Su pico llega a 0,0352, por ENCIMA del RESPIRO_PICO = 0,03 con el que este
+# mismo bloque decide "aqui dentro hay voz".
+#
+# Asi que lo que se emitia en cada final de frase era, literalmente:
+#   1. el fotograma entero -> el arranque de la palabra, 20 ms
+#   2. ese mismo fotograma INVERTIDO -> el arranque, del reves (empieza a
+#      -37,7 dBFS y se apaga en 10 ms: un golpe seco que se traga)
+#   3. el fotograma otra vez -> el arranque, por segunda vez
+#   4. y ahora si, la palabra
+# Tres golpes de energia separados 133 ms = una modulacion de 7,5 Hz. La misma
+# periodicidad que el espejo venia a evitar, pero con el ataque dentro. Por eso
+# "lo lee muy raro": es un tartamudeo con un chasquido al reves en medio.
+#
+# EL ESPEJO NO ERA EL CULPABLE, LO ERA EL MATERIAL. Sobre ruido plano el espejo
+# no tiene nada que invertir; sobre una rampa de 25 dB, si. Y la comprobacion
+# que daba luz verde -- "el salto maximo entre muestras no cambia" -- media
+# continuidad de MUESTRA, que el espejo garantiza por construccion, y no
+# continuidad de ENVOLVENTE, que es lo que oye el oido.
+#
+# EL ARREGLO: EL SUELO DE VERDAD, Y DELANTE DEL ATAQUE
+#   1. El fotograma se parte por el PIE del ataque (_partir_pausa): la cabeza
+#      callada por un lado y el ataque con su rampa por el otro.
+#   2. El aire se hace SOLO con la cabeza (_aire_de_pausa), en espejo alternado
+#      como siempre -- ahora sobre ruido plano, donde el espejo es inocuo.
+#   3. Y se mete ENTRE las dos: cabeza, aire, ataque. La palabra ya no se parte.
+#
+# MEDIDO sobre la misma locucion, con el aire insertado bajo la lupa
+# (scripts/deriva/pausas/): golpes = arranques de energia por encima de
+# -45 dBFS dentro del aire; rango = recorrido de la envolvente dentro del aire;
+# eco = cuanto suenan los 30 ms de DELANTE del aire por encima del aire (o sea,
+# ataque abandonado al otro lado de la pausa); mod = modulacion a 7,5 Hz.
+#
+#   variante                          golpes  rango   eco    mod   salto
+#   sin aire (referencia)                  -      -     -      -   0,0000
+#   espejo del fotograma entero, detras    4   30,1  +6,3   3,27   0,0022
+#   suelo de verdad, detras                0    8,2  +19,4  2,58   0,0236
+#   suelo de verdad, delante  <- ESTO      0   11,8   -2,0  1,06   0,0015
+#   silencio digital, delante              0  186,5  +6,4  16,17   0,0049
+#
+# El habla no cambia en ninguna: quitando los fotogramas de suelo, lo que queda
+# es muestra a muestra el de /tts/stream con " ".join.
+#
+# EL SILENCIO DIGITAL SE DESCARTO POR MEDIDA, no por gusto: dejar 267 ms a cero
+# entre frases abre un agujero en el suelo de sala (recorrido de 186 dB, y una
+# modulacion de 16 dB a 7,5 Hz) que suena a puerta de ruido abriendo y cerrando.
+# La grabacion de una persona en una sala no calla a cero; el modelo tampoco.
+#
 # VIBEVOICE_RESPIRO=0 lo apaga (ni alargue ni recorte: el audio sale bit a bit
 # como el de /tts/stream con " ".join), y cada sesion puede pedirlo o
 # rechazarlo con el campo `respiro`. El umbral y el tope tienen mando por si
@@ -1944,6 +2016,13 @@ RESPIRO_PICO = float(os.environ.get("VIBEVOICE_RESPIRO_PICO", "0.03"))
 # la rampa del ataque ni meter un escalon audible en la costura. 240 = 10 ms
 # a 24 kHz; ahi la senal esta todavia en el suelo, asi que el empalme no suena.
 RESPIRO_PRERROLLO = int(os.environ.get("VIBEVOICE_RESPIRO_PRERROLLO", "240"))
+# Lo mismo, pero para PARTIR el fotograma donde se mete el aire, que es otra
+# cosa: ahi no basta con no cortar la rampa, hay que dejarla ENTERA al otro
+# lado de la pausa. La primera muestra que pasa de RESPIRO_PICO es el ataque ya
+# a -30 dBFS; su pie cae 20-30 ms antes. 960 = 40 ms, en medio de la meseta
+# medida (ver _partir_pausa). Con 240 el arranque de la palabra se quedaba
+# delante del aire y se oia dos veces.
+RESPIRO_PIE = int(os.environ.get("VIBEVOICE_RESPIRO_PIE", "960"))
 
 # LA COLA DE LA LOCUCION: EL EOS LLEGA UN FOTOGRAMA ANTES DE QUE LA VOZ CALLE
 #
@@ -2326,27 +2405,74 @@ def _recortar_callado(trozo):
     return plano[max(0, primera - RESPIRO_PRERROLLO):]
 
 
-def _alargar_pausa(trozo, cuantos: int = RESPIRO_ALARGA) -> list:
-    """El aire de la frase: `cuantos` fotogramas mas del suelo de sala que el
-    modelo acaba de dar, SIN pedirselos a el (ver el bloque RESPIRO).
+def _partir_pausa(trozo):
+    """(cabeza callada, resto) del fotograma donde se va a meter el aire.
 
-    En ESPEJO y alternando. El fotograma invertido empieza por la ultima
-    muestra del original, y el original empieza por la primera, que es con la
-    que acaba el invertido: encadenados asi, cada empalme es continuo por
-    construccion. Repetir el fotograma tal cual metia un escalon en cada junta
-    y ademas una periodicidad audible de 7,5 Hz. Comprobado sobre el WAV: el
-    salto maximo entre muestras consecutivas no cambia (0,1477 con alargue y
-    sin el), o sea que no se introduce ni una discontinuidad.
+    La primera muestra que pasa de RESPIRO_PICO no es el principio de la
+    palabra: es donde el ataque YA esta a -30 dBFS. El PIE del ataque cae
+    20-30 ms antes (medido: la envolvente del fotograma de la costura sube de
+    -56 a -48 a -37 dBFS en bloques de 10 ms). Cortar en la muestra fuerte deja
+    esa rampa al otro lado de la pausa, y entonces se oye el arranque de la
+    palabra, luego el aire, y luego la palabra otra vez.
 
-    Se devuelven copias y no vistas: el trozo original ya va camino de la cola
-    y torch.flip materializa, pero clone() en el par deja claro que nadie
-    comparte memoria con lo que ya se emitio.
-    """
+    Asi que se corta RESPIRO_PIE muestras antes de la primera fuerte, y no
+    RESPIRO_PRERROLLO. Se probo tambien un retroceso adaptativo -- ir hacia
+    atras por bloques de 5 ms mientras sigan por encima del suelo del propio
+    fotograma -- y da EL MISMO corte (32 ms antes en los dos fotogramas de la
+    medida), asi que se queda el numero fijo: no depende de como redondee la
+    coma flotante, y ws_fidelidad.py lo reproduce sin margen de duda.
+
+    MEDIDO barriendo el retroceso (locucion de 6 frases, 3 pausas), con el eco
+    = cuanto suenan los 30 ms de DELANTE del aire por encima del aire:
+
+        pie      eco     golpes en el aire   recorrido de la envolvente
+        10 ms   +3,8 dB        3                  23,0 dB
+        20 ms   -1,6 dB        0                  11,8 dB
+        40 ms   -2,2 dB        0                  11,8 dB
+        60 ms   -2,0 dB        0                  11,9 dB
+
+    A partir de 20 ms el ataque queda entero al otro lado y la meseta es plana;
+    40 ms cae en medio de ella.
+
+    Sin ataque dentro, resto sale vacio y el aire va detras del fotograma
+    entero, que es donde iba siempre."""
     plano = trozo.reshape(-1)
-    if cuantos <= 0 or plano.numel() == 0:
+    if RESPIRO_PICO <= 0:
+        return plano, plano[:0]
+    fuertes = torch.nonzero(plano.abs() >= RESPIRO_PICO)
+    if fuertes.numel() == 0:
+        return plano, plano[:0]
+    corte = max(0, int(fuertes[0]) - RESPIRO_PIE)
+    return plano[:corte], plano[corte:]
+
+
+def _aire_de_pausa(suelo, muestras: int) -> list:
+    """`muestras` de aire hechas con `suelo`, en espejo alternado.
+
+    El espejo es el mismo truco de siempre -- la copia invertida EMPIEZA por la
+    ultima muestra del original, asi que cada junta es continua por
+    construccion --, pero ahora se aplica al SUELO DE SALA y no al fotograma
+    entero. Sobre ruido plano el espejo no tiene nada que invertir; sobre un
+    ataque de palabra si, y eso es lo que sonaba al reves.
+
+    El ultimo trozo se recorta para dar exactamente `muestras` y no romper la
+    cuenta de fotogramas: el corte cae en ruido de -55 dBFS, y el salto que
+    deja se midio en 0,0015 (el habla llega a 0,20).
+
+    Se devuelven copias y no vistas: el suelo puede venir del trozo que ya va
+    camino de la cola, y nadie debe compartir memoria con lo ya emitido."""
+    plano = suelo.reshape(-1)
+    if muestras <= 0 or plano.numel() == 0:
         return []
-    return [torch.flip(plano, [0]) if k % 2 == 0 else plano.clone()
-            for k in range(cuantos)]
+    fuera, puestas, k = [], 0, 0
+    while puestas < muestras:
+        pieza = (torch.flip(plano, [0]) if k % 2 == 0 else plano.clone())
+        if puestas + pieza.numel() > muestras:
+            pieza = pieza[:muestras - puestas].clone()
+        fuera.append(pieza)
+        puestas += pieza.numel()
+        k += 1
+    return fuera
 
 
 class ColaAudioSesion:
@@ -2408,6 +2534,10 @@ class ColaAudioSesion:
         self.respiro = respiro
         self._callado_seguido = 0
         self._sonado = False      # ya salio algun fotograma con voz dentro
+        # Ultimo fotograma que era suelo de sala ENTERO. Es el material de
+        # repuesto para el aire cuando el fotograma de la costura casi no tiene
+        # cabeza callada; ver put().
+        self._suelo = None
         # La cola de la ultima palabra (ver el bloque COLA FINAL). Aqui vive el
         # arreglo del "final en seco": el EOS del clasificador ya no cierra la
         # cola, la cierra el end() sin indices del final de generate().
@@ -2458,7 +2588,6 @@ class ColaAudioSesion:
                 if trozo is not None:
                     self._emitir(trozo)
                 continue
-            self._emitir(trozo)
             # El aire va ENTRE frases: ni delante de la primera ni detras de la
             # ultima. Delante solo retrasaria el primer sonido, que es la
             # latencia que mas se nota (de ahi `_sonado`); detras -- ya con el
@@ -2467,10 +2596,44 @@ class ColaAudioSesion:
             # turno del que escucha. Medido: sin esta guarda, una locucion corta
             # se llevaba 400 ms de cola (1 fotograma de aterrizaje + 2 de aire
             # insertado) donde bastan 133.
-            if (self._callado_seguido == RESPIRO_FOTOGRAMAS and self._sonado
-                    and not self.remate.visto):
-                for extra in _alargar_pausa(trozo):
-                    self._emitir(extra)
+            if (self._callado_seguido != RESPIRO_FOTOGRAMAS or not self._sonado
+                    or self.remate.visto or RESPIRO_ALARGA <= 0):
+                self._emitir(trozo)
+                # Suelo de sala de repuesto para el aire: solo vale el
+                # fotograma que esta callado ENTERO (pico por debajo del
+                # umbral), no el de la costura. En una pausa siempre acaba de
+                # pasar uno, porque el aire se mete en el SEGUNDO callado.
+                if float(trozo.abs().max()) < RESPIRO_PICO:
+                    self._suelo = trozo.reshape(-1).clone()
+                continue
+            # AQUI VA EL AIRE, y va DENTRO del fotograma, no detras.
+            #
+            # Este fotograma es el de la costura: sus primeros 110 ms son suelo
+            # de sala y los ultimos 20 son el arranque de la palabra siguiente
+            # (medido; ver el bloque RESPIRO). Meter el aire detras del
+            # fotograma entero dejaba ese arranque al otro lado de la pausa --
+            # se oia el principio de la palabra, luego 267 ms de pausa, y luego
+            # la palabra otra vez -- y ademas lo repetia, porque el material que
+            # se copiaba era ESE fotograma.
+            #
+            # Asi que se parte por el pie del ataque y se emite cabeza, aire,
+            # ataque. El aire se hace solo con la cabeza, que es suelo de sala
+            # de verdad; si no queda cabeza suficiente (un ataque que empieza
+            # muy pronto) se usa el ultimo fotograma que era suelo entero, que
+            # en una pausa siempre acaba de pasar.
+            cabeza, ataque = _partir_pausa(trozo)
+            fuente = cabeza if cabeza.numel() >= trozo.numel() // 4 else self._suelo
+            if fuente is None or fuente.numel() == 0:
+                fuente = trozo.reshape(-1)
+            if cabeza.numel():
+                self._emitir(cabeza)
+            # El aire mide RESPIRO_ALARGA fotogramas EXACTOS, se haga con lo que
+            # se haga: asi la pausa sigue creciendo lo que se anuncia y la
+            # cuenta de fotogramas del flujo no se descuadra.
+            for extra in _aire_de_pausa(fuente, RESPIRO_ALARGA * trozo.numel()):
+                self._emitir(extra)
+            if ataque.numel():
+                self._emitir(ataque)
 
     def _emitir(self, trozo) -> None:
         """Un fotograma a la cola -- o a la reserva, si la locucion ya esta en
@@ -3081,7 +3244,8 @@ def health() -> dict:
                                  "tope": RESPIRO_TOPE,
                                  "umbral_rms": RESPIRO_UMBRAL,
                                  "umbral_pico": RESPIRO_PICO,
-                                 "prerrollo": RESPIRO_PRERROLLO},
+                                 "prerrollo": RESPIRO_PRERROLLO,
+                                 "pie": RESPIRO_PIE},
                      "websocket": "/tts/sesion/ws"},
     }
 

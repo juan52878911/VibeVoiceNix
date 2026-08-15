@@ -278,7 +278,7 @@ def rachas_calladas(pcm, umbral):
     return out
 
 
-def aplicar_respiro(pcm, fot, alarga, tope, umbral, pico, prerrollo):
+def aplicar_respiro(pcm, fot, alarga, tope, umbral, pico, prerrollo, pie):
     """El respiro del servidor, reimplementado aqui (ColaAudioSesion.put).
 
     Es DELIBERADAMENTE una segunda implementacion y no una importacion: lo que
@@ -287,8 +287,10 @@ def aplicar_respiro(pcm, fot, alarga, tope, umbral, pico, prerrollo):
     """
     import array
     salida = array.array("h")
+    umbral_pico = int(pico * 32768)
     seguidos = 0
     sonado = False
+    suelo = None      # ultimo fotograma callado ENTERO, material del aire
     for f in _fotogramas(pcm):
         if _rms(f) >= umbral:
             seguidos = 0
@@ -300,18 +302,36 @@ def aplicar_respiro(pcm, fot, alarga, tope, umbral, pico, prerrollo):
             # Pasado el tope se recorta, pero solo la CABEZA callada: si el
             # fotograma lleva dentro el ataque de la palabra siguiente se emite
             # desde justo antes de el.
-            umbral_pico = int(pico * 32768)
             primera = next((k for k, v in enumerate(f)
                             if abs(v) >= umbral_pico), None)
             if primera is not None:
                 salida.extend(f[max(0, primera - prerrollo):])
             continue
-        salida.extend(f)
-        if seguidos == fot and sonado:
-            # El aire: `alarga` fotogramas mas del mismo suelo de sala, en
-            # espejo y alternando, que es lo que hace el empalme continuo.
-            for k in range(alarga):
-                salida.extend(f[::-1] if k % 2 == 0 else f)
+        if seguidos != fot or not sonado or alarga <= 0:
+            salida.extend(f)
+            if max(abs(v) for v in f) < umbral_pico:
+                suelo = f
+            continue
+        # EL AIRE, y va DENTRO del fotograma. Este es el de la costura: sus
+        # primeros 110 ms son suelo de sala y los ultimos 20 el arranque de la
+        # palabra siguiente. Se parte por el PIE de ese ataque y se emite
+        # cabeza, aire, ataque -- el aire hecho SOLO con la cabeza, que es
+        # suelo de verdad, en espejo alternado y recortado a `alarga`
+        # fotogramas exactos.
+        primera = next((k for k, v in enumerate(f)
+                        if abs(v) >= umbral_pico), None)
+        corte = len(f) if primera is None else max(0, primera - pie)
+        cabeza, ataque = f[:corte], f[corte:]
+        fuente = cabeza if len(cabeza) >= len(f) // 4 else (suelo or f)
+        salida.extend(cabeza)
+        puestas, k = 0, 0
+        while puestas < alarga * len(f):
+            pieza = fuente[::-1] if k % 2 == 0 else fuente
+            pieza = pieza[:alarga * len(f) - puestas]
+            salida.extend(pieza)
+            puestas += len(pieza)
+            k += 1
+        salida.extend(ataque)
     if sys.byteorder == "big":
         salida.byteswap()
     return salida.tobytes()
@@ -507,6 +527,7 @@ def main():
         umbral = resp.get("umbral_rms", 0.006)
         pico = resp.get("umbral_pico", 0.03)
         prerrollo = resp.get("prerrollo", 240)
+        pie = resp.get("pie", 960)
         pcm_sin, _, _ = asyncio.run(ws_sesion(
             a.url, a.token, FRASES, a.voz, a.cfg, a.semilla, a.pasos,
             respiro=False))
@@ -518,7 +539,7 @@ def main():
               f"alarga {alarga}, tope {tope})")
 
         esperado = aplicar_respiro(pcm_sin, fot, alarga, tope, umbral, pico,
-                                   prerrollo)
+                                   prerrollo, pie)
         if md5(esperado) == md5(pcm_resp):
             print("  OK  el respiro es exactamente el post-proceso documentado: "
                   "mismo md5 aplicandolo en local sobre el audio sin respiro")
