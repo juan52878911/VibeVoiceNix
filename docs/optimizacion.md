@@ -280,10 +280,17 @@ permite, por orden: **fin de frase** → **fin de cláusula** → **último espa
 tiene. Y el decoder acústico lo era: `quantize_dynamic` solo toca `nn.Linear`, así que sus **convoluciones
 transpuestas (40 M de parámetros, 162 MB leídos por fotograma) seguían en fp32** sin que nadie las tocara.
 
-**Lo que se encontró al medir por capa.** El coste dominante no era solo leer esos pesos: para generar
-**8 muestras** nuevas, `F.conv_transpose1d` de la subida 2048→1024 calcula la salida **completa** de los
-16 fotogramas de entrada (contexto de streaming incluido) y luego recorta — la mayor parte del cómputo se
-tira. En la máquina de desarrollo esa capa pasa de **60,6 a 4,7 ms (12,8×)** con el núcleo propio.
+**Lo medido por capa.** La subida 2048→1024 pasa de **60,6 a 4,7 ms (12,8×)** con el núcleo propio. La
+ganancia viene de dos sitios, y ninguno es exótico: **pesos en int8** (¼ de bytes que en fp32) y un GEMM
+AVX2 decente en lugar del camino de `conv_transpose1d` de torch.
+
+**Y de paso apareció un desperdicio que sigue ahí.** En streaming esa capa recibe 1 fotograma nuevo más 15
+de contexto, calcula las **136** posiciones de salida que salen de esos 16, recorta a 128 y **se queda con
+8**. De las 16 entradas, a las 8 posiciones que sobreviven solo contribuyen **dos**: se calcula **8× de más**.
+El núcleo **no lo aprovecha** — reproduce la salida completa a propósito, para que la paridad contra
+`F.conv_transpose1d` sea comprobable elemento a elemento. Queda como palanca pendiente, y con techo
+conocido: los 33,5 MB de pesos int8 de esa capa son ~2,6 ms a 13 GB/s, así que de los 4,7 ms actuales se
+podría bajar a ~3, no a 0,6. Es aritmética lo que sobra, no ancho de banda.
 
 **Lo que se hizo.** Un único `nucleos.cpp` (~250 líneas, sin dependencias) con dos núcleos AVX2 cargados
 por `ctypes`, y un envoltorio (`nucleos_torch.py`) que sustituye módulos **hoja** del decoder al arrancar,

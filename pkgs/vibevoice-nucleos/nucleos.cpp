@@ -212,8 +212,19 @@ int vv_linear_din(const float* x, const int8_t* w, const float* escalas,
 
 // Salida COMPLETA de conv_transpose1d(x[Cin,T], W, sesgo, stride=s), es decir
 // y[Cout, (T-1)*s+k]: la misma que devuelve F.conv_transpose1d, para que el
-// recorte causal del modulo que envuelve opere identico. Se calcula como
-// GEMM (reduccion sobre Cin) mas dispersion col2im:
+// recorte causal del modulo que envuelve opere identico.
+//
+// COMPLETA A PROPOSITO, Y CUESTA: en streaming el que llama se queda solo con
+// las ultimas T_nuevas*s posiciones, y a esas solo contribuyen las ultimas
+// ceil(k/s) entradas. En la subida 2048->1024 (T=16 con contexto, k=16, s=8)
+// eso son 2 de 16: se calcula 8x de mas. Se acepta porque asi la paridad
+// contra F.conv_transpose1d es comprobable elemento a elemento, y porque el
+// techo de la mejora es corto: los pesos de esa capa son ~2,6 ms de lectura
+// a 13 GB/s frente a los 4,7 ms que tarda hoy. Sobra aritmetica, no bytes.
+// Si algun dia se recorta, el envoltorio tendra que pasar cuantas posiciones
+// finales necesita y la paridad pasara a comprobarse solo sobre ellas.
+//
+// Se calcula como GEMM (reduccion sobre Cin) mas dispersion col2im:
 //   w:       int8 [Cout*k, Cin]: el W[Cin,Cout,k] de torch permutado a
 //            (Cout,k,Cin) y aplanado, cada columna de salida contigua.
 //   escalas: fp32 [Cout*k] (la escala por canal Cout, repetida k veces)
