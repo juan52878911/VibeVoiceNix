@@ -286,6 +286,22 @@ def cargar_modelo():
         modelo.to(DISPOSITIVO)
         _estado["motor"] = f"torch-fp16-{DISPOSITIVO}"
     else:
+        # Nucleos nativos int8 del decoder acustico (nucleos_torch.py). ANTES
+        # de quantize_dynamic a proposito: capturan los pesos fp32 originales
+        # y los modulos sustituidos dejan de ser nn.Linear, asi que la
+        # cuantizacion de abajo ya no los re-toca; las capas que se dejan en
+        # paz siguen siendo nn.Linear y se cuantizan como siempre. En maquinas
+        # sin el .so, sin x86_64 o sin AVX2 la llamada no cambia nada.
+        #
+        # En try por la misma razon que quantize_dynamic: es una OPTIMIZACION,
+        # y un servicio lento sirve mas que uno muerto en el arranque.
+        try:
+            from nucleos_torch import acelerar_decoder_nativo
+            if acelerar_decoder_nativo(modelo):
+                devolver_memoria()
+        except Exception as e:
+            print(f"[aviso] nucleos nativos no disponibles: {e}. Se sigue "
+                  f"sin ellos.", flush=True)
         motor_q = elegir_motor_cuantizacion()
         if motor_q:
             torch.backends.quantized.engine = motor_q

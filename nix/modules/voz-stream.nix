@@ -91,6 +91,14 @@ in
         MALLOC_ARENA_MAX = "2";
         VIBEVOICE_MOTOR = if ov.enable then "openvino" else "torch";
       }
+      # Nucleos nativos int8 del decoder acustico, solo para el motor torch:
+      # con OpenVINO el decoder es AcusticoOV y estos nucleos no pintan nada.
+      # El envoltorio (nucleos_torch.py) ya comprueba AVX2 al cargar y si no
+      # puede se queda como estaba, asi que apuntar al .so es inofensivo.
+      // lib.optionalAttrs (!ov.enable && pkgs.stdenv.hostPlatform.isx86_64) {
+        VIBEVOICE_NUCLEOS_SO =
+          "${pkgs.vibevoiceNucleos}/lib/libnucleos_vibevoice.so";
+      }
       // lib.optionalAttrs ov.enable {
         VIBEVOICE_OV_CODIGO = "${pkgs.vibevoiceOvCodigo}";
         VIBEVOICE_IR_LM = "${ov.directorioIR}/tts_lm_estado_${ov.precisionLM}.xml";

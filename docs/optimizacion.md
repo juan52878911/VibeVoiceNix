@@ -271,6 +271,70 @@ permite, por orden: **fin de frase** → **fin de cláusula** → **último espa
 
 </details>
 
+<details>
+<summary><b>5 · Núcleos nativos int8 (AVX2) para el decoder acústico</b> — pendiente de medir en la VM</summary>
+
+<br>
+
+**La hipótesis.** Con el cuello en el bus de memoria, el componente menos cuantizado es el que más margen
+tiene. Y el decoder acústico lo era: `quantize_dynamic` solo toca `nn.Linear`, así que sus **convoluciones
+transpuestas (40 M de parámetros, 162 MB leídos por fotograma) seguían en fp32** sin que nadie las tocara.
+
+**Lo que se encontró al medir por capa.** El coste dominante no era solo leer esos pesos: para generar
+**8 muestras** nuevas, `F.conv_transpose1d` de la subida 2048→1024 calcula la salida **completa** de los
+16 fotogramas de entrada (contexto de streaming incluido) y luego recorta — la mayor parte del cómputo se
+tira. En la máquina de desarrollo esa capa pasa de **60,6 a 4,7 ms (12,8×)** con el núcleo propio.
+
+**Lo que se hizo.** Un único `nucleos.cpp` (~250 líneas, sin dependencias) con dos núcleos AVX2 cargados
+por `ctypes`, y un envoltorio (`nucleos_torch.py`) que sustituye módulos **hoja** del decoder al arrancar,
+igual que la reescritura *depthwise* — la caché de streaming de 34 estados no se toca:
+
+- **pesos int8** simétricos por canal de salida, empaquetados una vez al cargar (las 3 subidas gordas
+  pasan de 162 MB residentes a ~41);
+- **activaciones u7** ([0,127] con punto cero) y no u8, a propósito: sin VNNI la ruta es `VPMADDUBSW`, que
+  satura en i16; con u7 el par máximo es 2·127·127 = 32258 < 32767 y **la saturación es imposible por
+  construcción**;
+- la conv transpuesta se hace **GEMM + dispersión**, con la salida completa idéntica a la de
+  `F.conv_transpose1d` (paridad comprobada elemento a elemento, diff ~1e−7 contra la referencia entera).
+
+**Medido en la máquina de desarrollo** (decode completo en streaming, `bancada_nucleos.py decoder`;
+*no es la VM*, ahí hay que repetirlo):
+
+| Variante | ms/fotograma | vs producción |
+|---|---|---|
+| fp32 | 161,9 | — |
+| producción (dw rápida + fbgemm) | 122,9 | 1,00× |
+| **+ 3 subidas nativas** (`ambito=subidas`) | **62,3** | **1,97×** |
+| + FFN etapa 0 (`ambito=etapa0`) | 64,6 | 1,90× |
+| + todas las FFN grandes (`ambito=todo`) | 69,4 | 1,77× |
+
+En desarrollo fbgemm gana la batalla de las FFN con T=8/40 **porque ahí tiene AVX512, que el i7-8700T no
+tiene**: cuál de los tres ámbitos gana en la VM se decide midiendo allí, no aquí. La correlación de audio
+con pesos aleatorios (el peor caso para una cuantización) queda en 0,9986, el mismo orden que el fbgemm ya
+aceptado en producción (0,9992); con los pesos reales la vara es `scripts/fidelidad.py` (WER ≤ ~3,6 %).
+
+**El estándar de fidelidad, sin rodeos:** el audio **deja de ser bit a bit idéntico** al de antes — int8 en
+las subidas mueve los últimos decimales. Los md5 *entre endpoints* sobreviven (comparan el mismo proceso
+consigo mismo), pero cualquier comparación contra audio pregrabado se rompe. El criterio pasa a ser el del
+precedente *depthwise*: correlación contra fp32, diff documentada, misma longitud exacta y WER sin degradar.
+
+**Cómo se mide en la VM** (con el entorno de producción, siempre):
+
+```bash
+OMP_NUM_THREADS=6 OMP_PLACES=cores OMP_PROC_BIND=close \
+  python pkgs/vibevoice-nucleos/bancada_nucleos.py decoder --pesos .../model.safetensors
+python scripts/fidelidad.py         # WER medio debe seguir ≤ ~3,6 %
+```
+
+Interruptores sin rebuild: `VIBEVOICE_SIN_NUCLEOS=1` (apagado de emergencia) y
+`VIBEVOICE_NUCLEOS_AMBITO=subidas|etapa0|todo` (el A/B contra fbgemm).
+
+**El techo honesto.** Todo-int8 son ~343 MB de pesos por fotograma; a los 13–17 GB/s efectivos de la VM el
+suelo del decoder es **~20–27 ms/fotograma**. Lo que este cambio puede comprar es acercarse a ese suelo —
+del orden de RTF 0,75 → ~0,6 — no otro 2×: a partir de ahí la palanca vuelve a ser el segundo módulo de RAM.
+
+</details>
+
 ---
 
 ## Lo que NO funcionó

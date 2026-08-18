@@ -126,4 +126,26 @@ in
     mkdir -p "$out"
     cp ${../pkgs/vibevoice-ov}/*.py "$out/"
   '';
+
+  # Nucleos nativos int8 (AVX2) para el decoder acustico del camino torch.
+  # Un solo .cpp sin dependencias que compila en segundos: cabe de sobra en
+  # el contenedor de construccion de 2,5 GB que a OpenVINO se le queda corto.
+  # Va fuera del lock de uv2nix a proposito, como los IR: no es un paquete de
+  # Python, es un .so que voz_stream.py carga por ctypes si esta y si la CPU
+  # puede con el (la comprobacion de AVX2 la hace nucleos_torch.py al cargar).
+  vibevoiceNucleos = final.stdenv.mkDerivation {
+    name = "vibevoice-nucleos";
+    src = ../pkgs/vibevoice-nucleos;
+    buildPhase = ''
+      runHook preBuild
+      $CXX -O3 -mavx2 -mfma -fopenmp -shared -fPIC -Wall \
+        nucleos.cpp -o libnucleos_vibevoice.so
+      runHook postBuild
+    '';
+    installPhase = ''
+      runHook preInstall
+      install -Dm644 libnucleos_vibevoice.so "$out/lib/libnucleos_vibevoice.so"
+      runHook postInstall
+    '';
+  };
 }

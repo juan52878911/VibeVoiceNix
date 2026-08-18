@@ -88,6 +88,9 @@
         # de torch+cpu que fija el lock son linux-x86_64.
         // nixpkgs.lib.optionalAttrs (system == sistemaDestino) {
           vibevoice-env = pkgsCon.vibevoice-env;
+          # Los nucleos int8 del decoder, sueltos: para probarlos a mano
+          #   nix build .#vibevoice-nucleos
+          vibevoice-nucleos = pkgsCon.vibevoiceNucleos;
           default = pkgsCon.voz-api;
         });
 

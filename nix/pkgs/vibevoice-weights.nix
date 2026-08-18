@@ -159,6 +159,10 @@ rec {
     # El estirado temporal (velocidad sin cambiar el tono). Va al lado porque
     # voz_stream.py lo importa por ruta, igual que prueba.html.
     cp ${../../pkgs/vibevoice-cli/estirar.py} "$out/bin/estirar.py"
+    # Envoltorio de los nucleos nativos int8 del decoder (el .so viene aparte,
+    # de pkgs.vibevoiceNucleos, via VIBEVOICE_NUCLEOS_SO). Mismo patron que
+    # estirar.py: al lado y importado por ruta.
+    cp ${../../pkgs/vibevoice-nucleos/nucleos_torch.py} "$out/bin/nucleos_torch.py"
     chmod +x "$out/bin/vibevoice-cli.py" "$out/bin/voz-stream.py"
   '';
 }
