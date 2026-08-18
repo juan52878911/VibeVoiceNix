@@ -313,6 +313,21 @@ tiene**: cuál de los tres ámbitos gana en la VM se decide midiendo allí, no a
 con pesos aleatorios (el peor caso para una cuantización) queda en 0,9986, el mismo orden que el fbgemm ya
 aceptado en producción (0,9992); con los pesos reales la vara es `scripts/fidelidad.py` (WER ≤ ~3,6 %).
 
+**Un regalo inesperado del streaming.** Pasando audio real por la subida grande (`prueba_audio.py`, que no
+necesita el checkpoint) aparece algo que no estaba previsto: las activaciones se cuantizan **por llamada**, y
+como el decoder se llama una vez por fotograma, la escala se readapta 7,5 veces por segundo. En un tramo a
+−46 dB eso decide entre oírlo o no:
+
+| Cuantización de activaciones | SNR global | SNR en el tramo a −46 dB |
+|---|---|---|
+| **por fotogramas (133 ms) ← producción** | **42,1 dB** | **43,4 dB** |
+| una sola escala para 4 s | 38,3 dB | **−0,0 dB** ← el silencio se hunde |
+
+O sea que trocear en streaming no solo bajó el primer sonido de 23,21 s a 0,20 s: **también protege a la
+cuantización**, porque ningún pasaje callado comparte escala con un transitorio fuerte lejano. Conviene
+recordarlo si alguna vez se plantea agrupar fotogramas para amortizar llamadas: se ganaría despacho y se
+perdería rango dinámico en los silencios.
+
 **El estándar de fidelidad, sin rodeos:** el audio **deja de ser bit a bit idéntico** al de antes — int8 en
 las subidas mueve los últimos decimales. Los md5 *entre endpoints* sobreviven (comparan el mismo proceso
 consigo mismo), pero cualquier comparación contra audio pregrabado se rompe. El criterio pasa a ser el del
