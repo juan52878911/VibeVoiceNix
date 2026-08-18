@@ -152,18 +152,18 @@ def interpolador():
     return h.astype(np.float32)
 
 
-def capa_subida(semilla=11):
-    """ConvTranspose1d(512->32, k16, s8) que remuestrea de verdad."""
+def capa_subida(semilla=11, canales_ent=CANALES_ENT, canales_sal=CANALES_SAL):
+    """ConvTranspose1d(k16, s8) que remuestrea de verdad."""
     generador = torch.Generator().manual_seed(semilla)
-    conv = nn.ConvTranspose1d(CANALES_ENT, CANALES_SAL, K, stride=RATIO)
+    conv = nn.ConvTranspose1d(canales_ent, canales_sal, K, stride=RATIO)
     h = torch.from_numpy(interpolador())
     # ganancias positivas y diversas que suman 1 por canal de salida: la
     # salida sigue siendo el remuestreo exacto, pero cada fila de pesos tiene
     # su propia escala, como en una capa aprendida
-    g = torch.rand(CANALES_ENT, CANALES_SAL, generator=generador) + 0.05
+    g = torch.rand(canales_ent, canales_sal, generator=generador) + 0.05
     g = g / g.sum(dim=0, keepdim=True)
     conv.weight.data = g[:, :, None] * h[None, None, :]
-    conv.bias.data = torch.zeros(CANALES_SAL)
+    conv.bias.data = torch.zeros(canales_sal)
     return conv.eval()
 
 
