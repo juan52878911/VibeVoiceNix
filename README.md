@@ -357,7 +357,7 @@ Tres servicios, tres puertos:
 
 | Servicio | Puerto | Qué expone |
 |---|---|---|
-| `voz-api` | **8080** | `/tts`, `/stt`, `/voces`, `/health` y la consola en `/` |
+| `voz-api` | **8080** | `/tts`, `/stt`, `/voces`, `/health`, `/v1/audio/speech` y la consola en `/` |
 | `homelab-whisper` | 8081 | solo loopback — no se abre nunca |
 | `voz-stream` | **8082** | TTS expresivo en streaming |
 
@@ -402,6 +402,34 @@ la generación normal: no es una versión degradada.
 
 > Bruno **no** es buen cliente para esto: espera a tener la respuesta completa. Usa `curl -sN`, la consola
 > del navegador, o la colección de [`bruno/`](bruno/) para el resto de rutas.
+
+### Como si fuera OpenAI
+
+La misma síntesis en el dialecto que ya habla todo el mundo, para enchufar clientes que no saben nada de
+este stack:
+
+```python
+from openai import OpenAI
+
+cli = OpenAI(base_url="http://voz:8080/v1", api_key=TOKEN)
+r = cli.audio.speech.create(model="tts-1", voice="nova", input="El backup terminó sin errores.")
+open("nota.mp3", "wb").write(r.content)
+```
+
+`tts-1`, `tts-1-hd` y `gpt-4o-mini-tts` van a **Piper**; `vibevoice` va al 8082 y solo aparece en
+`GET /v1/models` si ese servicio responde. Los seis formatos de OpenAI (`mp3`, `opus`, `aac`, `flac`,
+`wav`, `pcm`) están cubiertos, y las voces canónicas (`nova`, `alloy`…) caen a la de defecto avisando en
+`X-Voz-Sustituida` en vez de dar error — un cliente que las trae fijas no puede pedir otra cosa.
+
+Lo que **no** cabe en ese contrato es el modo sesión: en la API de OpenAI una petición es un texto entero
+y una respuesta un audio entero. La locución continua se queda en su endpoint nativo, que es justo lo que
+la hace valer.
+
+Comprobarlo de un tirón:
+
+```bash
+python scripts/openai_compat.py --base http://voz:8080 --token "$TOKEN"
+```
 
 ### Desde Python
 
@@ -658,8 +686,8 @@ conviene desactivarlo.
 
 ### Bruno
 
-La colección en [`bruno/`](bruno/) cubre estado, TTS, STT y streaming, con entornos para LAN, túnel y
-local. El token va como variable secreta, fuera del repo.
+La colección en [`bruno/`](bruno/) cubre estado, TTS, STT, streaming y la fachada de OpenAI, con entornos
+para LAN, túnel y local. El token va como variable secreta, fuera del repo.
 
 </details>
 

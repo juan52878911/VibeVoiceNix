@@ -6,15 +6,17 @@ Resumen para quien tenga prisa:
   sin documentar y aquí queda descrito y verificado. Un prefijo fabricado a
   mano reproduce el oficial con coseno ≥ 0,9993 en las cuatro ramas, y
   sintetiza con la misma calidad (medida abajo).
-- **Convertir un audio nuevo en esos latentes: NO RESUELTO.** El 0.5B no trae
-  codificador acústico y el del 1.5B **no vale tal cual**: vive en otra base
-  del mismo espacio de 64 dimensiones. Un adaptador lineal recupera parte
-  (R² ≈ 0,59) y produce habla inteligible con timbre aproximado, pero pierde
-  la identidad en voces alejadas de la media y desestabiliza la entonación.
+- **Convertir un audio nuevo en esos latentes: RESUELTO** (2026-08-24), con un
+  codificador de terceros auditado aquí. Ver [§7](#7-el-codificador-que-faltaba).
+  Clonando las seis voces españolas desde 15,5 s de referencia, la huella ECAPA
+  del clon contra su propia voz da **0,850 de media** (mínimo 0,803) frente a
+  **0,176** contra otra voz — sin solape, y con WER 0,000.
+- Lo que **no** funciona sigue documentado abajo: el codificador del 1.5B no
+  vale tal cual (§4) y el adaptador lineal tiene su techo en R² ≈ 0,59 (§4.3).
 
-Es decir: la mitad difícil del problema (el formato del prefijo) está hecha;
-lo que falta es un codificador para el 0.5B, y la vía para conseguirlo queda
-descrita al final con la evidencia de por qué debería funcionar.
+Es decir: las dos mitades del problema están hechas. El formato del prefijo se
+documentó aquí, y el codificador que Microsoft no publicó existe fuera y
+funciona — pero **solo con la receta de prefijo de §3**, no con la que trae.
 
 ---
 
@@ -315,11 +317,12 @@ entonación en todos los casos.
 - **Recuperar los latentes de cualquier `.pt` oficial** y su transcripción
   exacta, con los residuos de la sección 3.
 
-### No se puede hoy
+### Ya se puede (desde 2026-08-24)
 
-- Clonar una voz a partir de un audio arbitrario con fidelidad aceptable.
+- **Clonar una voz desde un audio arbitrario**, con `scripts/clonar_voz.py`.
+  Ver [§7](#7-el-codificador-que-faltaba) para las cifras y las trampas.
 
-### La vía que sí debería funcionar
+### La vía que se planteó antes de que apareciera el codificador
 
 El obstáculo es exclusivamente el codificador. Y hay una propiedad que lo hace
 tratable: **el decoder del 0.5B es diferenciable y está disponible**, así que
@@ -344,6 +347,233 @@ descubrir sobre el formato. Antes de meterse ahí conviene medir cuánto cuesta
 la optimización directa de `z` por audio, porque si sale barata (segundos por
 segundo de audio) **puede ser ella misma el codificador**, sin entrenar nada:
 se paga una vez por voz, al crear el prefijo, y no en cada síntesis.
+
+---
+
+## 7. El codificador que faltaba
+
+Un tercero publicó el checkpoint oficial **más un codificador acústico**:
+[`mohammed-bahumaish/vibevoice-realtime-0.5b-with-encoder`](https://huggingface.co/mohammed-bahumaish/vibevoice-realtime-0.5b-with-encoder)
+(MIT). Aquí está auditado con `scripts/auditar_encoder.py`, y sirve.
+
+### 7.1 No es el codificador del 1.5B con otro nombre
+
+Los 276 tensores del codificador, comparados uno a uno contra los del 1.5B:
+
+| | |
+|---|---:|
+| parámetros | 343,7 M |
+| idénticos byte a byte | **0 / 276** |
+| diferencia relativa (mediana) | 0,285 |
+| diferencia relativa (ponderada por parámetros) | **0,472** |
+| parámetros que se movieron menos del 30 % | **0,4 %** |
+
+Es un reentrenamiento partiendo del 1.5B —justo lo que §6 proponía como vía 2—,
+no una copia. Va en **F32** mientras el resto del checkpoint es BF16, y ocupa
+los primeros 1311 MB del safetensors sin ningún otro tensor intercalado: se baja
+entero con **una sola petición `Range`**, sin traer los 3,18 GB.
+
+### 7.2 Vive en el espacio latente del 0.5B
+
+Ciclo `audio → z → audio` con el decoder del 0.5B, sobre las seis voces de
+`ejemplos-voces/`. El brazo positivo reproduce el 0,9799 de §4.2, que es lo que
+da derecho a creerse los otros dos:
+
+| brazo | corr. de espectro | identidad ECAPA | corr. de onda |
+|---|---:|---:|---:|
+| **comunitario → dec(0.5B)** | **0,961–0,971** | **0,9696** | −0,94 * |
+| positivo `enc(1.5B) → dec(1.5B)` | 0,955–0,965 | 0,9788 | 0,9821 |
+| negativo `enc(1.5B) → dec(0.5B)` | 0,089–0,187 | −0,0060 | 0,0026 |
+
+\* **Trampa de medición.** La salida del comunitario viene con la **polaridad
+invertida**, que es inaudible, así que a desfase cero la correlación de onda sale
+en −0,94 y parece un fracaso. RMS y tono coinciden al 1–3 %. Hay que medir en
+espectro logarítmico, o negando la señal.
+
+### 7.3 Clonado de extremo a extremo: las seis voces
+
+Con la voz oficial se genera una referencia desde un texto **conocido**, se
+fabrica un prefijo de ese par y se dice la misma frase con los dos. El lazo se
+cierra sobre sí mismo, así que no hace falta transcribir nada y la
+transcripción es exacta por construcción.
+
+| voz | tono oficial → clon | recorrido | ECAPA |
+|---|---|---|---:|
+| sp-Spk0_woman | 244,9 → 235,3 Hz | 11,8 → 10,0 st | **0,8415** |
+| sp-Spk1_man | 111,1 → 128,3 Hz | 14,1 → 14,6 st | **0,8027** |
+| sp-Spk2_woman | 184,6 → 175,2 Hz | 8,7 → 9,3 st | **0,8591** |
+| sp-Spk3_man | 100,0 → 118,2 Hz | 11,5 → 11,2 st | **0,8413** |
+| sp-Spk4_woman | 184,6 → 186,0 Hz | 11,5 → 13,3 st | **0,8774** |
+| sp-Spk5_man | 134,8 → 142,0 Hz | 11,0 → 9,7 st | **0,8792** |
+
+Contra los umbrales de `scripts/oido.py`, medidos sobre estas mismas voces
+(mismo locutor ≥ 0,626, distinto ≤ 0,446):
+
+    clon contra SU voz oficial     media 0,850   mínimo 0,803
+    clon contra OTRA voz           media 0,176   máximo 0,404
+
+No hay solape. WER 0,000 en la frase de prueba.
+
+**Lo que no es perfecto:** las tres voces masculinas suben de tono (+2,5 a +2,9
+semitonos en las dos más graves) y las femeninas se mueven mucho menos. El
+volumen del clon sale entre 1,05× y 1,55× el del original, sin recorte.
+
+### 7.4 Los dos marcadores que cuestan la identidad
+
+El `make_voice_prompt.py` que acompaña al codificador construye la rama
+`tts_lm` con un `<|vision_start|>` delante y un `<|vision_end|>` detrás del
+bloque de latentes: **N+2+M** posiciones. La receta de §3 de este documento,
+recuperada invirtiendo la caché KV de las voces oficiales, es **N+M sin
+marcadores**.
+
+Medido sobre el mismo audio, la misma frase y la misma semilla:
+
+| receta | WER | tono | recorrido | **ECAPA** |
+|---|---:|---:|---:|---:|
+| §3 de este doc (N+M) | 0,000 | 240,0 Hz | 10,0 st | **0,8638** |
+| comunitaria (N+2+M) | 0,000 | 233,0 Hz | 8,0 st | **0,4098** |
+| *oráculo, la voz oficial* | *0,000* | *244,9 Hz* | *11,8 st* | *1,0000* |
+
+**Dos posiciones de más y deja de ser la misma persona**, sin que el WER ni el
+tono lo delaten. Es exactamente el tipo de fallo que no se ve sin una métrica de
+identidad: suena bien, se entiende, y es otro locutor.
+
+### 7.5 Con una grabación real de móvil
+
+Todo lo anterior usa audio generado por el propio modelo, que es el caso
+favorable. La prueba de verdad es una nota de voz de WhatsApp: **9,9 s de opus a
+17 kbps**, de los que solo **6,8 s son voz** (31,7 % de silencio), con el pico
+en 1,000 —o sea **recortada**— y el 99,9 % de la energía por debajo de 5,9 kHz.
+Hablante masculino grave, 98,6 Hz.
+
+Aquí no hay oráculo, así que la calibración sale de la propia grabación:
+partirla por la mitad y medir una mitad contra la otra da el techo realista en
+esas condiciones.
+
+| | ECAPA |
+|---|---:|
+| **calibración**: sus dos mitades entre sí (mismo locutor, mismas condiciones) | 0,7170 |
+| **control**: su voz contra las seis voces oficiales (distinto locutor) | máx. 0,4138 |
+| clon, frase de 5,5 s | 0,6464 |
+| clon, frase de 6,5 s | 0,7399 |
+| clon, frase de 10,0 s | **0,8718** |
+| **clon, media** | **0,7527** |
+
+La media del clon **supera la auto-similitud de la grabación consigo misma**.
+El tono del clon va de 97,2 a 111,1 Hz frente a los 98,6 Hz del original, y el
+recorrido (15,7–18,8 st frente a 16,5) queda en el mismo orden.
+
+Dos matices honestos: la cifra mejora con la duración de la frase generada, y
+buena parte de eso es que **ECAPA es más ruidoso con 5 s que con 10**; y el
+sesgo de subir el tono en voces graves vuelve a aparecer en las frases cortas.
+
+Conclusión: funciona con audio de móvil comprimido, recortado y con menos de la
+mitad del material recomendado.
+
+### 7.6 Usarlo
+
+```bash
+python scripts/clonar_voz.py \
+    --audio mi_voz.wav \
+    --transcripcion "la transcripcion literal de ese audio" \
+    --salida ~/.cache/vibevoice-nix/voces/mi_voz.pt
+
+VIBEVOICE_VOZ=mi_voz ./scripts/voz-stream-mac.sh
+```
+
+El `.pt` sale de 4,7 MB y se carga como cualquier voz oficial. **El motor de
+producción no necesita el codificador**: solo hace falta para fabricar el
+prefijo, una vez por voz.
+
+### 7.7 Lo que queda sin comprobar
+
+- Solo español, y un puñado de frases.
+- La curva de §7.8 está medida sobre voces oficiales sintéticas. Con grabaciones
+  reales de micrófono la forma debería ser la misma, pero no está comprobado.
+- Una sola voz real, y en condiciones malas a propósito. Falta una grabación
+  limpia de 24 kHz de verdad, que debería ir mejor.
+- Nadie ha comparado la `z` del codificador contra la `z` **verdadera**
+  recuperada en §3. Es la única verdad de terreno que queda sin usar, y diría
+  cuánto margen queda.
+
+### 7.8 Cuánto audio hace falta, medido
+
+`clonar_voz.py` admite varias muestras de la misma voz: `--audio` y
+`--transcripcion` se repiten emparejados. Cada clip se codifica **por separado**
+y se concatenan los latentes; pegar las ondas primero metería un salto artificial
+en cada empalme que el encoder convolucional se llevaría a los latentes de
+alrededor.
+
+La curva se midió sin pedirle más grabaciones a nadie, con una voz oficial de
+oráculo (`scripts/banco_duracion.py`): se generan cuatro clips de referencia
+desde textos conocidos, se fabrican prefijos con 1, 2, 3 y 4, y todo se compara
+contra la huella ECAPA de la referencia completa. El propio oráculo diciendo las
+frases de prueba da el techo.
+
+| | segundos | posiciones | ECAPA | ± |
+|---|---:|---:|---:|---:|
+| **sp-Spk4_woman** — techo | — | — | **0,8856** | 0,020 |
+| 1 clip | 11,7 | 137 | 0,8538 | 0,028 |
+| 2 clips | 23,1 | 276 | **0,8854** | 0,025 |
+| 3 clips | 35,2 | 424 | 0,8854 | 0,025 |
+| 4 clips | 48,1 | 588 | 0,8931 | 0,018 |
+| **sp-Spk3_man** — techo | — | — | **0,8814** | 0,006 |
+| 1 clip | 11,7 | 137 | 0,8339 | 0,015 |
+| 2 clips | 22,0 | 268 | 0,8484 | 0,009 |
+| 3 clips | 34,3 | 417 | 0,8509 | 0,014 |
+| 4 clips | 48,0 | 587 | 0,8530 | 0,027 |
+
+**Más audio sí mejora, y el salto está entre 12 y 23 segundos.** En la voz
+femenina ese tramo vale +0,032 y ya toca el techo; de ahí en adelante la curva es
+plana dentro del ruido. En la masculina el mismo tramo vale +0,015 y luego
++0,003 y +0,002: rendimientos decrecientes bruscos.
+
+**Y hay una asimetría que no se puede ignorar.** La voz femenina alcanza su techo
+con 23 s; la masculina no lo alcanza ni con 48, se queda 0,028 por debajo. Es la
+misma dirección del sesgo que ya aparecía en §7.3 y §7.5, donde las voces graves
+clonadas suben de tono y las agudas no. Con las voces graves hay algo que el
+prefijo no termina de capturar, y no se arregla con más material.
+
+Lo caro no es fabricar el prefijo, es usarlo: **el prefijo entero viaja en cada
+generación**. Pasar de 137 a 588 posiciones cuadruplica la caché KV que arrastra
+cada frase, para ganar 0,008 en la voz femenina y 0,005 en la masculina más allá
+de los 23 s. No compensa.
+
+> **La recomendación operativa: 25-30 s.** Con menos de 15 s se está en la parte
+> empinada de la curva; con más de 30 se paga caché sin ganar nada.
+
+#### El matiz que casi cuesta caro: homogéneos, no cualesquiera
+
+La curva de arriba se midió con clips generados por el mismo modelo en las mismas
+condiciones. Con material real dispar, **más audio empeora el clon**.
+
+Medido sobre una voz con tres notas de voz de WhatsApp de distinta sala,
+distancia y registro. Lo primero que llama la atención es que entre sí solo dan
+0,51–0,59 de ECAPA —zona gris—, cuando las dos mitades del clip largo dan 0,854 y
+contra otro hombre da 0,213: es la misma persona grabada de tres maneras
+distintas.
+
+| prefijo | segundos | ECAPA del clon |
+|---|---:|---:|
+| **solo el clip largo** | 31,4 | **0,6837** ±0,029 |
+| los tres juntos | 41,1 | 0,5915 ±0,084 |
+| solo los dos cortos | 9,6 | 0,4600 ±0,049 |
+
+Diez segundos **más** de material y el clon pierde 0,09. Y el techo explica por
+qué: los propios clips cortos, audio real de la persona, puntúan 0,681 y 0,605
+contra la referencia conjunta. Son tan distintos que ni él se parece a sí mismo
+ahí. El prefijo, al juntarlos, promedia condiciones de grabación en vez de
+acumular información de la voz.
+
+`clonar_voz.py` avisa cuando detecta clips que no suenan entre sí a la misma
+grabación, y recomienda quedarse con el mejor. **La regla completa es: 25-30 s de
+la misma sesión, mismo micro y misma distancia.** Si solo hay una toma buena y
+varias malas, la buena sola gana.
+
+
+> **Sobre clonar voces ajenas.** Esto convierte 15 segundos de audio en una voz
+> reutilizable. Es la capacidad por la que Microsoft no publicó el codificador.
+> Clonar a alguien sin su consentimiento no es un uso de este repositorio.
 
 ---
 

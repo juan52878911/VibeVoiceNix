@@ -51,3 +51,8 @@ graphify-out/
 
 # Perfiles de voz del asistente (huellas de locutor; datos locales)
 perfiles_voz.json
+
+# Metadatos AppleDouble que macOS deja al escribir en volumenes no-APFS.
+# Son basura: 42.000 de estos dentro de un venv rompen `import transformers`.
+._*
+.DS_Store
