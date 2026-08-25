@@ -143,6 +143,10 @@
     puerto = 8082;
     # Reusa el token de voz-api: una sola credencial para todo el stack.
     ficheroToken = "/var/lib/voz/token.env";
+    # Prefijos de voz propios, fuera del store por el mismo motivo que el
+    # token: un .pt ES la voz clonable de una persona y no va al repositorio.
+    # Se suben con scp y se suman a las 61 oficiales.
+    vocesPropias = "/var/lib/voz/voces-propias";
     # Abierto en la LAN ademas de en el tunel: la pagina de prueba en "/" se
     # usa tambien desde casa, y exigir el tunel estando en la misma red no
     # aporta seguridad -- voz-api (8080) ya esta abierto igual. Sigue pidiendo

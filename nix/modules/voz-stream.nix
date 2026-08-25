@@ -21,6 +21,9 @@ let
   vv = config.services.vibevoice;
   ov = config.services.vibevoice.openvino;
   pesos = pkgs.vibevoicePesos;
+
+  # RuntimeDirectory = "voz-stream" lo pone systemd en /run/voz-stream.
+  dirCombinado = "/run/voz-stream/voces";
 in
 {
   options.services.voz-stream = {
@@ -58,6 +61,33 @@ in
       description = ''
         Fichero con `VOZ_TOKEN=...`. Lo natural es reutilizar el mismo que
         voz-api para no manejar dos credenciales.
+      '';
+    };
+
+    vocesPropias = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/var/lib/voz/voces-propias";
+      description = ''
+        Directorio de la MAQUINA con prefijos `.pt` propios, que se suman a las
+        61 voces oficiales. Si un `.pt` propio se llama igual que una oficial,
+        gana el propio.
+
+        NO ES UNA RUTA DEL STORE, Y ES A PROPOSITO. Un prefijo de voz ES la voz
+        clonable de una persona: meterlo en el flake lo publicaria en el
+        repositorio, igual que pasaria con el token. Por eso esto sigue el
+        mismo patron que `ficheroToken` -- una ruta que se lee en arranque y
+        que se sube a la maquina aparte:
+
+            scp mi_voz.pt root@voz:/var/lib/voz/voces-propias/
+
+        Los prefijos se fabrican con `scripts/clonar_voz.py`, que NO cabe en
+        esta VM (ver docs/clonado-de-voz.md §7.9): se hacen en una estacion de
+        trabajo y aqui llega el `.pt`, que pesa entre 2,6 y 8,4 MB.
+
+        El servicio corre con DynamicUser, asi que el directorio y los ficheros
+        tienen que ser legibles por cualquiera. La regla de tmpfiles de abajo
+        crea el directorio con 0755 si no existe.
       '';
     };
 
@@ -155,6 +185,12 @@ in
       '';
     }];
 
+    # El directorio tiene que existir y ser legible por el DynamicUser del
+    # servicio. Se crea vacio si no esta; los .pt se suben aparte.
+    systemd.tmpfiles.rules = lib.mkIf (cfg.vocesPropias != null) [
+      "d ${cfg.vocesPropias} 0755 root root -"
+    ];
+
     systemd.services.voz-stream = {
       description = "TTS en streaming (VibeVoice)";
       wantedBy = [ "multi-user.target" ];
@@ -163,7 +199,10 @@ in
 
       environment = {
         VIBEVOICE_MODELO = "${pesos.modelo}";
-        VIBEVOICE_VOCES = "${pesos.voces}";
+        # Con voces propias se apunta al directorio COMBINADO que monta
+        # ExecStartPre; sin ellas, directo al del store y no se monta nada.
+        VIBEVOICE_VOCES =
+          if cfg.vocesPropias != null then dirCombinado else "${pesos.voces}";
         VIBEVOICE_PASOS = toString vv.pasosDifusion;
         VIBEVOICE_VOZ = vv.vozDefecto;
         VOZ_STREAM_HOST = cfg.direccion;
@@ -199,11 +238,36 @@ in
       };
 
       serviceConfig = {
+        # Enlaces, no copias: son 96 MB de voces oficiales que ya estan en el
+        # store, y el servicio solo las lee.
+        ExecStartPre = lib.mkIf (cfg.vocesPropias != null)
+          (pkgs.writeShellScript "voz-stream-combinar-voces" ''
+            set -eu
+            rm -rf ${dirCombinado}
+            mkdir -p ${dirCombinado}
+            for f in ${pesos.voces}/*.pt; do
+              ln -sf "$f" ${dirCombinado}/
+            done
+            propias=0
+            for f in ${cfg.vocesPropias}/*.pt; do
+              # el glob sin coincidencias se queda literal; -e lo descarta
+              [ -e "$f" ] || continue
+              ln -sf "$f" ${dirCombinado}/
+              propias=$((propias + 1))
+            done
+            echo "[voces] $propias propias sobre $(ls ${pesos.voces}/*.pt | wc -l) oficiales"
+          '');
+
         ExecStart = "${pkgs.vibevoice-env}/bin/python ${pesos.inferencia}/bin/voz-stream.py";
         EnvironmentFile = lib.mkIf (cfg.ficheroToken != null) cfg.ficheroToken;
 
         # El arranque carga el modelo y hace una sintesis de calentamiento:
         # son ~2 minutos antes de aceptar la primera peticion.
+        # Donde vive el directorio combinado. Se borra al parar el servicio,
+        # que es lo que queremos: se rehace en cada arranque y nunca queda un
+        # enlace apuntando a una voz que ya no esta.
+        RuntimeDirectory = lib.mkIf (cfg.vocesPropias != null) "voz-stream";
+
         TimeoutStartSec = "10min";
         Restart = "on-failure";
         RestartSec = 15;
