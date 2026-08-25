@@ -31,50 +31,56 @@ Asi el punto de partida es la identidad -- una red sin entrenar no estropea
 nada -- y toda su capacidad se dedica a lo que falta, que es poca cosa: una
 quinta parte de una banda de modulacion.
 
-RESULTADO DEL PRIMER INTENTO: NO FUNCIONA. NO USAR ESTE PESO.
-Entrenado con 90 min del corpus OpenSLR 72 (espanol colombiano, CC BY-SA 4.0),
-8,35 M de parametros, 40 epocas en un M4. La perdida de validacion bajo de
-0,9692 (sin filtro) a 0,9097, un 6,1 %. Y aun asi FRACASA en lo unico que
-importaba, medido sobre las cuatro voces reales, que el modelo nunca vio:
+QUE FUNCIONA, Y QUE HIZO FALTA PARA QUE FUNCIONARA
+Seis intentos. Los dos primeros fracasaron y de ahi salieron las dos piezas que
+hacen que el tercero en adelante funcione. Todo medido sobre las CUATRO VOCES
+REALES, que el modelo nunca vio: el corpus es de otros hablantes.
 
-    recuperacion del hueco que dejaba el codec
-      modulacion 16-32 Hz     +7 %
-      modulacion 32-64 Hz     -2 %
+  intento                       dist. al original   mejora    mel    8-12 kHz
+  1 solo multi-STFT                     0,255        +0,3 %  -130 %  +8,03 dB
+  2 + perdida de modulacion             0,165       +35,4 %   -95 %  +6,64 dB
+  3 + residuo acotado a 0,5             0,188       +26,7 %    -2 %  -1,80 dB
+  4 residuo + mod x3, 196 min           0,124       +51,6 %    -2 %  -1,48 dB
+  5 residuo + mod x1, 196 min           0,115       +54,9 %    -3 %  -1,50 dB
 
-    distancia LTAS contra el original
-      juan +2,0 %   isis +15,0 %   santiago -11,9 %   andres -9,5 %   media -1,1 %
-      distancia mel: -130 % (el filtrado se parece MENOS que el ciclo crudo)
+(la distancia del ciclo sin filtrar al original es 0,256)
 
-Lo que aprendio en su lugar, visto en el desglose por bandas:
+LA PERDIDA DE MODULACION, porque una multi-STFT no ve el grano: compara
+magnitudes por ventana y la microestructura vive en lo que ese promedio borra.
+El intento 1 bajo su perdida un 6 % sin tocar el problema -- recupero un +7 % y
+un -2 % de las bandas de 16-64 Hz -- porque encontro un atajo mas barato.
 
-      0-8 kHz   entre -4,9 y -6,8 dB
-      8-12 kHz          +11,8 dB
+EL LIMITE DEL RESIDUO, porque ese atajo era subir 11,8 dB por encima de 8 kHz,
+donde el original casi no tiene energia. Penalizarlo no bastaba; hay que
+hacerlo imposible. Con el recorte por celda tiempo-frecuencia el exceso pasa de
++8 dB a -1,5 dB y la distancia mel de -130 % a -3 %.
 
-No aprendio a devolver el grano: aprendio a meter BRILLO en una banda donde el
-original casi no tiene energia, porque eso baja la STFT logaritmica de forma
-barata. Es siseo, no textura. La planitud de sibilantes de una voz paso de
-0,17 a 0,27, o sea mas ruido de alta frecuencia.
+Y MAS DATOS: de 90 a 196 minutos de corpus, la mejora sube de +26,7 % a +54,9 %.
+La curva no estaba agotada; se paro por disco, no por rendimientos decrecientes.
 
-POR QUE FALLO, Y QUE HARIA FALTA
-La perdida multi-STFT es CIEGA a la fase y a la microestructura temporal:
-compara magnitudes por ventana y el grano vive justo en lo que ese promedio
-borra. Se le pidio a la red recuperar modulacion rapida con una metrica que no
-la mide, y la red hizo lo racional -- buscar el atajo mas barato, que era
-ecualizar. Ademas el residuo va sin restriccion: nada le impide anadir energia
-donde no deberia tocar.
+TRANSFIERE AL TTS DE VERDAD, que era el riesgo de abajo. Sobre audio generado,
+con la z viniendo de la difusion y no del encoder:
 
-Tres cambios, en orden, para un segundo intento:
-  1. meter la modulacion de 16-64 Hz EN LA PERDIDA. Si es el objetivo, tiene
-     que estar en el coste y no solo en la evaluacion. Es diferenciable y ya
-     esta escrita en espectro.py.
-  2. limitar el residuo por banda, para que no pueda comprar mejoras subiendo
-     12 dB donde no toca.
-  3. anadir perdida adversarial, que es lo que usan los post-filtros de vocoder
-     de verdad. Una STFT sola no produce textura convincente; el grano es
-     precisamente lo que un discriminador exige y una L1 espectral no.
+  voz        dist. TTS   + filtro    mejora    ECAPA     ECAPA + filtro
+  juan          0,127      0,211    -66,2 %   0,8796        0,8848
+  isis          0,332      0,222    +32,9 %   0,9127        0,9104
+  santiago      0,336      0,116    +65,4 %   0,9453        0,9390
+  andres        0,363      0,227    +37,5 %   0,9083        0,9127
+  MEDIA         0,289      0,194    +32,9 %   0,9115        0,9117
 
-El arnes (datos, entrenamiento, aplicacion, evaluacion) queda montado y es
-reutilizable: el siguiente intento cuesta horas, no dias.
+La identidad no se mueve y el WER se queda en 0,000 en las diez frases de
+prueba. Juan es la excepcion: su TTS ya salia cerca (0,127 frente a 0,33-0,36
+de los otros) y el filtro se pasa de frenada. Su referencia es la mas limitada
+en banda de las cuatro, y probablemente por eso.
+
+DONDE VIVE EL MODELO
+Pesa 33 MB, o sea que NO va al repositorio, igual que las voces. Vive en
+~/.cache/vibevoice-nix/postfiltro.pt y se usa con `decir.py --postfiltro`.
+Cuesta RTF 0,014 en CPU con 6 hilos: un 1,5 % del presupuesto del motor.
+
+OJO CON LA LICENCIA: entrenado con OpenSLR 72 (espanol colombiano), que es
+CC BY-SA 4.0. Para uso propio da igual; si algun dia se distribuyen los pesos,
+el share-alike viaja con ellos.
 
 EL RIESGO QUE HAY QUE VIGILAR
 Los pares se hacen con z del ENCODER, pero en produccion la z viene muestreada
@@ -139,8 +145,22 @@ class PostFiltro(nn.Module):
     de 16 Hz son 62 ms) sin irse a un modelo que no quepa en la CPU del homelab.
     """
 
-    def __init__(self, base=24, niveles=4, bloques=4):
+    def __init__(self, base=24, niveles=4, bloques=4, limite=0.0, n_fft=512, salto=64):
         super().__init__()
+        # LIMITE DEL RESIDUO POR BANDA
+        # El intento 2 recuperaba la modulacion pero seguia metiendo +10,6 dB
+        # por encima de 8 kHz: subir energia donde el original casi no tiene es
+        # la forma mas barata de bajar cualquier perdida espectral, y ni la
+        # perdida de modulacion lo impedia.
+        #
+        # Esto no lo penaliza: lo hace IMPOSIBLE. En cada celda de tiempo y
+        # frecuencia el residuo se recorta a `limite` veces la magnitud de la
+        # ENTRADA en esa misma celda. Donde la entrada no tiene energia, el
+        # residuo tampoco puede tenerla, por mucho que le convenga.
+        #
+        # Es una proyeccion, no un termino de coste, asi que la garantia se
+        # cumple tambien fuera de entrenamiento.
+        self.limite, self.n_fft, self.salto = limite, n_fft, salto
         self.entrada = nn.Conv1d(1, base, 7, padding=3)
         cs = [base * (2 ** i) for i in range(niveles + 1)]
         self.baja = nn.ModuleList(
@@ -156,6 +176,16 @@ class PostFiltro(nn.Module):
         nn.init.zeros_(self.salida.bias)
         self.act = nn.LeakyReLU(0.2)
 
+    def _recortar(self, r, x):
+        """Recorta el residuo a `limite` veces la entrada, celda a celda."""
+        v = torch.hann_window(self.n_fft, device=x.device)
+        n = x.shape[-1]
+        R = torch.stft(r.squeeze(1), self.n_fft, self.salto, window=v, return_complex=True)
+        X = torch.stft(x.squeeze(1), self.n_fft, self.salto, window=v, return_complex=True)
+        tope = self.limite * X.abs()
+        g = torch.clamp(tope / (R.abs() + 1e-8), max=1.0)
+        return torch.istft(R * g, self.n_fft, self.salto, window=v, length=n).unsqueeze(1)
+
     def forward(self, x):                        # (B, 1, T)
         h = self.act(self.entrada(x))
         saltos = []
@@ -169,7 +199,10 @@ class PostFiltro(nn.Module):
                 h = h[..., :s.shape[-1]] if h.shape[-1] > s.shape[-1] else \
                     nn.functional.pad(h, (0, s.shape[-1] - h.shape[-1]))
             h = self.act(j(torch.cat([h, s], 1)))
-        return x + self.salida(h)                # RESIDUO
+        r = self.salida(h)                       # RESIDUO
+        if self.limite > 0:
+            r = self._recortar(r, x)
+        return x + r
 
 
 # ---------------------------------------------------------------- perdida --
@@ -197,6 +230,62 @@ class PerdidaMultiSTFT(nn.Module):
         return total / len(self.RESOLUCIONES)
 
 
+class PerdidaModulacion(nn.Module):
+    """La banda que el codec se come, DENTRO de la funcion de coste.
+
+    El primer intento fallo porque se le pedia a la red recuperar modulacion de
+    16-64 Hz con una perdida que no la mide: la multi-STFT compara magnitudes
+    por ventana y el grano vive justo en lo que ese promedio borra. La red hizo
+    lo racional -- buscar el atajo mas barato para bajarla, que era ecualizar.
+
+    Aqui se mide lo mismo que `espectro.textura`, pero derivable:
+
+      1. STFT con salto de 64 -> envolvente a 375 Hz, que SI resuelve 16-64 Hz
+      2. energia por banda acustica -> tres envolventes
+      3. FFT de cada envolvente -> espectro de modulacion
+      4. energia en cada banda de modulacion, en log, y L1 contra el objetivo
+
+    Se comparan LOGARITMOS de energia y no energias crudas porque el hueco a
+    recuperar es una quinta parte de una cantidad ya pequena: en lineal esa
+    diferencia no mueve el gradiente frente a las bandas gordas.
+    """
+
+    VENTANA, SALTO = 512, 64
+    BANDAS_HZ = [(100, 800), (800, 2500), (2500, 8000)]
+    # el peso va donde esta el problema; las bajas entran con poco para que la
+    # red no destroce el ritmo silabico persiguiendo el grano
+    BANDAS_MOD = [(4, 8, 0.25), (8, 16, 0.5), (16, 32, 1.0), (32, 64, 1.0)]
+
+    def __init__(self, disp, hz=RITMO):
+        super().__init__()
+        self.hz = hz
+        self.ventana = torch.hann_window(self.VENTANA, device=disp)
+        f = torch.fft.rfftfreq(self.VENTANA, 1 / hz).to(disp)
+        self.mascaras = [((f >= lo) & (f < hi)).float() for lo, hi in self.BANDAS_HZ]
+        self.hz_env = hz / self.SALTO
+
+    def _energias(self, x):
+        S = torch.stft(x.squeeze(1), self.VENTANA, self.SALTO, window=self.ventana,
+                       return_complex=True).abs() ** 2          # (B, F, T)
+        fuera = []
+        for m in self.mascaras:
+            env = torch.sqrt((S * m[None, :, None]).sum(1) + 1e-12)   # (B, T)
+            env = env - env.mean(dim=1, keepdim=True)
+            M = torch.fft.rfft(env * torch.hann_window(env.shape[-1], device=env.device)).abs() ** 2
+            fm = torch.fft.rfftfreq(env.shape[-1], 1 / self.hz_env).to(env.device)
+            total = M[:, fm > 0.5].sum(1, keepdim=True) + 1e-12
+            fuera.append(torch.stack(
+                [(M[:, (fm >= lo) & (fm < hi)].sum(1) / total.squeeze(1))
+                 for lo, hi, _ in self.BANDAS_MOD], dim=1))          # (B, mod)
+        return torch.stack(fuera, dim=1)                             # (B, banda, mod)
+
+    def forward(self, y, obj):
+        a, b = self._energias(y), self._energias(obj)
+        w = torch.tensor([p for _, _, p in self.BANDAS_MOD], device=a.device)
+        d = (torch.log(a + 1e-8) - torch.log(b + 1e-8)).abs()
+        return (d * w[None, None, :]).sum() / (d.numel() * w.mean())
+
+
 # ------------------------------------------------------------------ datos --
 def subcomando_datos(args):
     """Corpus de habla real -> pares (ciclo del codec, original) en .npy."""
@@ -208,6 +297,11 @@ def subcomando_datos(args):
 
     fuentes = sorted(p for ext in ("*.wav", "*.flac", "*.mp3", "*.opus")
                      for p in Path(args.corpus).rglob(ext))
+    if args.mezclar:
+        # los ficheros vienen ordenados y eso pone todas las voces femeninas
+        # primero: con --max-min se entrenaria casi solo con ellas
+        import random
+        random.Random(7).shuffle(fuentes)
     if args.limite:
         fuentes = fuentes[:args.limite]
     if not fuentes:
@@ -287,11 +381,15 @@ def subcomando_entrenar(args):
     val, ent = idx[:corte], idx[corte:]
     print(f"{n} trozos: {len(ent)} de entrenamiento, {len(val)} de validacion")
 
-    red = PostFiltro(base=args.base).to(disp)
+    red = PostFiltro(base=args.base, limite=args.limite).to(disp)
     par = sum(p.numel() for p in red.parameters())
     print(f"post-filtro: {par/1e6:.2f} M parametros")
     opt = torch.optim.AdamW(red.parameters(), lr=args.lr, weight_decay=1e-4)
-    perdida = PerdidaMultiSTFT(disp)
+    perdida_stft = PerdidaMultiSTFT(disp)
+    perdida_mod = PerdidaModulacion(disp)
+
+    def perdida(y, obj):
+        return perdida_stft(y, obj) + args.peso_mod * perdida_mod(y, obj)
     pasos_total = args.epocas * math.ceil(len(ent) / args.lote)
     plan = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=pasos_total)
 
@@ -320,7 +418,8 @@ def subcomando_entrenar(args):
         marca = ""
         if vl < mejor:
             mejor = vl
-            torch.save({"estado": red.state_dict(), "base": args.base}, args.salida)
+            torch.save({"estado": red.state_dict(), "base": args.base,
+                        "limite": args.limite}, args.salida)
             marca = "  <- guardado"
         print(f"epoca {ep:3d}  entren {acum/max(1,nl):.4f}  valid {vl:.4f}  "
               f"(sin filtro {base_l:.4f})  {time.perf_counter()-t0:.0f} s{marca}", flush=True)
@@ -332,7 +431,7 @@ def subcomando_aplicar(args):
     from espectro import textura
     disp = "cpu" if args.cpu else ("mps" if torch.backends.mps.is_available() else "cpu")
     ck = torch.load(args.modelo, map_location=disp, weights_only=False)
-    red = PostFiltro(base=ck.get("base", 24)).to(disp)
+    red = PostFiltro(base=ck.get("base", 24), limite=ck.get("limite", 0.0)).to(disp)
     red.load_state_dict(ck["estado"]); red.eval()
 
     x, hz = leer_wav(args.entrada)
@@ -368,6 +467,8 @@ def main():
     d.add_argument("--corpus", required=True)
     d.add_argument("--salida", required=True)
     d.add_argument("--limite", type=int, default=0, help="solo N ficheros")
+    d.add_argument("--mezclar", action="store_true",
+                   help="baraja el orden con semilla fija; imprescindible con --max-min")
     d.add_argument("--max-min", type=float, default=0, help="parar a los N minutos de audio")
     d.add_argument("--ffmpeg", default=os.environ.get("VOZ_FFMPEG", "ffmpeg"))
     d.add_argument("--modelo", default=os.environ.get(
@@ -382,6 +483,11 @@ def main():
     e.add_argument("--lote", type=int, default=16)
     e.add_argument("--lr", type=float, default=3e-4)
     e.add_argument("--base", type=int, default=24, help="canales del primer nivel")
+    e.add_argument("--limite", type=float, default=0.0,
+                   help="tope del residuo como fraccion de la entrada, por celda "
+                        "tiempo-frecuencia. 0 = sin limite")
+    e.add_argument("--peso-mod", type=float, default=1.0,
+                   help="peso de la perdida de modulacion frente a la multi-STFT")
     e.set_defaults(f=subcomando_entrenar)
 
     a = sub.add_parser("aplicar", help="pasar un wav por el post-filtro")

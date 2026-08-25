@@ -34,6 +34,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 RITMO = 24000
 
 
@@ -52,6 +54,10 @@ def main():
     ap.add_argument("--texto", action="append", default=[],
                     help="frase a decir; se puede repetir para generar varias")
     ap.add_argument("--salida", default="salida", help="prefijo de los WAV de salida")
+    ap.add_argument("--postfiltro", nargs="?", const=str(
+                        Path.home() / ".cache/vibevoice-nix/postfiltro.pt"), default=None,
+                    help="pasa la salida por el post-filtro del codec. Sin valor usa "
+                         "~/.cache/vibevoice-nix/postfiltro.pt. Ver scripts/postfiltro.py")
     ap.add_argument("--verificar", action="store_true",
                     help="transcribe lo generado y avisa si no dice lo que pediste")
     ap.add_argument("--cfg", type=float, default=3.0)
@@ -103,6 +109,14 @@ def main():
     prefijo = torch.load(dir_voces / f"{args.voz}.pt", weights_only=False, map_location=disp)
     escritos = []
 
+    filtro = None
+    if args.postfiltro:
+        from postfiltro import PostFiltro
+        ck = torch.load(args.postfiltro, map_location="cpu", weights_only=False)
+        filtro = PostFiltro(base=ck.get("base", 24), limite=ck.get("limite", 0.0))
+        filtro.load_state_dict(ck["estado"]); filtro.eval()
+        print(f"post-filtro cargado de {args.postfiltro}")
+
     for i, texto in enumerate(args.texto, 1):
         if not texto.endswith("\n"):
             texto += "\n"
@@ -120,6 +134,11 @@ def main():
                 verbose=False, return_speech=True,
                 all_prefilled_outputs=copy.deepcopy(prefijo))
         x = salida.speech_outputs[0].detach().float().cpu().numpy().reshape(-1)
+        if filtro is not None:
+            # en CPU a proposito: cuesta RTF 0,014 y evita mover el modelo del
+            # dispositivo de generacion
+            with torch.no_grad():
+                x = filtro(torch.from_numpy(x)[None, None]).squeeze().numpy()
         proc_s = time.perf_counter() - ini
         # SIEMPRE con sufijo, aunque solo haya un texto. Antes con un solo
         # --texto salia "salida.wav" y con varios "salida-1.wav": si reutilizabas
