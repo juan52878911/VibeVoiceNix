@@ -1,0 +1,399 @@
+#!/usr/bin/env python
+"""Post-filtro que deshace lo que el codec acustico le quita a la voz.
+
+    python scripts/postfiltro.py datos    --corpus ~/corpus --salida ~/pares
+    python scripts/postfiltro.py entrenar --pares ~/pares --salida postfiltro.pt
+    python scripts/postfiltro.py aplicar  --modelo postfiltro.pt entrada.wav salida.wav
+
+QUE ARREGLA, Y POR QUE ESTO Y NO OTRA COSA
+Medido con `espectro.py --textura` sobre el triplete original / ciclo del codec /
+clon entero, en cuatro voces reales:
+
+    el codec NO toca los ataques (-1,5 %) ni el ritmo silabico (-1,7 %)
+    el codec SI pierde ~22 % de la modulacion rapida de 16-64 Hz
+    la generacion apenas resta nada mas alla de la loteria de la semilla
+
+O sea: el defecto vive ENTERO en el ciclo encoder->decoder, que no pasa por el
+modelo de lenguaje. Confirmado tambien de oido: el ciclo ya suena robotico.
+
+Eso hace que la reparacion sea un problema mucho mas facil que "mejorar el TTS":
+
+  * los pares de entrenamiento son GRATIS e ILIMITADOS -- cualquier grabacion
+    de habla real pasada por el ciclo da un par (degradado, limpio) sin
+    etiquetar nada
+  * el post-filtro va a la SALIDA, no toca el modelo, y no hay que reentrenar
+    un TTS para el que ni siquiera existe un trainer que funcione
+  * se puede entrenar en un portatil, no hace falta alquilar una GPU
+
+POR QUE APRENDE EL RESIDUO
+La red suma una correccion a la entrada en vez de generar el audio desde cero.
+Asi el punto de partida es la identidad -- una red sin entrenar no estropea
+nada -- y toda su capacidad se dedica a lo que falta, que es poca cosa: una
+quinta parte de una banda de modulacion.
+
+RESULTADO DEL PRIMER INTENTO: NO FUNCIONA. NO USAR ESTE PESO.
+Entrenado con 90 min del corpus OpenSLR 72 (espanol colombiano, CC BY-SA 4.0),
+8,35 M de parametros, 40 epocas en un M4. La perdida de validacion bajo de
+0,9692 (sin filtro) a 0,9097, un 6,1 %. Y aun asi FRACASA en lo unico que
+importaba, medido sobre las cuatro voces reales, que el modelo nunca vio:
+
+    recuperacion del hueco que dejaba el codec
+      modulacion 16-32 Hz     +7 %
+      modulacion 32-64 Hz     -2 %
+
+    distancia LTAS contra el original
+      juan +2,0 %   isis +15,0 %   santiago -11,9 %   andres -9,5 %   media -1,1 %
+      distancia mel: -130 % (el filtrado se parece MENOS que el ciclo crudo)
+
+Lo que aprendio en su lugar, visto en el desglose por bandas:
+
+      0-8 kHz   entre -4,9 y -6,8 dB
+      8-12 kHz          +11,8 dB
+
+No aprendio a devolver el grano: aprendio a meter BRILLO en una banda donde el
+original casi no tiene energia, porque eso baja la STFT logaritmica de forma
+barata. Es siseo, no textura. La planitud de sibilantes de una voz paso de
+0,17 a 0,27, o sea mas ruido de alta frecuencia.
+
+POR QUE FALLO, Y QUE HARIA FALTA
+La perdida multi-STFT es CIEGA a la fase y a la microestructura temporal:
+compara magnitudes por ventana y el grano vive justo en lo que ese promedio
+borra. Se le pidio a la red recuperar modulacion rapida con una metrica que no
+la mide, y la red hizo lo racional -- buscar el atajo mas barato, que era
+ecualizar. Ademas el residuo va sin restriccion: nada le impide anadir energia
+donde no deberia tocar.
+
+Tres cambios, en orden, para un segundo intento:
+  1. meter la modulacion de 16-64 Hz EN LA PERDIDA. Si es el objetivo, tiene
+     que estar en el coste y no solo en la evaluacion. Es diferenciable y ya
+     esta escrita en espectro.py.
+  2. limitar el residuo por banda, para que no pueda comprar mejoras subiendo
+     12 dB donde no toca.
+  3. anadir perdida adversarial, que es lo que usan los post-filtros de vocoder
+     de verdad. Una STFT sola no produce textura convincente; el grano es
+     precisamente lo que un discriminador exige y una L1 espectral no.
+
+El arnes (datos, entrenamiento, aplicacion, evaluacion) queda montado y es
+reutilizable: el siguiente intento cuesta horas, no dias.
+
+EL RIESGO QUE HAY QUE VIGILAR
+Los pares se hacen con z del ENCODER, pero en produccion la z viene muestreada
+por la cabeza de difusion. Son distribuciones parecidas pero no iguales, asi que
+un post-filtro que funcione de maravilla sobre el ciclo puede no transferir a
+la salida del TTS. Por eso `aplicar` mide siempre antes y despues con
+`espectro.textura`, y hay que comprobarlo sobre audio GENERADO, no solo sobre
+ciclos.
+"""
+import argparse
+import math
+import os
+import sys
+import time
+import wave
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+RITMO = 24000
+TROZO = 24000 * 2          # 2 s por muestra de entrenamiento
+
+
+# ---------------------------------------------------------------- audio --
+def leer_wav(ruta):
+    with wave.open(str(ruta)) as w:
+        x = np.frombuffer(w.readframes(w.getnframes()), "<i2").astype(np.float32) / 32768
+        return x, w.getframerate()
+
+
+def escribir_wav(ruta, x):
+    with wave.open(str(ruta), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RITMO)
+        w.writeframes((np.clip(x, -1, 1) * 32767).astype("<i2").tobytes())
+
+
+# ---------------------------------------------------------------- la red --
+class Bloque(nn.Module):
+    """Conv dilatada con puerta. La puerta deja que la red decida DONDE
+    corregir: en las zonas que el codec reconstruye bien, aprende a no tocar."""
+
+    def __init__(self, canales, dilatacion):
+        super().__init__()
+        self.conv = nn.Conv1d(canales, canales * 2, 5, padding=2 * dilatacion,
+                              dilation=dilatacion)
+        self.salida = nn.Conv1d(canales, canales, 1)
+
+    def forward(self, x):
+        a, b = self.conv(x).chunk(2, dim=1)
+        return x + self.salida(torch.tanh(a) * torch.sigmoid(b))
+
+
+class PostFiltro(nn.Module):
+    """U-Net 1D pequena sobre la forma de onda, con salida residual.
+
+    Cuatro niveles a stride 4 dan un campo receptivo de ~85 ms en el cuello,
+    suficiente para la modulacion de 16-64 Hz que hay que reconstruir (un ciclo
+    de 16 Hz son 62 ms) sin irse a un modelo que no quepa en la CPU del homelab.
+    """
+
+    def __init__(self, base=24, niveles=4, bloques=4):
+        super().__init__()
+        self.entrada = nn.Conv1d(1, base, 7, padding=3)
+        cs = [base * (2 ** i) for i in range(niveles + 1)]
+        self.baja = nn.ModuleList(
+            [nn.Conv1d(cs[i], cs[i + 1], 8, stride=4, padding=2) for i in range(niveles)])
+        self.cuello = nn.Sequential(
+            *[Bloque(cs[-1], 2 ** i) for i in range(bloques)])
+        self.sube = nn.ModuleList(
+            [nn.ConvTranspose1d(cs[i + 1], cs[i], 8, stride=4, padding=2) for i in range(niveles)][::-1])
+        self.junta = nn.ModuleList(
+            [nn.Conv1d(cs[i] * 2, cs[i], 3, padding=1) for i in range(niveles)][::-1])
+        self.salida = nn.Conv1d(base, 1, 7, padding=3)
+        nn.init.zeros_(self.salida.weight)      # arranca en la identidad
+        nn.init.zeros_(self.salida.bias)
+        self.act = nn.LeakyReLU(0.2)
+
+    def forward(self, x):                        # (B, 1, T)
+        h = self.act(self.entrada(x))
+        saltos = []
+        for c in self.baja:
+            saltos.append(h)
+            h = self.act(c(h))
+        h = self.cuello(h)
+        for c, j, s in zip(self.sube, self.junta, reversed(saltos)):
+            h = self.act(c(h))
+            if h.shape[-1] != s.shape[-1]:
+                h = h[..., :s.shape[-1]] if h.shape[-1] > s.shape[-1] else \
+                    nn.functional.pad(h, (0, s.shape[-1] - h.shape[-1]))
+            h = self.act(j(torch.cat([h, s], 1)))
+        return x + self.salida(h)                # RESIDUO
+
+
+# ---------------------------------------------------------------- perdida --
+class PerdidaMultiSTFT(nn.Module):
+    """STFT a tres resoluciones. La ventana corta (256 con salto 64) es la que
+    importa aqui: su envolvente va a 375 Hz y por tanto SI resuelve la banda de
+    16-64 Hz que el codec se come. Con una sola ventana larga esa banda queda
+    promediada y la perdida no la ve."""
+
+    RESOLUCIONES = [(256, 64), (512, 128), (1024, 256)]
+
+    def __init__(self, disp):
+        super().__init__()
+        self.ventanas = [torch.hann_window(n, device=disp) for n, _ in self.RESOLUCIONES]
+
+    def forward(self, y, obj):
+        total = 0.0
+        for (n, salto), v in zip(self.RESOLUCIONES, self.ventanas):
+            Y = torch.stft(y.squeeze(1), n, salto, window=v, return_complex=True).abs()
+            O = torch.stft(obj.squeeze(1), n, salto, window=v, return_complex=True).abs()
+            # magnitud relativa + log: la primera cuida los picos, la segunda
+            # los valles, que es donde vive el grano
+            total = total + (Y - O).norm() / (O.norm() + 1e-7)
+            total = total + nn.functional.l1_loss(torch.log(Y + 1e-5), torch.log(O + 1e-5))
+        return total / len(self.RESOLUCIONES)
+
+
+# ------------------------------------------------------------------ datos --
+def subcomando_datos(args):
+    """Corpus de habla real -> pares (ciclo del codec, original) en .npy."""
+    from banco_duracion import cargar_modelo
+    disp = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"cargando el tokenizador acustico en {disp}...", flush=True)
+    _, modelo = cargar_modelo(args.modelo, args.cache, disp, 10, con_encoder=True)
+    tok = modelo.model.acoustic_tokenizer
+
+    fuentes = sorted(p for ext in ("*.wav", "*.flac", "*.mp3", "*.opus")
+                     for p in Path(args.corpus).rglob(ext))
+    if args.limite:
+        fuentes = fuentes[:args.limite]
+    if not fuentes:
+        raise SystemExit(f"no hay audio en {args.corpus}")
+    salida = Path(args.salida); salida.mkdir(parents=True, exist_ok=True)
+    print(f"{len(fuentes)} ficheros")
+
+    sucio, limpio, segundos, t0 = [], [], 0.0, time.perf_counter()
+    for i, f in enumerate(fuentes, 1):
+        try:
+            x = cargar_a_24k(f, args.ffmpeg)
+        except Exception as e:
+            print(f"  [salto] {f.name}: {e}"); continue
+        if len(x) < TROZO // 2:
+            continue
+        # recorte de silencio por los extremos: entrenar sobre silencio no
+        # ensena nada y el corpus viene con margen generoso
+        x = recortar(x)
+        if len(x) < TROZO // 2:
+            continue
+        with torch.no_grad():
+            a = torch.from_numpy(x)[None, None].to(disp, torch.float32)
+            z = tok.encode(a).mean                    # la MEDIA, sin ruido:
+            y = tok.decode(z).squeeze().cpu().numpy() # el par tiene que ser limpio
+        n = min(len(x), len(y))
+        for k in range(0, n - TROZO + 1, TROZO):
+            sucio.append(y[k:k + TROZO]); limpio.append(x[k:k + TROZO])
+        segundos += n / RITMO
+        if i % 25 == 0 or i == len(fuentes):
+            vel = segundos / (time.perf_counter() - t0)
+            print(f"  {i}/{len(fuentes)}  {segundos/60:.1f} min de audio  "
+                  f"{len(sucio)} trozos  ({vel:.0f}x tiempo real)", flush=True)
+        if args.max_min and segundos / 60 >= args.max_min:
+            print("  alcanzado --max-min"); break
+
+    np.save(salida / "sucio.npy", np.stack(sucio).astype(np.float32))
+    np.save(salida / "limpio.npy", np.stack(limpio).astype(np.float32))
+    print(f"\n{len(sucio)} pares de {TROZO/RITMO:.0f} s "
+          f"({len(sucio)*TROZO/RITMO/60:.1f} min) en {salida}")
+
+
+def cargar_a_24k(ruta, ffmpeg="ffmpeg"):
+    import subprocess, tempfile
+    if ruta.suffix.lower() == ".wav":
+        x, hz = leer_wav(ruta)
+        if hz == RITMO:
+            return x
+    with tempfile.TemporaryDirectory() as t:
+        d = Path(t) / "a.wav"
+        r = subprocess.run([ffmpeg, "-v", "error", "-y", "-i", str(ruta),
+                            "-ar", str(RITMO), "-ac", "1", "-c:a", "pcm_s16le", str(d)],
+                           capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode()[:120])
+        return leer_wav(d)[0]
+
+
+def recortar(x, umbral=0.005, margen=int(0.05 * RITMO)):
+    k = (len(x) // 240) * 240
+    if not k:
+        return x
+    rms = np.sqrt((x[:k].reshape(-1, 240) ** 2).mean(1))
+    vivo = np.where(rms > umbral)[0]
+    if len(vivo) < 2:
+        return x
+    return x[max(0, vivo[0] * 240 - margen):min(len(x), (vivo[-1] + 1) * 240 + margen)]
+
+
+# -------------------------------------------------------------- entrenar --
+def subcomando_entrenar(args):
+    disp = "mps" if torch.backends.mps.is_available() else "cpu"
+    sucio = torch.from_numpy(np.load(Path(args.pares) / "sucio.npy"))
+    limpio = torch.from_numpy(np.load(Path(args.pares) / "limpio.npy"))
+    n = len(sucio)
+    corte = max(1, int(n * 0.05))
+    idx = torch.randperm(n, generator=torch.Generator().manual_seed(7))
+    val, ent = idx[:corte], idx[corte:]
+    print(f"{n} trozos: {len(ent)} de entrenamiento, {len(val)} de validacion")
+
+    red = PostFiltro(base=args.base).to(disp)
+    par = sum(p.numel() for p in red.parameters())
+    print(f"post-filtro: {par/1e6:.2f} M parametros")
+    opt = torch.optim.AdamW(red.parameters(), lr=args.lr, weight_decay=1e-4)
+    perdida = PerdidaMultiSTFT(disp)
+    pasos_total = args.epocas * math.ceil(len(ent) / args.lote)
+    plan = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=pasos_total)
+
+    mejor = float("inf")
+    for ep in range(1, args.epocas + 1):
+        red.train()
+        perm = ent[torch.randperm(len(ent))]
+        acum, nl, t0 = 0.0, 0, time.perf_counter()
+        for k in range(0, len(perm) - args.lote + 1, args.lote):
+            b = perm[k:k + args.lote]
+            x = sucio[b].unsqueeze(1).to(disp); y = limpio[b].unsqueeze(1).to(disp)
+            l = perdida(red(x), y)
+            opt.zero_grad(); l.backward()
+            torch.nn.utils.clip_grad_norm_(red.parameters(), 1.0)
+            opt.step(); plan.step()
+            acum += l.item(); nl += 1
+        red.eval(); vac, vn = 0.0, 0
+        with torch.no_grad():
+            for k in range(0, len(val), args.lote):
+                b = val[k:k + args.lote]
+                x = sucio[b].unsqueeze(1).to(disp); y = limpio[b].unsqueeze(1).to(disp)
+                vac += perdida(red(x), y).item(); vn += 1
+                if vn == 1:      # linea base: no tocar nada
+                    base_l = perdida(x, y).item()
+        vl = vac / max(1, vn)
+        marca = ""
+        if vl < mejor:
+            mejor = vl
+            torch.save({"estado": red.state_dict(), "base": args.base}, args.salida)
+            marca = "  <- guardado"
+        print(f"epoca {ep:3d}  entren {acum/max(1,nl):.4f}  valid {vl:.4f}  "
+              f"(sin filtro {base_l:.4f})  {time.perf_counter()-t0:.0f} s{marca}", flush=True)
+    print(f"\nmejor validacion {mejor:.4f} en {args.salida}")
+
+
+# --------------------------------------------------------------- aplicar --
+def subcomando_aplicar(args):
+    from espectro import textura
+    disp = "cpu" if args.cpu else ("mps" if torch.backends.mps.is_available() else "cpu")
+    ck = torch.load(args.modelo, map_location=disp, weights_only=False)
+    red = PostFiltro(base=ck.get("base", 24)).to(disp)
+    red.load_state_dict(ck["estado"]); red.eval()
+
+    x, hz = leer_wav(args.entrada)
+    if hz != RITMO:
+        raise SystemExit(f"el audio va a {hz} Hz y hace falta {RITMO}")
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        y = red(torch.from_numpy(x)[None, None].to(disp)).squeeze().cpu().numpy()
+    dt = time.perf_counter() - t0
+    escribir_wav(args.salida, y)
+    print(f"{args.salida}  {len(x)/RITMO:.2f} s  RTF del filtro {dt/(len(x)/RITMO):.4f}")
+
+    a, b = textura(x), textura(y)
+    print(f"\n{'metrica':22} {'antes':>9} {'despues':>9} {'cambio':>9}")
+    for k, nom in (("ataques_dB_s", "nitidez ataques"), ("planitud_sib", "planitud sibil."),
+                   ("mod_4_8", "modulacion 4-8 Hz"), ("mod_8_16", "modulacion 8-16 Hz"),
+                   ("mod_16_32", "modulacion 16-32 Hz"), ("mod_32_64", "modulacion 32-64 Hz")):
+        c = 100 * (b[k] - a[k]) / a[k] if a[k] else 0.0
+        print(f"{nom:22} {a[k]:9.4f} {b[k]:9.4f} {c:+8.1f}%")
+    if args.referencia:
+        r = textura(*leer_wav(args.referencia))
+        print(f"\n{'':22} {'objetivo':>9}   (la referencia real)")
+        for k, nom in (("mod_16_32", "modulacion 16-32 Hz"), ("mod_32_64", "modulacion 32-64 Hz")):
+            print(f"{nom:22} {r[k]:9.4f}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("datos", help="corpus -> pares (ciclo, original)")
+    d.add_argument("--corpus", required=True)
+    d.add_argument("--salida", required=True)
+    d.add_argument("--limite", type=int, default=0, help="solo N ficheros")
+    d.add_argument("--max-min", type=float, default=0, help="parar a los N minutos de audio")
+    d.add_argument("--ffmpeg", default=os.environ.get("VOZ_FFMPEG", "ffmpeg"))
+    d.add_argument("--modelo", default=os.environ.get(
+        "VIBEVOICE_MODELO", str(Path.home() / ".cache/vibevoice-nix/modelo")))
+    d.add_argument("--cache", default=str(Path.home() / ".cache/vibevoice-nix"))
+    d.set_defaults(f=subcomando_datos)
+
+    e = sub.add_parser("entrenar", help="pares -> post-filtro")
+    e.add_argument("--pares", required=True)
+    e.add_argument("--salida", default="postfiltro.pt")
+    e.add_argument("--epocas", type=int, default=40)
+    e.add_argument("--lote", type=int, default=16)
+    e.add_argument("--lr", type=float, default=3e-4)
+    e.add_argument("--base", type=int, default=24, help="canales del primer nivel")
+    e.set_defaults(f=subcomando_entrenar)
+
+    a = sub.add_parser("aplicar", help="pasar un wav por el post-filtro")
+    a.add_argument("entrada"); a.add_argument("salida")
+    a.add_argument("--modelo", default="postfiltro.pt")
+    a.add_argument("--referencia", help="wav real, para ver el objetivo")
+    a.add_argument("--cpu", action="store_true")
+    a.set_defaults(f=subcomando_aplicar)
+
+    args = ap.parse_args()
+    return args.f(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
