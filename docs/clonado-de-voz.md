@@ -571,6 +571,40 @@ la misma sesión, mismo micro y misma distancia.** Si solo hay una toma buena y
 varias malas, la buena sola gana.
 
 
+### 7.9 Dónde corre cada cosa, medido en la VM
+
+Fabricar un prefijo **no cabe en la VM**, y no es una estimación. Probado en `voz`
+(4.909 MB de RAM, 12 núcleos, con los tres servicios en marcha y 1.671 MB
+libres), cargando solo el modelo en fp32 dentro de un *scope* con tope de
+memoria para no arriesgar producción:
+
+```
+Memory cgroup out of memory: Killed process 8857 (python3.12)
+  total-vm:3222508kB, anon-rss:1627672kB
+run-p8857-i8858.scope: Failed with result 'oom-kill'
+```
+
+Murió al llegar a 1,63 GB, y eso es **solo el modelo**: el codificador de la
+comunidad son 1,3 GB más en F32. Con el pico de 4,1 GB que ya estaba medido para
+el fp32 completo, el total ronda los 5,4 GB — más de los 4,9 GB que tiene la
+máquina entera, así que tampoco cabría parando `voz-stream`.
+
+El reparto que sí funciona:
+
+| pieza | dónde | por qué |
+|---|---|---|
+| `clonar_voz.py` | estación de trabajo | necesita modelo + codificador, ~5,4 GB |
+| el `.pt` resultante | la VM, en `VIBEVOICE_VOCES` | 2,6–8,4 MB, se carga como cualquier voz oficial |
+| `voz-stream` | la VM | **no necesita el codificador**: solo hace falta para fabricar el prefijo |
+| `prosodia.py`, `espectro.py` | cualquiera de los dos | numpy puro; probados en la VM sobre audio que ella misma generó |
+| `banco_clonado.py`, `banco_duracion.py` | estación de trabajo | generan cientos de locuciones |
+
+Es la misma lógica que el resto del repositorio: lo caro se hace fuera y a la
+máquina llega el artefacto pequeño. Un prefijo es a una voz lo que un `.onnx` de
+Piper es a las suyas.
+
+---
+
 > **Sobre clonar voces ajenas.** Esto convierte 15 segundos de audio en una voz
 > reutilizable. Es la capacidad por la que Microsoft no publicó el codificador.
 > Clonar a alguien sin su consentimiento no es un uso de este repositorio.
