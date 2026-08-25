@@ -9,10 +9,14 @@ Cuatro cosas, y las cuatro con numeros:
   1. FIDELIDAD. El PCM que baja por el websocket tiene que ser IDENTICO -- md5,
      no "parecido" -- al de la sesion HTTP con las mismas frases, la misma voz
      y la misma semilla, y tambien al de /tts/stream con las frases unidas por
-     SALTO DE LINEA. Lo de los saltos de linea no es un detalle: la sesion
-     tokeniza cada frase como texto.strip() + "\\n", asi que unir con espacios
-     da OTRO texto y por tanto otro audio. Comparar contra la referencia
-     equivocada es el error clasico aqui.
+     ESPACIO. Se pide respiro=False a proposito: el respiro (el aire de cada
+     final de frase; bloque RESPIRO de voz_stream.py) no toca el texto pero si
+     el audio -- alarga la pausa y recorta el sobrante --, asi que con el
+     puesto el md5 ya no puede coincidir. Sin respiro, la sesion cose los
+     trozos con espacio y pone un unico "\\n" al final de la locucion (igual
+     que hace el procesador con una peticion suelta). Comparar contra la
+     referencia equivocada es el error clasico aqui. El respiro tiene su
+     propia prueba (punto 5).
 
      El websocket ademas se alimenta en el CASO DIFICIL: cada frase se manda
      solo cuando llega el evento esperando=true, es decir cuando el modelo ya
@@ -32,6 +36,18 @@ Cuatro cosas, y las cuatro con numeros:
   4. LIMPIEZA. Al cortar el websocket a mitad de la locucion, la sesion tiene
      que desaparecer: GET /tts/sesion/{id} da 404 y el candado del modelo queda
      libre para la peticion siguiente.
+
+  5. RESPIRO. Con respiro (el defecto de las sesiones) el audio tiene que
+     respetar el contrato de la pausa: ninguna racha de fotogramas de 133 ms
+     por debajo del umbral puede pasar de fotogramas+alarga+2 (los dos de
+     margen son los bordes, que quedan justo bajo el umbral de deteccion pero
+     encima del de recorte), y tiene que haber pausas de final de frase
+     (rachas >= 2). Ademas el HABLA tiene que seguir siendo la misma que sin
+     respiro: quitando de la version con respiro los fotogramas que son suelo
+     de sala, lo que queda tiene que coincidir muestra a muestra con lo mismo
+     hecho sobre la version sin respiro -- es lo que prueba que el aire se
+     INSERTA y no se sintetiza (bloque RESPIRO de voz_stream.py). Los
+     parametros exactos se leen de /health, no se suponen.
 
 El marco binario es el de scripts/asistente_web.py: [tipo:1][longitud:4 BE]
 [carga], tipo 0 = PCM y tipo 1 = evento JSON.
@@ -76,10 +92,12 @@ def http_stream(url, token, texto, voz, cfg, semilla, pasos):
     return pedir(f"{url}/tts/stream", token, cuerpo).read()[44:]
 
 
-def http_sesion(url, token, nombre, frases, voz, cfg, semilla, pasos):
+def http_sesion(url, token, nombre, frases, voz, cfg, semilla, pasos,
+                respiro=False):
     """Sesion HTTP: se meten todas las frases y se escucha el WAV continuo."""
     import threading
-    base = {"voz": voz, "cfg_scale": cfg, "semilla": semilla}
+    base = {"voz": voz, "cfg_scale": cfg, "semilla": semilla,
+            "respiro": respiro}
     if pasos is not None:
         base["pasos"] = pasos
     pcm = bytearray()
@@ -140,7 +158,7 @@ def desmarcar(buf, salida_pcm, eventos):
 
 async def ws_sesion(url, token, frases, voz, cfg, semilla, pasos,
                     por_cabecera=True, cortar_en=None, traza=None,
-                    antes_de_cortar=None):
+                    antes_de_cortar=None, respiro=False):
     """Habla por el websocket y devuelve (pcm, eventos, nombre).
 
     cortar_en: si viene, se cierra el socket a lo bruto en cuanto hayan bajado
@@ -163,7 +181,7 @@ async def ws_sesion(url, token, frases, voz, cfg, semilla, pasos,
     # velocidad: 1.0 explicita a proposito: es el unico valor que admite el
     # websocket y conviene que la prueba pase por esa comprobacion.
     abrir = {"accion": "abrir", "voz": voz, "cfg_scale": cfg,
-             "velocidad": 1.0, "semilla": semilla}
+             "velocidad": 1.0, "semilla": semilla, "respiro": respiro}
     if pasos is not None:
         abrir["pasos"] = pasos
 
@@ -228,6 +246,97 @@ def dur(b):
     return len(b) / 2 / RITMO
 
 
+FOT = 3200          # muestras de un fotograma acustico (133 ms a 24 kHz)
+
+
+def _fotogramas(pcm):
+    """El PCM s16le partido en fotogramas de 133 ms, como arrays de enteros."""
+    import array
+    m = array.array("h")
+    m.frombytes(pcm[:len(pcm) // 2 * 2])
+    if sys.byteorder == "big":
+        m.byteswap()
+    return [m[i:i + FOT] for i in range(0, len(m) - FOT + 1, FOT)]
+
+
+def _rms(f):
+    return (sum(v * v for v in f) / len(f)) ** 0.5 / 32768.0
+
+
+def rachas_calladas(pcm, umbral):
+    """Rachas de fotogramas seguidos por debajo del umbral."""
+    out, r = [], 0
+    for f in _fotogramas(pcm):
+        if _rms(f) < umbral:
+            r += 1
+        else:
+            if r:
+                out.append(r)
+            r = 0
+    if r:
+        out.append(r)
+    return out
+
+
+def aplicar_respiro(pcm, fot, alarga, tope, umbral, pico, prerrollo, pie):
+    """El respiro del servidor, reimplementado aqui (ColaAudioSesion.put).
+
+    Es DELIBERADAMENTE una segunda implementacion y no una importacion: lo que
+    se quiere comprobar es que el servidor hace lo que su documentacion dice,
+    y compartir el codigo no probaria nada.
+    """
+    import array
+    salida = array.array("h")
+    umbral_pico = int(pico * 32768)
+    seguidos = 0
+    sonado = False
+    suelo = None      # ultimo fotograma callado ENTERO, material del aire
+    for f in _fotogramas(pcm):
+        if _rms(f) >= umbral:
+            seguidos = 0
+            sonado = True
+            salida.extend(f)
+            continue
+        seguidos += 1
+        if seguidos > tope:
+            # Pasado el tope se recorta, pero solo la CABEZA callada: si el
+            # fotograma lleva dentro el ataque de la palabra siguiente se emite
+            # desde justo antes de el.
+            primera = next((k for k, v in enumerate(f)
+                            if abs(v) >= umbral_pico), None)
+            if primera is not None:
+                salida.extend(f[max(0, primera - prerrollo):])
+            continue
+        if seguidos != fot or not sonado or alarga <= 0:
+            salida.extend(f)
+            if max(abs(v) for v in f) < umbral_pico:
+                suelo = f
+            continue
+        # EL AIRE, y va DENTRO del fotograma. Este es el de la costura: sus
+        # primeros 110 ms son suelo de sala y los ultimos 20 el arranque de la
+        # palabra siguiente. Se parte por el PIE de ese ataque y se emite
+        # cabeza, aire, ataque -- el aire hecho SOLO con la cabeza, que es
+        # suelo de verdad, en espejo alternado y recortado a `alarga`
+        # fotogramas exactos.
+        primera = next((k for k, v in enumerate(f)
+                        if abs(v) >= umbral_pico), None)
+        corte = len(f) if primera is None else max(0, primera - pie)
+        cabeza, ataque = f[:corte], f[corte:]
+        fuente = cabeza if len(cabeza) >= len(f) // 4 else (suelo or f)
+        salida.extend(cabeza)
+        puestas, k = 0, 0
+        while puestas < alarga * len(f):
+            pieza = fuente[::-1] if k % 2 == 0 else fuente
+            pieza = pieza[:alarga * len(f) - puestas]
+            salida.extend(pieza)
+            puestas += len(pieza)
+            k += 1
+        salida.extend(ataque)
+    if sys.byteorder == "big":
+        salida.byteswap()
+    return salida.tobytes()
+
+
 def comprobar_orden(eventos):
     """Los eventos tienen que llegar en el orden que promete el protocolo."""
     tipos = [e["tipo"] for e in eventos]
@@ -268,7 +377,8 @@ def main():
     ap.add_argument("--semilla", type=int, default=11)
     ap.add_argument("--pasos", type=int, default=6)
     ap.add_argument("--pruebas",
-                    default="fidelidad,eventos,concurrencia,corte,errores,auth")
+                    default="fidelidad,eventos,concurrencia,respiro,corte,"
+                            "errores,auth")
     a = ap.parse_args()
     pruebas = a.pruebas.split(",")
     fallos = []
@@ -291,7 +401,10 @@ def main():
               f"{time.time()-t:5.1f} s · {len(pcm_ses)} bytes · md5 {md5(pcm_ses)}")
 
         t = time.time()
-        pcm_str = http_stream(a.url, a.token, "\n".join(FRASES), a.voz, a.cfg,
+        # Con ESPACIOS: la sesion cose los trozos con espacio y solo pone el
+        # "\n" del final de la locucion (SesionViva.alimentar/cerrar), que
+        # /tts/stream anade igual por su cuenta (text.strip() + "\n").
+        pcm_str = http_stream(a.url, a.token, " ".join(FRASES), a.voz, a.cfg,
                               a.semilla, a.pasos)
         print(f"[http stream] {dur(pcm_str):5.2f} s de audio en "
               f"{time.time()-t:5.1f} s · {len(pcm_str)} bytes · md5 {md5(pcm_str)}")
@@ -396,6 +509,80 @@ def main():
                 fallos.append(f"concurrencia: la {etiqueta} != sesion a solas")
                 print(f"  FALLO la {etiqueta} != sesion a solas: {len(pcm)} vs "
                       f"{len(pcm_sola)} bytes, primer byte distinto en {iguales}")
+
+    # ------------------------------------------------------- 3b) respiro --
+    # Con respiro (el defecto real de las sesiones) el audio no puede coincidir
+    # por md5 con " ".join, porque el aire se anade despues. Lo que si se puede
+    # es REPRODUCIRLO: el respiro es un post-proceso puro sobre el audio sin
+    # respiro, y aqui se aplica en local y se compara md5. Si sale igual, el
+    # aire esta INSERTADO y el habla es la misma; si no, el respiro esta
+    # cambiando algo que no deberia tocar.
+    if "respiro" in pruebas:
+        print("\n[respiro]")
+        salud = json.load(pedir(f"{a.url}/health", a.token))
+        resp = salud["sesiones"].get("respiro", {})
+        fot = resp.get("fotogramas", 2)
+        alarga = resp.get("alarga", 0)
+        tope = resp.get("tope", 8)
+        umbral = resp.get("umbral_rms", 0.006)
+        pico = resp.get("umbral_pico", 0.03)
+        prerrollo = resp.get("prerrollo", 240)
+        pie = resp.get("pie", 960)
+        pcm_sin, _, _ = asyncio.run(ws_sesion(
+            a.url, a.token, FRASES, a.voz, a.cfg, a.semilla, a.pasos,
+            respiro=False))
+        pcm_resp, _, _ = asyncio.run(ws_sesion(
+            a.url, a.token, FRASES, a.voz, a.cfg, a.semilla, a.pasos,
+            respiro=True))
+        print(f"  sin respiro {dur(pcm_sin):5.2f} s · con respiro "
+              f"{dur(pcm_resp):5.2f} s (pausa desde {fot} fotogramas, "
+              f"alarga {alarga}, tope {tope})")
+
+        esperado = aplicar_respiro(pcm_sin, fot, alarga, tope, umbral, pico,
+                                   prerrollo, pie)
+        if md5(esperado) == md5(pcm_resp):
+            print("  OK  el respiro es exactamente el post-proceso documentado: "
+                  "mismo md5 aplicandolo en local sobre el audio sin respiro")
+        else:
+            fallos.append("respiro: el audio no es el post-proceso del audio "
+                          "sin respiro")
+            n = min(len(esperado), len(pcm_resp))
+            i = next((k for k in range(n) if esperado[k] != pcm_resp[k]), n)
+            print(f"  FALLO simulado {len(esperado)} bytes vs servidor "
+                  f"{len(pcm_resp)}, primer byte distinto en {i}")
+
+        rachas = rachas_calladas(pcm_resp, umbral)
+        pausas = [r for r in rachas if r >= 2]
+        larga = max(rachas, default=0)
+        print(f"  rachas de silencio {sorted(rachas, reverse=True)[:8]} "
+              f"(fotogramas de 133 ms)")
+        # Ninguna pausa puede pasar de tope+alarga: llegado al tope se recorta
+        # lo que siga. Los dos de margen son los fotogramas de borde, que
+        # quedan bajo el umbral de deteccion pero por encima del de recorte.
+        if larga <= tope + alarga + 2:
+            print(f"  OK  ninguna racha pasa del tope "
+                  f"({larga} <= {tope}+{alarga}+2)")
+        else:
+            fallos.append(f"respiro: racha de {larga} fotogramas con tope "
+                          f"{tope}+{alarga}")
+            print(f"  FALLO racha de {larga} fotogramas; el tope es "
+                  f"{tope}+{alarga}")
+        # CUANTAS pausas hay lo decide el modelo, no este codigo: el respiro ya
+        # no mete marcadores en el texto, solo alarga las que el modelo hace
+        # (que estan siempre en un final de frase; ver el bloque RESPIRO). Lo
+        # que si tiene que cumplirse es que el aire ESTE, y que sea el que se
+        # anuncia: la pausa mas larga tiene que crecer exactamente `alarga`.
+        sin_respiro = rachas_calladas(pcm_sin, umbral)
+        larga_sin = max(sin_respiro, default=0)
+        if larga_sin >= fot and larga == min(larga_sin, tope) + alarga:
+            print(f"  OK  el aire esta puesto: la pausa mas larga pasa de "
+                  f"{larga_sin} a {larga} fotogramas "
+                  f"({larga*FOT/RITMO:.2f} s) · pausas {sorted(pausas, reverse=True)[:6]}")
+        else:
+            fallos.append(f"respiro: la pausa mas larga es {larga} fotogramas "
+                          f"y sin respiro era {larga_sin} (alarga={alarga})")
+            print(f"  FALLO pausa mas larga {larga}, sin respiro {larga_sin}, "
+                  f"alarga {alarga}")
 
     # ----------------------------------- 4) corte a mitad y limpieza --
     if "corte" in pruebas:

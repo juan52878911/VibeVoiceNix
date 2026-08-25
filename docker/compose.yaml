@@ -53,6 +53,10 @@ services:
       # Sin token la API queda ABIERTA a quien alcance el puerto.
       VOZ_TOKEN: "${VOZ_TOKEN:-}"
       VOZ_WHISPER_URL: "http://whisper:8081"
+      # Para que `POST /v1/audio/speech` pueda servir tambien VibeVoice. Si el
+      # perfil `pesado` no esta levantado, el nombre no resuelve, `GET /v1/models`
+      # no anuncia el modelo y Piper sigue funcionando igual.
+      VOZ_VIBEVOICE_URL: "http://voz-stream:8082"
       # Sesga el vocabulario de whisper. Es el ajuste que MÁS se nota: sin él
       # transcribe "WireGuard" como "We The War". Mete aquí tu jerga.
       VOZ_PROMPT_STT: >-

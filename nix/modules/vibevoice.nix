@@ -24,7 +24,13 @@ let
     name = "vibevoice";
     runtimeInputs = [ pkgs.vibevoice-env pkgs.ffmpeg ];
     text = ''
-      export OMP_NUM_THREADS="''${VIBEVOICE_HILOS:-${toString cfg.hilos}}"
+      # hilos = 0 significa "que lo decida la maquina": se deja OMP_NUM_THREADS
+      # SIN poner y detectar_hilos() (voz_stream.py) cuenta nucleos fisicos.
+      # Exportarlo vacio no vale: OpenMP lee la variable, no su contenido.
+      hilos="''${VIBEVOICE_HILOS:-${toString cfg.hilos}}"
+      if [ "$hilos" != "0" ]; then
+        export OMP_NUM_THREADS="$hilos"
+      fi
       ${lib.optionalString cfg.anclarNucleos ''
         export OMP_PLACES="''${OMP_PLACES:-cores}"
         export OMP_PROC_BIND="''${OMP_PROC_BIND:-close}"
@@ -58,19 +64,30 @@ in
 
     hilos = lib.mkOption {
       type = lib.types.int;
-      default = 6;
+      default = 0;
       description = ''
-        Hilos de OpenMP. 6 = los nucleos FISICOS del i7-8700T. Medido en la VM
-        (RTF, menor es mejor):
+        Hilos de OpenMP. **0 = detectarlos** (lo recomendado): cuenta nucleos
+        FISICOS -- no hilos logicos -- respetando el cpuset del cgroup, y a
+        partir de 8 deja uno libre para el resto del stack. Asi la misma
+        configuracion sirve en una maquina de 4, de 8 o de 12 hilos sin tocar
+        nada. La deteccion se imprime al arrancar.
+
+        Un numero fijo pisa la deteccion, que es lo que hay que hacer para
+        comparar mediciones entre si.
+
+        MAS NO ES MEJOR, y por eso se cuentan fisicos. Medido en la VM
+        (i7-8700T, 6 fisicos / 12 logicos; RTF, menor es mejor):
 
           2 hilos  4,19    8 hilos  4,31
           4 hilos  4,19   10 hilos  4,46
           6 hilos  4,24   12 hilos  5,18  <- 24% PEOR que con 2
 
-        Mas hilos empeora: la carga esta limitada por ancho de banda de
-        memoria, no por computo. Con 2 hilos ya se satura el bus DDR4 de un
-        solo canal, y del 7 al 12 encima compiten por las mismas unidades AVX2
-        de los 6 nucleos fisicos.
+        La carga esta limitada por ancho de banda de memoria, no por computo.
+        Con 2 hilos ya se satura el bus DDR4 de un solo canal, y del 7 al 12
+        encima compiten por las mismas unidades AVX2 de los 6 nucleos fisicos.
+
+        La forma de aprovechar los hilos que sobran NO es subir este numero,
+        sino solapar etapas: ver services.voz-stream.solaparDecodificador.
       '';
     };
 
@@ -110,13 +127,38 @@ in
         DPMSolverMultistepScheduler, disenado para pocos pasos, y viene
         configurado a 20.
 
-        Medido con int8: 20 pasos RTF 2,75 · 8 pasos 2,18 · 6 pasos 2,18 ·
-        4 pasos 2,11. De 6 a 4 solo se gana un 3%, asi que 6 deja margen de
-        calidad casi gratis.
+        Medido con int8 en su dia: 20 pasos RTF 2,75 · 8 pasos 2,18 · 6 pasos
+        2,18 · 4 pasos 2,11. De 6 a 4 solo se ganaba un 3 %, asi que 6 dejaba
+        margen de calidad casi gratis.
 
-        Por debajo de 6 apenas se gana: la cabeza de difusion (84 MB) deja de
-        dominar y pasa a mandar el backbone (869 MB), que no depende de los
+        CON EL MOTOR OPENVINO YA NO ES ASI. Comparacion pareada, alternando 6
+        y 4 en tandas seguidas para que la deriva de la maquina no sesgue el
+        resultado (decodificador int4, sin solapar, 6 hilos, semilla fija):
+
+          tanda    pasos 6   pasos 4
+            1       0,964     0,890
+            2       0,932     0,889
+            3       0,937     0,901
+          media     0,944     0,893
+
+        Un 5,4 % consistente, y es lo que separa el "casi tiempo real" del
+        "tiempo real". La cabeza de difusion pasa de 15,6 a 10,6 ms por
+        fotograma; el resto del bucle no se entera.
+
+        LA CALIDAD NO SE RESIENTE, medido con 24 clips (6 frases x 4
+        semillas), transcritos con whisper:
+
+                      WER medio   frases exactas   deriva de tono   recorte
+          6 pasos       12,7 %         58 %          -3,81 st        0,000 %
+          4 pasos        9,8 %         79 %          -3,13 st        0,000 %
+
+        El unico clip descarrilado con 4 pasos sale de la semilla 42, que
+        tambien descarrila TRES clips con 6 pasos: es la semilla, no los
         pasos.
+
+        El defecto se queda en 6 porque bajarlo cambia la locucion (otro
+        audio, otra duracion) y esa decision es del que despliega, no de la
+        biblioteca. Ponlo en 4 si el objetivo es RTF < 0,9.
       '';
     };
 

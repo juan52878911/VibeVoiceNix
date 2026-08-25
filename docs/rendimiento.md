@@ -85,6 +85,16 @@ una aserción exige que el sistema tenga swap declarada.
 Contraintuitivo hasta que se sabe que el cuello es el **ancho de banda de memoria**: más hilos compiten por
 el mismo bus y añaden contención, no trabajo útil.
 
+Por eso `services.vibevoice.hilos` vale **`0` (detectar)**: cuenta **núcleos físicos**, no hilos lógicos
+—en este i7 da 6, no 12—, respeta el `cpuset` del contenedor y a partir de 8 deja uno libre. La misma
+configuración vale en una máquina de 4, 8 o 12 hilos.
+
+**Y para usar los hilos que sobran, la respuesta no es subir ese número: es solapar etapas.** El
+decodificador acústico se lleva el 42 % del tiempo y no realimenta el bucle, así que puede correr en su
+propio hilo mientras el resto sigue. Medido en un M4: **RTF 0,739 → 0,587 (−21 %), con el audio idéntico
+bit a bit**. Lo que estaba saturado era una etapa, no la máquina. Ver
+[optimizacion.md](optimizacion.md#5--solapar-el-decodificador-acústico--las-dos-etapas-a-la-vez).
+
 ### `cfgScale` no acelera: se midió
 
 Parecía el ajuste obvio —con *classifier-free guidance* cada paso hace una pasada condicional y otra

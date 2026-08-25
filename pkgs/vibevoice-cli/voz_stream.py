@@ -64,9 +64,12 @@ import contextlib
 import copy
 import ctypes
 import gc
+import hashlib
 import json
 import os
 import platform
+import queue
+import re
 import secrets
 import sys
 import struct
@@ -104,7 +107,93 @@ if not TOKEN:
         "que alcance este puerto.",
         flush=True,
     )
-HILOS = int(os.environ.get("OMP_NUM_THREADS", "6"))
+def nucleos_fisicos() -> int:
+    """Nucleos FISICOS utilizables, no hilos logicos ni nucleos de la maquina.
+
+    Los tres son numeros distintos y confundirlos es justo el error que este
+    proyecto ya midio: en el i7-8700T (6 fisicos / 12 logicos) usar los 12
+    empeora el RTF un 24 % -- los hilos hermanos de un mismo nucleo comparten
+    la unidad AVX2 y el puerto de memoria, asi que se estorban en vez de
+    sumar. Ver docs/optimizacion.md.
+
+    Por orden de fiabilidad:
+      1. sched_getaffinity: lo que el cgroup/taskset deja usar DE VERDAD. En un
+         contenedor con `--cpuset-cpus 0-3` esto da 4 y os.cpu_count() da 12.
+      2. /proc/cpuinfo agrupando por (physical id, core id): separa fisicos de
+         hermanos SMT en Linux.
+      3. hw.perflevel0.physicalcpu (macOS): los nucleos de RENDIMIENTO de un
+         Apple Silicon. Contar tambien los de eficiencia mete en el reparto
+         nucleos ~3x mas lentos, y con trabajo repartido a partes iguales el
+         lote entero va al ritmo del mas lento.
+      4. os.cpu_count() // 2 como ultimo recurso, asumiendo SMT.
+    """
+    permitidos = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            permitidos = len(os.sched_getaffinity(0))
+        except OSError:
+            permitidos = None
+
+    fisicos = None
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+            for clave in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
+                r = subprocess.run(["sysctl", "-n", clave],
+                                   capture_output=True, text=True, timeout=2)
+                if r.returncode == 0 and r.stdout.strip().isdigit():
+                    fisicos = int(r.stdout.strip())
+                    break
+        else:
+            nucleos, actual = set(), {}
+            for linea in Path("/proc/cpuinfo").read_text().splitlines():
+                if ":" not in linea:
+                    if actual:
+                        nucleos.add((actual.get("physical id", "0"),
+                                     actual.get("core id", str(len(nucleos)))))
+                        actual = {}
+                    continue
+                k, _, v = linea.partition(":")
+                actual[k.strip()] = v.strip()
+            if actual:
+                nucleos.add((actual.get("physical id", "0"),
+                             actual.get("core id", str(len(nucleos)))))
+            fisicos = len(nucleos) or None
+    except Exception:
+        fisicos = None
+
+    if fisicos is None:
+        fisicos = max(1, (os.cpu_count() or 2) // 2)
+    # La afinidad es un TOPE, no una alternativa: si el cgroup da 2 CPUs, dan
+    # igual los 6 nucleos que tenga la maquina por debajo.
+    if permitidos:
+        fisicos = min(fisicos, permitidos)
+    return max(1, fisicos)
+
+
+def detectar_hilos() -> int:
+    """Hilos de inferencia. OMP_NUM_THREADS manda; si no, los fisicos.
+
+    Se deja UNO libre a partir de 8 nucleos para que el resto del stack --
+    whisper, voz-api, el propio servidor HTTP -- pueda responder mientras esto
+    genera. Por debajo de 8 no se reserva nada: quitarle un nucleo a una
+    maquina de 4 cuesta un 25 % del computo y ahi no sobra.
+    """
+    puesto = os.environ.get("OMP_NUM_THREADS", "").strip()
+    if puesto.isdigit() and int(puesto) > 0:
+        return int(puesto)
+    n = nucleos_fisicos()
+    return n - 1 if n >= 8 else n
+
+
+HILOS = detectar_hilos()
+# Que se vea: si la deteccion se equivoca, este numero es la primera pista.
+print(f"[arranque] {HILOS} hilos de inferencia "
+      f"({nucleos_fisicos()} nucleos fisicos utilizables)", flush=True)
+# torch NO lee OMP_NUM_THREADS cuando su backend es nativo en vez de OpenMP
+# (el caso en macOS ARM), asi que se le dice explicitamente. Sin esto el
+# reparto adaptativo no llegaba al camino torch.
+torch.set_num_threads(HILOS)
 
 # Motor de inferencia: "torch" (RTF 2,19) u "openvino" (RTF 1,09).
 MOTOR = os.environ.get("VIBEVOICE_MOTOR", "torch")
@@ -114,6 +203,10 @@ OV_CODIGO = os.environ.get("VIBEVOICE_OV_CODIGO", "")
 IR_LM = os.environ.get("VIBEVOICE_IR_LM", "")
 IR_CABEZA = os.environ.get("VIBEVOICE_IR_CABEZA", "")
 IR_ACUSTICO = os.environ.get("VIBEVOICE_IR_ACUSTICO", "")
+# Cuanto se frena la extrapolacion de la guia (0 = nada, 1 = del todo). Ver
+# frenar_guia(): sin esto, una locucion larga con cfg alto se desboca de
+# volumen hasta recortar. El defecto se midio ahi.
+FRENO_GUIA = float(os.environ.get("VIBEVOICE_FRENO_GUIA", "0.75"))
 
 
 def elegir_dispositivo() -> str:
@@ -192,12 +285,33 @@ _candado = asyncio.Lock()
 # medio, asi que su estado por solve -- step_index, model_outputs -- nunca cruza
 # una pausa. Lo que si sigue haciendo falta es el candado: dos generaciones A LA
 # VEZ si se lo corromperian.
+#
+# CON EL MOTOR OPENVINO HAY UN TERCER ESTADO, Y SE ARREGLA EN OTRO SITIO
+# El decodificador acustico compilado guarda las colas de sus convoluciones
+# dentro del IR, que es UNO para todo el proceso: no solo cruza las pausas, es
+# que cruzaba peticiones enteras. No se cubre desde aqui porque este fichero no
+# conoce el motor; lo hace AcusticoOV (pkgs/vibevoice-ov/motor.py) atando el
+# estado al objeto cache que generate() crea en cada llamada, que es justo la
+# misma unidad de aislamiento que el RNG de aqui.
 _candado_modelo = threading.Lock()
 _bearer = HTTPBearer(auto_error=False)
 
 
 class GeneracionCancelada(Exception):
     """Senal interna: el cliente se fue, aborta generate()."""
+
+
+class LocucionDescarrilada(Exception):
+    """El modelo agoto el texto sellado y NO emitio su EOS: sigue pidiendo
+    ventanas y generando audio sin texto detras. Se corta la locucion.
+
+    Visto en produccion (2026-08-05 23:31, sesion ws-8247c2d0): una respuesta
+    normal de ~330 tokens termino de leerse y el modelo siguio generando; al
+    saltar el tope de cache llevaba 766 posiciones de mas ("-766 tokens
+    pendientes" en el registro) y aun asi siguio seis minutos, hasta que el
+    cliente se desconecto. El tope no podia frenarlo: sellar solo hace que las
+    lecturas devuelvan vacio, que es justo lo que ya pasaba. Esta excepcion es
+    el freno que faltaba: desmonta generate() desde la lectura de texto."""
 
 
 def devolver_memoria() -> None:
@@ -233,6 +347,273 @@ def autorizar(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> N
         raise HTTPException(status_code=401, detail="token invalido o ausente")
 
 
+# ---------------------------------------------------------------------------
+# SOLAPAR EL DECODIFICADOR ACUSTICO CON EL RESTO DEL BUCLE
+# ---------------------------------------------------------------------------
+#
+# EL HALLAZGO QUE LO PERMITE: el decodificador acustico es un SUMIDERO.
+# Comprobado leyendo el bucle de Microsoft
+# (modeling_vibevoice_streaming_inference.py, lineas 776-804):
+#
+#     speech_latent  = sample_speech_tokens(...)      # cabeza de difusion
+#     audio_chunk    = acoustic_tokenizer.decode(...) # <- el 42% del tiempo
+#     audio_chunks[idx].append(audio_chunk[i])        # se guarda
+#     audio_streamer.put(audio_chunk, ...)            # se emite
+#     acoustic_embed = acoustic_connector(speech_latent)   # <- LATENT, no audio
+#
+# La realimentacion autorregresiva pasa por `acoustic_connector(speech_latent)`.
+# El audio decodificado NO vuelve a entrar en el modelo: solo se guarda y se
+# emite. Asi que decode() esta en el camino critico unicamente porque se llama
+# de forma sincrona, no porque el bucle lo necesite.
+#
+# MEDIDO en un Apple M4 (motor torch-int8, 6 hilos, texto de 180 caracteres,
+# semilla 11), reparto DENTRO de una generate() real:
+#
+#     tts_lm      189 llamadas   20,47 ms   40,3 %
+#     cabeza      540 llamadas    2,56 ms   14,4 %
+#     acustico     90 llamadas   45,19 ms   42,4 %   <- se puede solapar
+#     resto                                  2,8 %
+#
+# Con el decodificador fuera del camino critico el techo teorico es
+# max(42,4 ; 57,6) = 57,6 % del tiempo, o sea 1,74x. Lo que se consigue de
+# verdad depende de cuanto se estorben las dos etapas por ancho de banda de
+# memoria, que en esta maquina es el recurso escaso; por eso hay medicion y
+# no solo teoria (ver docs/optimizacion.md).
+#
+# POR QUE UN BUFER PREASIGNADO Y NO UN "FUTURO"
+# generate() hace `torch.cat(audio_chunks)` al final PASE LO QUE PASE -- solo
+# el `return` mira `return_speech`, no el concat --, asi que lo que devuelva
+# decode() tiene que ser un tensor de verdad, no un objeto perezoso. La salida
+# tiene forma fija y conocida (un latente -> 3200 muestras), asi que se
+# devuelve un tensor VACIO del tamano bueno y el worker lo rellena in situ.
+# Quien lo lee ve el dato porque nadie lo lee antes de que el worker acabe.
+#
+# POR QUE UN SOLO WORKER Y EN ORDEN ESTRICTO
+# El decodificador es causal y con estado: las colas de sus convoluciones las
+# deja la llamada anterior. Dos decode() a la vez, o en otro orden, darian otro
+# audio. Un unico hilo con una cola FIFO conserva el orden exacto de la version
+# sincrona, que es lo que hace que el audio salga identico bit a bit.
+#
+# LA EMISION TAMBIEN SE MUEVE AL WORKER
+# Si `streamer.put()` se quedara en el hilo de generate() habria que esperar
+# ahi al decode -- y no se solaparia nada. Asi que el worker, tras rellenar el
+# bufer, llama el mismo al put() de verdad. Efecto colateral: la cancelacion
+# cooperativa (put() lanzando GeneracionCancelada) ya no salta en el hilo de
+# generate(), asi que la excepcion se guarda y se relanza en el decode()
+# siguiente. El corte tarda como mucho un trozo mas que antes: ~133 ms.
+SOLAPAR_DECODER = os.environ.get("VIBEVOICE_SOLAPAR_DECODER", "1") not in ("0", "no")
+# Hilos para el decodificador cuando va solapado. El resto son para el camino
+# principal (tts_lm + cabeza). Solo el motor OpenVINO puede repartirlos de
+# verdad: INFERENCE_NUM_THREADS es por modelo compilado, mientras que en torch
+# el pool intra-op es uno para todo el proceso.
+HILOS_DECODER = int(os.environ.get("VIBEVOICE_HILOS_DECODER", "0")) or max(1, HILOS // 2)
+
+
+# --------------------------------------------------------------------- crono --
+# CUAL DE LAS DOS TUBERIAS ES EL CUELLO
+# Con el decodificador solapado, sumar los tiempos por componente ya no dice
+# donde va el reloj de pared: el bucle (tts_lm + cabeza) y el decodificador
+# corren A LA VEZ, asi que la suma pasa de 100 %. Lo que hace falta saber es
+# quien espera a quien:
+#
+#   contrapresion  segundos que el BUCLE pasa bloqueado en cola.put() porque el
+#                  decodificador no da abasto -> el cuello es el decodificador
+#   hambre         segundos que el WORKER pasa esperando trabajo -> el cuello
+#                  es el bucle
+#
+# Se acumula siempre (dos perf_counter() por fotograma, ~0,2 us) y se lee por
+# GET /crono, que ademas lo pone a cero: asi cada banco mide SU generacion y no
+# arrastra la anterior.
+CRONO_TUBERIA = {"generate": 0.0, "generaciones": 0, "audio_s": 0.0,
+                 "contrapresion": 0.0, "trabajo_worker": 0.0,
+                 "hambre_worker": 0.0, "decodes": 0}
+
+
+def crono_cero() -> dict:
+    previo = dict(CRONO_TUBERIA)
+    for k in CRONO_TUBERIA:
+        CRONO_TUBERIA[k] = 0.0 if isinstance(CRONO_TUBERIA[k], float) else 0
+    return previo
+
+
+class _Trabajo:
+    """Un decode encolado y su emision, que se deciden en hilos distintos.
+
+    El worker rellena el bufer; el hilo de generate() dice a donde va. Cual de
+    los dos llega antes NO esta garantizado -- entre decode() y put() solo hay
+    un append de lista, pero "casi siempre" no es "siempre" --, asi que el que
+    llegue el ultimo es el que emite. El candado hace atomica esa decision.
+    """
+
+    __slots__ = ("bufer", "args", "kw", "destino", "indices", "listo", "emitido",
+                 "candado")
+
+    def __init__(self, bufer, args, kw):
+        self.bufer, self.args, self.kw = bufer, args, kw
+        self.destino = self.indices = None
+        self.listo = self.emitido = False
+        self.candado = threading.Lock()
+
+    def reclamar_emision(self, *, desde_worker: bool):
+        """Devuelve (destino, indices) si a QUIEN LLAMA le toca emitir."""
+        with self.candado:
+            if desde_worker:
+                self.listo = True
+                if self.destino is None or self.emitido:
+                    return None
+            else:
+                if not self.listo:
+                    return None       # ya emitira el worker, que llegara despues
+                if self.emitido:
+                    return None
+            self.emitido = True
+            return self.destino, self.indices
+
+
+class DecodificadorSolapado:
+    """Saca acoustic_tokenizer.decode() del camino critico de generate()."""
+
+    def __init__(self, decode_real, profundidad: int = 2):
+        self._decode = decode_real
+        # Cola CORTA a proposito: es cuanto puede adelantarse el bucle al
+        # decodificador. Mas profundidad no acelera -- el cuello es el propio
+        # decodificador -- y solo retrasaria la cancelacion y el audio en vuelo.
+        self._cola: "queue.Queue" = queue.Queue(maxsize=profundidad)
+        self._molde = None          # forma/dtype, del primer decode (sincrono)
+        self._fallo = None          # excepcion del worker, para relanzar en generate()
+        self._trabajos: dict = {}   # id(bufer) -> _Trabajo pendiente de destino
+        self._hilo = threading.Thread(target=self._bucle, name="decoder-acustico",
+                                      daemon=True)
+        self._hilo.start()
+
+    # ---- hilo trabajador ----
+    def _bucle(self):
+        while True:
+            espera = time.perf_counter()
+            trabajo = self._cola.get()
+            CRONO_TUBERIA["hambre_worker"] += time.perf_counter() - espera
+            try:
+                if trabajo is None:
+                    return
+                if self._fallo is None:
+                    faena = time.perf_counter()
+                    salida = self._decode(*trabajo.args, **trabajo.kw)
+                    CRONO_TUBERIA["trabajo_worker"] += time.perf_counter() - faena
+                    CRONO_TUBERIA["decodes"] += 1
+                    if tuple(salida.shape) != tuple(trabajo.bufer.shape):
+                        raise RuntimeError(
+                            "el decodificador cambio de forma: esperaba "
+                            f"{tuple(trabajo.bufer.shape)} y dio "
+                            f"{tuple(salida.shape)}")
+                    trabajo.bufer.copy_(salida)
+                    envio = trabajo.reclamar_emision(desde_worker=True)
+                    if envio is not None and envio[0] is not None:
+                        # El put() de verdad, ya con el audio dentro. Puede
+                        # lanzar GeneracionCancelada: es la senal de que el
+                        # cliente se fue, y se propaga por _fallo.
+                        envio[0].put(trabajo.bufer, envio[1])
+            except BaseException as e:      # noqa: BLE001 - se relanza tal cual
+                if self._fallo is None:
+                    self._fallo = e
+            finally:
+                self._cola.task_done()
+
+    # ---- cara visible ----
+    def decode(self, latents, *a, **kw):
+        self._relanzar()
+        if self._molde is None:
+            # La primera va sincrona: hace falta su forma para poder preasignar
+            # las siguientes, y ademas es la que paga el cebado del decoder.
+            salida = self._decode(latents, *a, **kw)
+            self._molde = (tuple(salida.shape), salida.dtype)
+            return salida
+        forma, tipo = self._molde
+        bufer = torch.empty(forma, dtype=tipo)
+        trabajo = _Trabajo(bufer, (latents, *a), kw)
+        self._trabajos[id(bufer)] = trabajo
+        # put() bloquea cuando la cola esta llena: es la contrapresion que evita
+        # que el bucle se adelante sin limite al decodificador.
+        frenado = time.perf_counter()
+        self._cola.put(trabajo)
+        CRONO_TUBERIA["contrapresion"] += time.perf_counter() - frenado
+        return bufer
+
+    def emitir(self, bufer, streamer, indices) -> None:
+        """Dice a donde va el audio de `bufer`. Lo llama el streamer envuelto."""
+        trabajo = self._trabajos.pop(id(bufer), None)
+        if trabajo is None:
+            # No salio de un decode diferido (la primera, que va sincrona): el
+            # dato ya esta, se emite aqui mismo.
+            if streamer is not None:
+                streamer.put(bufer, indices)
+            return
+        with trabajo.candado:
+            trabajo.destino, trabajo.indices = streamer, indices
+        envio = trabajo.reclamar_emision(desde_worker=False)
+        if envio is not None and envio[0] is not None:
+            envio[0].put(trabajo.bufer, envio[1])
+        self._relanzar()
+
+    def drenar(self) -> None:
+        """Espera a que no quede audio por decodificar ni por emitir."""
+        self._cola.join()
+        self._trabajos.clear()
+        self._relanzar()
+
+    def _relanzar(self):
+        if self._fallo is not None:
+            fallo, self._fallo = self._fallo, None
+            raise fallo
+
+
+class StreamerSolapado:
+    """Envuelve al streamer real para que la emision la haga el worker.
+
+    put() aqui NO emite: le dice al decodificador que, cuando termine con ese
+    bufer, se lo entregue al streamer de verdad. end() drena antes de cerrar,
+    que es lo que garantiza que no se pierda ni un trozo ni se adelante el
+    cierre al ultimo put().
+    """
+
+    def __init__(self, solapado: DecodificadorSolapado, real):
+        self._solapado = solapado
+        self.real = real
+
+    def put(self, trozos, indices):
+        self._solapado.emitir(trozos, self.real, indices)
+
+    def end(self, indices=None):
+        self._solapado.drenar()
+        self.real.end(indices)
+
+    def __getattr__(self, nombre):
+        # cancelado, terminado, flujo(), trozos... el resto del mundo sigue
+        # hablando con el streamer real sin enterarse de esta capa.
+        return getattr(self.real, nombre)
+
+
+def solapar_decodificador(modelo) -> Optional[DecodificadorSolapado]:
+    """Instala el decodificador solapado. None si esta desactivado."""
+    if not SOLAPAR_DECODER:
+        return None
+    if EN_GPU:
+        # En GPU el reparto es otro (el decodificador deja de dominar) y ademas
+        # habria que preasignar el bufer en el dispositivo bueno. No se ha
+        # medido ahi, asi que no se activa a ciegas.
+        print("[arranque] decodificador sin solapar: solo esta medido en CPU",
+              flush=True)
+        return None
+    tok = getattr(getattr(modelo, "model", None), "acoustic_tokenizer", None)
+    if tok is None:
+        return None
+    solapado = DecodificadorSolapado(tok.decode)
+    tok.decode = solapado.decode
+    print(f"[arranque] decodificador acustico solapado "
+          f"({HILOS - HILOS_DECODER} hilos el bucle, {HILOS_DECODER} el decoder)",
+          flush=True)
+    return solapado
+
+
 def cargar_modelo():
     """Carga el modelo con el motor elegido.
 
@@ -252,9 +633,23 @@ def cargar_modelo():
             sys.path.insert(0, OV_CODIGO)
             from motor import cargar as cargar_ov
             procesador, modelo = cargar_ov(
-                MODELO_DIR, HILOS, IR_LM, IR_CABEZA, IR_ACUSTICO
+                MODELO_DIR, HILOS, IR_LM, IR_CABEZA, IR_ACUSTICO,
+                # Solo se reparte si el decodificador va a correr EN PARALELO
+                # con el bucle; si no, cada etapa tiene la maquina entera para
+                # ella durante su turno y partir los hilos solo la frenaria.
+                hilos_acustico=HILOS_DECODER if SOLAPAR_DECODER else None,
+                neg_cada=NEG_CADA,
             )
+            marcar_rama_condicional(modelo)
+            # El freno tambien aqui: sample_speech_tokens sigue siendo la de
+            # torch con este motor (solo cambian los grafos que llama), y la
+            # rampa de volumen se midio en LOS DOS motores.
+            frenar_guia(modelo)
+            reforzar_guia_arranque(modelo)
+            demorar_eos(modelo)
+            instrumentar_latentes(modelo)
             modelo.set_ddpm_inference_steps(PASOS)
+            _estado["solapado"] = solapar_decodificador(modelo)
             devolver_memoria()
             _estado["motor"] = "openvino"
             return procesador, modelo
@@ -281,6 +676,9 @@ def cargar_modelo():
     acelerar_convoluciones_depthwise(modelo)
     cebar_decoder_acustico(modelo)
     compartir_embeddings_muertos(modelo)
+    frenar_guia(modelo)
+    reforzar_guia_arranque(modelo)
+    demorar_eos(modelo)
 
     if EN_GPU:
         modelo.to(DISPOSITIVO)
@@ -308,7 +706,11 @@ def cargar_modelo():
             )
             _estado["motor"] = "torch-fp32"
 
+    instrumentar_latentes(modelo)
     modelo.set_ddpm_inference_steps(PASOS)
+    # Despues de cebar_decoder_acustico: asi el cebado corre DENTRO del worker
+    # y no vuelve a meter el decodificador en el camino critico.
+    _estado["solapado"] = solapar_decodificador(modelo)
     # Los pesos fp32 que acaban de ser sustituidos siguen ocupando hasta que
     # se recolectan Y se devuelven al sistema.
     devolver_memoria()
@@ -350,6 +752,346 @@ def cebar_decoder_acustico(modelo) -> None:
     tok._cebado = True
     print("[arranque] decoder cebado con silencio (quita el chasquido inicial)",
           flush=True)
+
+
+def frenar_guia(modelo, freno: float = None) -> None:
+    """Reescala la guia de la difusion para que una locucion larga no se
+    desboque de volumen (el "CFG rescale" de Lin et al. 2023, aplicado aqui).
+
+    EL FALLO QUE ARREGLA, medido (2026-08-06, 8 frases encadenadas, 42 s,
+    voz sp-Spk1_man, semilla 11, 6 pasos): con cfg 4.5 el RMS sube de
+    -22 dB a -7 dB en los primeros 20 segundos de locucion y se queda ahi,
+    con hasta un 4,8 % de muestras recortadas en el peor tramo de 5 s -- eso
+    es la voz "creciendo hasta distorsionarse" que se oia en el asistente.
+    No es del motor (openvino 1,85 % de recorte, torch-mps 0,30 %, la misma
+    rampa en ambos) ni de las sesiones (una peticion larga por /tts/stream da
+    EXACTAMENTE el mismo audio); es del modelo al encadenar contexto largo:
+    los latentes que genera vuelven a entrar como contexto, con cfg > 1 la
+    extrapolacion uncond + cfg*(cond - uncond) los saca un poco mas de rango
+    en cada vuelta, y el bucle se realimenta hasta que el decodificador
+    satura. Por frases sueltas no se ve porque cada peticion arranca de cero
+    y en ~5 s la deriva no da tiempo a nada (0,00 % de recorte en 8 frases).
+    Con cfg 1.5 tampoco (RMS plano en -25 dB), pero cfg bajo cuesta
+    fidelidad: WER peor 85,7 % (ver PeticionTTS.cfg_scale).
+
+    EL ARREGLO: tras extrapolar, el eps guiado se reescala para que su
+    desviacion tipica vuelva a ser la de la rama condicional -- la energia
+    que el modelo aprendio en entrenamiento -- y se mezcla con el original
+    segun `freno` (0 = todo extrapolado, como antes; 1 = todo reescalado).
+    Eso corta la realimentacion sin renunciar a la direccion de la guia.
+
+    MEDIDO con el mismo banco (misma semilla, mismas 8 frases, cfg 4.5,
+    torch-mps): freno 0 -> rampa de -22,5 a -9,3 dB y 0,30 % de recorte;
+    freno 0.75 -> RMS estable en -25 +-1,5 dB los 44 s enteros, 0,00 % de
+    recorte, pico 0,71, y el WER de la locucion entera pasa de 9 % a 8 %.
+    En frases sueltas no empeora: WER medio 10 % frente a 11 % sin freno.
+    EL DEFECTO SE QUEDA EN 0.75. Se probo 0.85 en la VM y CUESTA FIDELIDAD:
+    9 clips con cfg 3.5 dieron WER medio 14,8 % y peor caso 50,0 %, frente a
+    9,7 % y 11,1 % con 0.75. Aplana la rampa de energia, si, pero a un precio
+    que no compensa. Queda como palanca por si alguien prefiere el volumen
+    plano a la precision.
+
+    El detalle de por que 0.75 no basta en OpenVINO: la deriva se corta del todo
+    en torch (pendiente +0,03) pero en OpenVINO, donde la cabeza de
+    prediccion va en int8, queda residuo -- pendiente +0,26, la norma del
+    latente de 8,2 a 9,1 y +3,8 dB de RMS por locucion. Eso es lo que se oia
+    como voz que se enturbia segun avanza. Con 0.85 la pendiente baja a
+    -0,05 y el RMS queda plano.
+
+    OJO CON SUBIRLO MAS: 1.0 tambien aplana la curva pero SOBREFRENA y la voz
+    colapsa (WER 71,6 %). El margen util es estrecho y esta cerca.
+
+    VIBEVOICE_FRENO_GUIA=0 lo desactiva y deja el
+    comportamiento anterior bit a bit.
+
+    Se sustituye sample_speech_tokens ENTERO en vez de envolverlo porque el
+    reescalado va DENTRO del bucle de pasos, entre la extrapolacion y el
+    solver: desde fuera no hay donde engancharse. Copia fiel de upstream
+    (modeling_vibevoice_streaming_inference.py, sample_speech_tokens) mas
+    las tres lineas del freno; si Microsoft cambia esa funcion, esto hay
+    que re-copiarlo.
+    """
+    import types
+
+    fi = FRENO_GUIA if freno is None else freno
+    if fi <= 0:
+        return
+
+    @torch.no_grad()
+    def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
+        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
+        condition = torch.cat([condition, neg_condition], dim=0).to(
+            self.model.prediction_head.device)
+        speech = torch.randn(condition.shape[0],
+                             self.config.acoustic_vae_dim).to(condition)
+        for t in self.model.noise_scheduler.timesteps:
+            half = speech[: len(speech) // 2]
+            combined = torch.cat([half, half], dim=0)
+            eps = self.model.prediction_head(
+                combined, t.repeat(combined.shape[0]).to(combined),
+                condition=condition)
+            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            # ---- el freno: la energia del eps guiado vuelve a la de la
+            # rama condicional, y se mezcla segun `fi` ----
+            std_cond = cond_eps.std(dim=-1, keepdim=True)
+            std_guiado = half_eps.std(dim=-1, keepdim=True)
+            half_eps = (fi * (half_eps * (std_cond / (std_guiado + 1e-8)))
+                        + (1.0 - fi) * half_eps)
+            eps = torch.cat([half_eps, half_eps], dim=0)
+            speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
+        return speech[: len(speech) // 2]
+
+    modelo.sample_speech_tokens = types.MethodType(sample_speech_tokens, modelo)
+    print(f"[arranque] freno de guia {fi} (una locucion larga ya no se "
+          f"desboca de volumen)", flush=True)
+
+
+# La guia reforzada del ARRANQUE. El primer sonido de una locucion se decide
+# con un contexto minimo: generate() lee la primera ventana de 5 tokens y
+# genera 6 latentes (0,8 s de audio) antes de leer nada mas -- se comprobo
+# sintetizando el mismo arranque con dos continuaciones distintas y la primera
+# muestra que diverge es EXACTAMENTE la 0,800 s. En esa ventana la difusion
+# va mas suelta de la cuenta y la primera palabra sale a veces masticada:
+# "El backup..." con semilla 7 se oye "El Gacop", con la 42 "Escode" -- y sin
+# semilla es una loteria por peticion, que es justo "al principio no vocaliza
+# bien la mayoria de las veces". Medido con 3 textos dificiles x 8 semillas
+# (cfg 3.5, sp-Spk1_man): 4,2 % de WER en las TRES PRIMERAS palabras frente a
+# 0,0 % en todo el resto. El fallo es del arranque, no del texto.
+#
+# La palanca es la guia: con cfg 4.0-4.5 esos mismos arranques salen bien
+# (la difusion se cine mas al texto), pero cfg alto TODO el rato aplana la
+# melodia y cuesta fidelidad (medido en PeticionTTS.cfg_scale y narrador.py).
+# Asi que se refuerza SOLO el arranque: los primeros fotogramas salen con la
+# guia en CFG_ARRANQUE y una rampa lineal la devuelve al cfg pedido en
+# CFG_ARRANQUE_FOTOGRAMAS fotogramas. Cuesta cero latencia y cero computo
+# (la guia no anade pasadas; ver PeticionTTS.cfg_scale).
+CFG_ARRANQUE = float(os.environ.get("VIBEVOICE_CFG_ARRANQUE", "4.5"))
+CFG_ARRANQUE_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_CFG_ARRANQUE_FOTOGRAMAS", "6"))
+
+
+def reforzar_guia_arranque(modelo) -> None:
+    """Envuelve sample_speech_tokens para subir la guia en los primeros
+    fotogramas de CADA generate(). Se aplica DESPUES de frenar_guia y
+    funciona igual con el freno apagado: envuelve lo que haya.
+
+    El contador se reinicia envolviendo generate(): cada peticion suelta es
+    un arranque, y en una sesion larga lo son la primera generate() y las
+    que encadena el tope de caché -- que arrancan igual de frias desde el
+    prefijo pristino, asi que tambien lo necesitan."""
+    if CFG_ARRANQUE <= 0 or CFG_ARRANQUE_FOTOGRAMAS <= 0:
+        return
+    contador = {"frame": 0}
+    muestrear = modelo.sample_speech_tokens
+    generar = modelo.generate
+
+    def generate_reiniciado(*a, **kw):
+        contador["frame"] = 0
+        return generar(*a, **kw)
+
+    def muestrear_reforzado(condition, neg_condition, cfg_scale=3.0):
+        k = contador["frame"]
+        contador["frame"] = k + 1
+        if k < CFG_ARRANQUE_FOTOGRAMAS and CFG_ARRANQUE > cfg_scale:
+            # Rampa lineal: fotograma 0 con CFG_ARRANQUE, y de vuelta al
+            # pedido al agotar la ventana. Sin escalon: el freno de guia ya
+            # normaliza la energia, pero la prosodia agradece la suavidad.
+            peso = (CFG_ARRANQUE_FOTOGRAMAS - k) / CFG_ARRANQUE_FOTOGRAMAS
+            cfg_scale = cfg_scale + (CFG_ARRANQUE - cfg_scale) * peso
+        return muestrear(condition, neg_condition, cfg_scale)
+
+    modelo.generate = generate_reiniciado
+    modelo.sample_speech_tokens = muestrear_reforzado
+    print(f"[arranque] guia reforzada al empezar: cfg {CFG_ARRANQUE} con rampa "
+          f"de {CFG_ARRANQUE_FOTOGRAMAS} fotogramas (la primera palabra ya no "
+          f"se mastica)", flush=True)
+
+
+def demorar_eos(modelo) -> None:
+    """Aplaza UN bloque el "se acabo" del clasificador cuando el modelo quiere
+    parar en mitad del decaimiento de la ultima palabra y no queda ventana de
+    donde sacar la cola. El porque y las medidas, en el bloque COLA INSISTIR.
+
+    Se envuelve `forward` del clasificador y no el objeto entero porque
+    tts_eos_classifier es un submodulo registrado: asignarle una funcion suelta
+    lo rechaza nn.Module. Envolver el forward de la instancia lo tapa igual
+    -- __call__ va a self.forward -- y deja el modulo donde estaba.
+
+    NO SE INTENTA ADIVINAR QUE LLAMADA ES LA QUE DECIDE. Upstream consulta el
+    clasificador tres veces por fotograma y solo la tercera manda; distinguirlas
+    desde aqui seria atarse a un orden que no promete nadie. En vez de eso, el
+    streamer ARMA el fotograma (RemateEOS.deja_pasar, que corre una vez por
+    fotograma y antes que las tres llamadas) y mientras esta armado se dice que
+    no hay EOS a QUIEN PREGUNTE. El presupuesto solo se gasta cuando alguna de
+    esas llamadas traia de verdad un EOS: si no, no se ha aplazado nada.
+    """
+    if COLA_INSISTIR <= 0:
+        return
+    if SOLAPAR_DECODER:
+        # Ver el bloque COLA INSISTIR: con el decodificador en otro hilo el
+        # pico del "ultimo fotograma" puede ir por detras, y decidir con el
+        # fotograma equivocado es peor que no decidir.
+        print("[arranque] cola insistente desactivada: el decodificador va "
+              "solapado y el pico del ultimo fotograma llegaria tarde",
+              flush=True)
+        return
+    clasificador = getattr(modelo, "tts_eos_classifier", None)
+    if clasificador is None:
+        print("[aviso] no hay tts_eos_classifier: la cola insistente no se "
+              "instala (revisa si upstream lo renombro)", flush=True)
+        return
+    real = clasificador.forward
+
+    def forward(*a, **kw):
+        logits = real(*a, **kw)
+        if not _REMATE["armado"]:
+            return logits
+        if float(torch.sigmoid(logits.detach()).reshape(-1)[0]) > 0.5:
+            # Esta si traia EOS: el presupuesto se gasta aqui y no antes.
+            # OJO: `armado` NO se baja aqui. Las tres llamadas del fotograma
+            # tienen que ver lo mismo, y la que decide es la ultima: bajarlo
+            # en la primera dejaba pasar el EOS de verdad por la tercera. Lo
+            # vuelve a calcular deja_pasar en el fotograma siguiente, y ahi ya
+            # se encuentra el presupuesto gastado.
+            _REMATE["aplazados"] += 1
+            print(f"[sesion] EOS en el ultimo latente del bloque con el "
+                  f"fotograma aun sonando (pico {_REMATE['pico']:.3f}): se "
+                  f"pide un bloque mas para la cola", flush=True)
+        # Muy negativo: sigmoid(-10) = 4,5e-5, o sea "no hay EOS". El bloque
+        # siguiente vuelve a preguntar y ese ya pasa.
+        return torch.full_like(logits, -10.0)
+
+    clasificador.forward = forward
+    print(f"[arranque] cola insistente: hasta {COLA_INSISTIR} bloque(s) de mas "
+          f"si el EOS cae con la voz por encima de {COLA_FINAL_PICO} "
+          f"(la ultima palabra ya no se corta a mitad)", flush=True)
+
+
+# ------------------------------------------- la rama incondicional, agrupada --
+# UNA pasada del backbone cada N latentes en la rama negativa del CFG.
+#
+# EL HALLAZGO: el bucle de Microsoft llama a tts_language_model DOS VECES por
+# fotograma acustico. Una con el contexto real y otra con la secuencia
+# negativa -- que arranca de un solo <|image_pad|> y NUNCA recibe texto, solo
+# los latentes ya generados. Medido con GET /crono en la VM, dentro de una
+# tanda real de 12 clips (684 fotogramas):
+#
+#   backbone (tts_lm)     1445 llamadas   45,7 ms cada una   77 % del reloj
+#   cabeza de difusion    4104 llamadas    2,7 ms            13 %
+#   decodificador          684 llamadas   93,6 ms      SOLAPADO, fuera del
+#                                                      camino critico
+#   contrapresion del decodificador: 0,02 % -> el bucle NUNCA le espera
+#
+# 1445/684 = 2,11 pasadas de backbone por fotograma. Una de cada dos es la
+# incondicional, y cuesta lo mismo que la buena.
+#
+# LA APUESTA ERA que agrupar N fotogramas en UNA pasada de N tokens saldria
+# casi gratis, porque el coste del modelo serian sus 156 MB de pesos y no la
+# longitud de la secuencia. MEDIDO, NO SE CUMPLE: una pasada de dos tokens
+# cuesta 35,3 ms frente a los 20,0 de una de uno, o sea 1,77x. Este backbone
+# esta limitado por COMPUTO, no por memoria, y por eso agrupar apenas ahorra.
+#
+#   neg_cada   RTF     WER medio   audio generado
+#      1       0,940     12,7 %      referencia
+#      2       0,914     15,2 %      +7,9 % mas largo
+#      3       0,911       --        +7,6 % mas largo
+#
+# Un 2,6 % de RTF a cambio de 2,5 puntos de WER y locuciones un 8 % mas largas
+# -- la condicion negativa desfasada retrasa el fin de frase. NO COMPENSA, y
+# por eso el defecto es 1. Se deja la palanca porque el diagnostico (dos
+# pasadas de backbone por fotograma) vale mas que el resultado, y porque en
+# una CPU con VNNI, donde el computo dejaria de mandar, la cuenta podria
+# salir distinta.
+#
+# 1 = comportamiento original bit a bit.
+NEG_CADA = int(os.environ.get("VIBEVOICE_NEG_CADA", "1"))
+
+
+def marcar_rama_condicional(modelo) -> None:
+    """Le pone la marca `_positivo` a la cache de la rama CONDICIONAL.
+
+    Sin esto TtsLmOV no puede distinguir las dos ramas: a ambas les llega una
+    pasada de un token con su propia cache. La marca sale del unico dato que
+    las separa de verdad -- `tts_text_masks` con algun 1, o sea tokens de
+    texto, que la rama negativa no ve jamas.
+
+    La primera llamada de cada generate() con texto va ANTES que cualquier
+    llamada negativa (ver el bucle de generate en
+    modeling_vibevoice_streaming_inference.py), asi que para cuando la negativa
+    aparece la condicional ya esta marcada y no hay ambiguedad.
+
+    Se instala SIEMPRE, tambien con NEG_CADA=1: cuesta un `.max()` sobre un
+    tensor de un elemento por pasada y es lo que permite mover el agrupado por
+    peticion (PeticionTTS.neg_cada) sin reiniciar el servicio. Medir cambiando
+    variables de entorno ya salio caro una vez en este proyecto -- el modulo de
+    Nix las fija en el servicio y pisa las del gestor.
+    """
+    original = modelo.forward_tts_lm
+
+    def forward_tts_lm_marcado(*a, **kw):
+        mascara = kw.get("tts_text_masks")
+        salida = original(*a, **kw)
+        if mascara is not None and bool(mascara.max()):
+            cache = getattr(salida, "past_key_values", None)
+            if cache is not None:
+                try:
+                    cache._positivo = True
+                except AttributeError:
+                    pass            # cache de torch: el agrupado no aplica
+        return salida
+
+    modelo.forward_tts_lm = forward_tts_lm_marcado
+    if NEG_CADA > 1:
+        print(f"[arranque] rama incondicional agrupada: una pasada del backbone "
+              f"cada {NEG_CADA} fotogramas", flush=True)
+
+
+# ---------------------------------------------------- latentes a examen --
+# Mirilla directa al bucle de realimentacion: el latente que devuelve
+# sample_speech_tokens vuelve al modelo como contexto del paso siguiente
+# (acoustic_connector), y la sospecha de "el audio se degrada segun avanza
+# la locucion" apunta justo ahi. Medir el audio de rebote (RMS, WER por
+# tramos) ya fallo dos veces; esto mira la causa: una fila por fotograma
+# con la norma, la media y la desviacion del propio latente.
+RUTA_LATENTES = os.environ.get("VIBEVOICE_LATENTES_CSV", "")
+
+
+def instrumentar_latentes(modelo) -> None:
+    """Si VIBEVOICE_LATENTES_CSV apunta a un fichero, cada latente acustico
+    deja una fila CSV: generacion, fotograma, norma L2, media, desviacion.
+    Sin la variable no se toca nada -- cero coste en produccion.
+
+    ENVUELVE en vez de editar: sample_speech_tokens puede ser la de upstream
+    O la copia con freno de frenar_guia (con VIBEVOICE_FRENO_GUIA=0 no se
+    sustituye), y asi se miden las dos tal cual son. El contador de
+    generaciones se lleva envolviendo generate(): cada peticion suelta es una
+    generacion nueva, y una sesion larga es UNA (o varias si salta el tope de
+    caché), que es exactamente la distincion que interesa comparar."""
+    if not RUTA_LATENTES:
+        return
+    estado = {"gen": 0, "frame": 0}
+    muestrear = modelo.sample_speech_tokens
+    generar = modelo.generate
+
+    def generate_contado(*a, **kw):
+        estado["gen"] += 1
+        estado["frame"] = 0
+        return generar(*a, **kw)
+
+    def muestrear_medido(condition, neg_condition, cfg_scale=3.0):
+        lat = muestrear(condition, neg_condition, cfg_scale)
+        v = lat.detach().float()
+        estado["frame"] += 1
+        with open(RUTA_LATENTES, "a") as f:
+            f.write(f"{estado['gen']},{estado['frame']},"
+                    f"{float(v.norm()):.6f},{float(v.mean()):.6f},"
+                    f"{float(v.std()):.6f}\n")
+        return lat
+
+    modelo.generate = generate_contado
+    modelo.sample_speech_tokens = muestrear_medido
+    print(f"[arranque] latentes a {RUTA_LATENTES} (norma, media, desviacion "
+          f"por fotograma)", flush=True)
 
 
 class ConvDepthwiseRapida(torch.nn.Module):
@@ -670,6 +1412,72 @@ app.add_middleware(
 )
 
 
+class RemateEOS:
+    """El trocito de estado que conserva la COLA de la locucion.
+
+    Lo usan por composicion los dos streamers -- el de /tts/stream y el de las
+    sesiones --, porque el fallo es el mismo en los dos y el arreglo tambien:
+    el clasificador de EOS dispara DESPUES de emitir su fotograma y el bucle de
+    6 latentes sigue dando audio que se estaba tirando. Ver el bloque COLA
+    FINAL de arriba, con la medida.
+
+    Dos reglas y ninguna mas:
+      - el `end(indices)` del clasificador NO cierra: solo levanta la bandera;
+        el que cierra es el `end()` sin indices que generate() hace siempre al
+        salir del bucle (y, si algo revienta, el `finally` de quien sintetiza).
+      - tras el EOS pasan como mucho `cuantos` fotogramas, y se para en cuanto
+        uno de ellos ya es suelo de sala: ese entra -- para aterrizar en
+        silencio y no en mitad del decaimiento -- y los siguientes no.
+    """
+
+    __slots__ = ("cuantos", "pico", "visto", "emitidos", "aterrizado")
+
+    def __init__(self, cuantos: int = None, pico: float = None):
+        self.cuantos = max(0, COLA_FINAL if cuantos is None else int(cuantos))
+        self.pico = COLA_FINAL_PICO if pico is None else float(pico)
+        self.visto = False        # el clasificador ya dijo "se acabo"
+        self.emitidos = 0         # fotogramas de cola emitidos desde entonces
+        self.aterrizado = False   # ya se llego a suelo de sala: no queda cola
+
+    def retener_cierre(self, indices) -> bool:
+        """True si este end() es el del clasificador y hay que aguantarlo."""
+        if indices is None or self.visto or self.cuantos <= 0:
+            return False
+        self.visto = True
+        return True
+
+    def deja_pasar(self, trozo) -> bool:
+        """True si este fotograma todavia debe emitirse. Antes del EOS, todos.
+
+        De paso lleva la cuenta de fotogramas y apunta el pico de este en
+        _REMATE, y ARMA el aplazamiento del EOS cuando toca (ver el bloque
+        COLA INSISTIR): esto corre una vez por fotograma acustico y justo
+        antes de las llamadas al clasificador de ese fotograma, que es lo que
+        lo hace el sitio bueno para decidirlo. Cuesta un abs().max() sobre
+        3200 muestras, nada al lado de los 133 ms que cuesta generarlo."""
+        pico = float(trozo.detach().abs().max())
+        _REMATE["pico"] = pico
+        _REMATE["fotogramas"] += 1
+        # Ultimo latente del bloque de 6 y la voz todavia sonando: si el modelo
+        # decide parar AQUI no queda ni un fotograma de la ventana para la
+        # cola. Se arma para este fotograma y solo para este.
+        _REMATE["armado"] = (
+            COLA_INSISTIR > 0
+            and _REMATE["aplazados"] < COLA_INSISTIR
+            and _REMATE["fotogramas"] % LATENTES_VENTANA == 0
+            and pico >= COLA_FINAL_PICO)
+        if not self.visto:
+            return True
+        if self.aterrizado or self.emitidos >= self.cuantos:
+            return False
+        self.emitidos += 1
+        if pico < self.pico:
+            # Suelo de sala: la palabra ya termino de apagarse. Este entra
+            # (es el silencio en el que aterriza la locucion) y se cierra.
+            self.aterrizado = True
+        return True
+
+
 class StreamerCancelable:
     """Envuelve AsyncAudioStreamer anadiendo cancelacion cooperativa.
 
@@ -680,13 +1488,17 @@ class StreamerCancelable:
     cliente que se va dejaria la CPU 20 s generando audio para nadie.
     """
 
-    def __init__(self):
+    def __init__(self, cola_final: int = None):
         from vibevoice.modular import AsyncAudioStreamer
         self.interno = AsyncAudioStreamer(batch_size=1, stop_signal=None)
         self.cancelado = False
         # generate() ya cerro el flujo por su cuenta. Lo que llegue despues
         # sobra, pero NO es que el cliente se haya ido.
         self.terminado = False
+        # La cola de la ultima palabra (ver el bloque COLA FINAL). Ojo: ahora
+        # `terminado` se pone unos fotogramas MAS TARDE que el EOS, que es
+        # justo de lo que se trata.
+        self.remate = RemateEOS(cola_final)
 
     def put(self, trozos, indices):
         # Solo aborta si el que se fue es el CLIENTE.
@@ -702,9 +1514,20 @@ class StreamerCancelable:
         # de 6, que es 1 de cada 6. De ahi que pareciera aleatorio.
         if self.cancelado and not self.terminado:
             raise GeneracionCancelada()
+        if self.terminado:
+            return
+        # batch_size 1: un solo trozo por llamada, y su indice es siempre 0.
+        if not self.remate.deja_pasar(trozos[0]):
+            return
         self.interno.put(trozos, indices)
 
     def end(self, indices=None):
+        # El EOS del clasificador no cierra: quedan por bajar los fotogramas en
+        # los que se apaga la ultima palabra. Cierra el end() sin indices que
+        # generate() hace al salir del bucle -- o el `finally` de _sintetizar,
+        # que tambien llama sin indices.
+        if self.remate.retener_cierre(indices):
+            return
         self.terminado = True
         self.interno.end(indices)
 
@@ -721,12 +1544,32 @@ def _ajustar_pasos(pasos: Optional[int]) -> None:
     _estado["pasos_ahora"] = quiere
 
 
-def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
+def _ajustar_neg_cada(cada: Optional[int]) -> None:
+    """Agrupado de la rama incondicional, por peticion. Con el candado tomado.
+
+    Se toca el atributo del backbone y no una variable de entorno A PROPOSITO:
+    el modulo de Nix fija las variables en la unidad de systemd y pisa las que
+    ponga quien lance el banco, asi que medir cambiando el entorno da cuatro
+    audios identicos y una tarde perdida. Esto es un parametro de la peticion,
+    y el md5 lo delata si no ha hecho efecto."""
+    lm = getattr(getattr(_estado.get("modelo"), "model", None),
+                 "tts_language_model", None)
+    if lm is None or not hasattr(lm, "neg_cada"):
+        return
+    lm.neg_cada = max(1, NEG_CADA if cada is None else cada)
+
+
+def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None,
+                neg_cada=None):
     """Cuerpo sincrono de la sintesis; corre en un hilo del executor."""
     procesador = _estado["procesador"]
+    solapado = _estado.get("solapado")
+    if solapado is not None and streamer is not None:
+        streamer = StreamerSolapado(solapado, streamer)
     try:
         with _candado_modelo:
             _ajustar_pasos(pasos)
+            _ajustar_neg_cada(neg_cada)
             # Antes de generar, no despues: el ruido se sortea dentro de
             # generate().
             if semilla is not None:
@@ -739,6 +1582,10 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
             )
             if EN_GPU:
                 entradas = a_dispositivo(entradas)
+            reloj = time.perf_counter()
+            # El estado del remate es por generate(): en que latente del bloque
+            # va, como sono el ultimo fotograma y si ya se aplazo el EOS.
+            remate_cero()
             with torch.no_grad():
                 _estado["modelo"].generate(
                     **entradas,
@@ -754,6 +1601,8 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
                     all_prefilled_outputs=copy.deepcopy(base),
                     audio_streamer=streamer,
                 )
+            CRONO_TUBERIA["generate"] += time.perf_counter() - reloj
+            CRONO_TUBERIA["generaciones"] += 1
     except GeneracionCancelada:
         # Se avisa: cuando esto salta por error, callarlo cuesta horas.
         print("[aviso] generacion cancelada por el cliente", flush=True)
@@ -767,9 +1616,16 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None):
     finally:
         # Pase lo que pase, cierra la cola: sin esto un fallo dentro de
         # generate() dejaria al consumidor esperando un trozo que no llega.
-        # end() es idempotente.
+        # end() es idempotente. StreamerSolapado.end() ademas drena el worker,
+        # asi que al salir de aqui no queda audio a medio decodificar.
         if streamer is not None:
             streamer.end()
+        elif solapado is not None:
+            # Calentamiento: no hay streamer que drene por su cuenta, pero el
+            # worker si tiene trabajo encolado y la siguiente sintesis no debe
+            # encontrarselo a medias.
+            with contextlib.suppress(Exception):
+                solapado.drenar()
 
 
 # --------------------------------------------------------------------------
@@ -860,6 +1716,442 @@ CADUCIDAD_SESION = float(os.environ.get("VIBEVOICE_CADUCIDAD_SESION", "300"))
 # locucion por terminada. Es el margen que tiene el LLM de arriba para producir
 # la frase siguiente sin que se cierre la locucion.
 ESPERA_TEXTO = float(os.environ.get("VIBEVOICE_ESPERA_TEXTO", "20"))
+# Cuantas posiciones puede seguir pidiendo generate() MAS ALLA del final del
+# texto sellado antes de darlo por descarrilado (EOS que no llega). El margen
+# es MARGEN_EOS + MARGEN_EOS_FACTOR * (tokens sellados), y la parte
+# proporcional NO es prudencia de mas: es la fisica del bucle.
+#
+# generate() LEE texto a ritmo fijo -- 5 tokens por ventana de 6 latentes,
+# o sea 6,25 tokens por segundo de audio -- pero la voz DICE unos 4,7-5
+# tokens por segundo (medido: 291 tokens en 57,3-63,2 s segun semilla). Si el
+# texto entra mas deprisa de lo que se habla (un LLM rapido, o todo de golpe),
+# la lectura se adelanta y al agotarse el texto quedan por DECIR unos
+# 0,25-0,36 tokens de cada uno: con 291 tokens, el EOS legitimo llego con
+# exceso 67-104 (6 semillas). ESO ERA LO QUE EL MARGEN FIJO DE 100 NO SABIA:
+# guillotinaba locuciones legitimas a mitad de la ultima frase en cuanto el
+# texto pasaba de ~300 tokens o la voz iba algo lenta -- la semilla 1 lo
+# reproduce determinista, cortada en "...hasta la" con el final sin decir, y
+# las transcripciones rellenan el corte con una palabra inventada ("hasta la
+# proxima"), que es justo el sintoma que se achacaba al modelo. Un descarrile
+# de verdad es OTRA escala: 766 posiciones de mas (2,3x el texto) y seguia
+# (2026-08-05). Con margen 30 + 1,0x texto, esa locucion de 330 tokens se
+# corta en el exceso 360 en vez de en el 3000 del tope, y ninguna legitima
+# (maximo medido 0,36x + lookahead) se acerca al umbral.
+MARGEN_EOS = int(os.environ.get("VIBEVOICE_MARGEN_EOS", "30"))
+MARGEN_EOS_FACTOR = float(os.environ.get("VIBEVOICE_MARGEN_EOS_FACTOR", "1.0"))
+# Desde donde se RETIENE el audio en vez de emitirlo (ver ColaAudioSesion):
+# pasado este exceso, un EOS legitimo es ya poco probable (medido: llegan con
+# exceso <= 0,36x el texto) y lo que se genere solo se suelta si el EOS acaba
+# llegando. Por debajo NO se retiene nada: retener desde que el texto se agota
+# seria estrangular el remate legitimo -- esos 0,3x tokens aun por decir son
+# 10-15 s de locucion normal y el oyente los esta escuchando en directo.
+RETENER_FACTOR = float(os.environ.get("VIBEVOICE_RETENER_FACTOR", "0.5"))
+
+# Tramo FINAL de puntuacion de un trozo. Es lo que el pretokenizador de Qwen2
+# puede fundir con un "\n" posterior (".\n" es un token), asi que se retiene
+# hasta saber que viene detras; ver SesionViva.alimentar(). \w en vez de
+# \p{L}\p{N} deja fuera el "_", que en texto hablado no aparece.
+_COLA_PUNTUACION = re.compile(r"[^\s\w]+$")
+
+# EL RESPIRO: PAUSA DE VERDAD EN CADA PUNTO, Y SOLO EN LOS PUNTOS
+#
+# Con los trozos cosidos con espacio el texto es fiel, pero el modelo lee los
+# puntos como si fueran comas: medido (Mac, mps, sp-Spk1_man, cfg 3.5, texto de
+# 10 frases, 3 semillas), la pausa tras punto es 0,34-0,36 s de media y tras
+# coma 0,27-0,34 s -- LA MISMA. No hay jerarquia y la locucion suena sin aire.
+# Y no es el volumen ni el tono: el RMS por sextos es plano (+-0,9 dB) y el F0
+# no cae. Es solo la estructura de pausas.
+#
+# Se probo alargar la pausa del punto CON UN MARCADOR DE TEXTO y no hay ninguno
+# que salga barato. Medido en la VM (i7-8700T, openvino, 6 frases x 3 semillas,
+# sp-Spk3_man, cfg 4.5, 6 pasos), cambiando SOLO el separador entre frases:
+#
+#   separador        genera  callado   se oye   RTF que ve el reproductor
+#   " "              14,80 s   2,09 s  14,51 s   1,043
+#   "  "             15,24 s   2,09 s  14,98 s   1,108
+#   " — "            14,76 s   1,91 s  14,53 s   1,108
+#   "\t"             15,16 s   2,27 s  14,89 s   1,096
+#   "… "             15,16 s   1,91 s  14,89 s   1,085
+#   "; "             14,71 s   2,04 s  14,58 s   1,096
+#   "\n"             20,27 s   6,36 s  16,22 s   1,311
+#   "\n\n"           20,13 s   6,27 s  15,87 s   1,334
+#
+# Solo "\n" y "\n\n" pausan. Y pausan porque el modelo ejecuta ahi su parada de
+# FIN DE LOCUCION -- ".\n" (token 624) es exactamente con lo que termina toda
+# locucion --, de duracion loca (0,2-3,2 s) y a precio completo: un fotograma
+# callado cuesta lo mismo de generar que uno de habla. El resto de separadores
+# se comportan como el espacio: el modelo los ignora.
+#
+# ESA ERA LA VERSION ANTERIOR DE ESTE BLOQUE, Y ERA UN MAL NEGOCIO
+# Cosia "\n\n" tras cada punto y luego RECORTABA el silencio sobrante. El texto
+# quedaba bien y la pausa caia en su sitio, pero se pagaban 4,2 s de CPU por
+# 4,2 s de silencio que acto seguido se tiraban a la basura. Medido el 7 de
+# agosto en la VM, mismo texto, misma semilla, mismo motor:
+#
+#                                    audio que sale   pared    RTF
+#   /tts/stream " ".join                   15,20 s   15,18 s  0,999
+#   sesion, costura de espacio             15,20 s   15,86 s  1,044
+#   sesion, "\n\n" + recorte (lo viejo)    15,61 s   22,86 s  1,464
+#
+# La sesion NO era mas lenta: generaba los mismos 21,9 s de audio que
+# /tts/stream con "\n\n".join (22,94 s de pared, RTF 1,049) y entregaba 15,61.
+# El +40 % de RTF era exactamente el audio descartado, y por eso el reproductor
+# se quedaba seco y se oian microcortes.
+#
+# EL ARREGLO: LA PAUSA NO SE GENERA, SE INSERTA
+# El modelo YA pausa en los finales de frase con costura de espacio; lo que no
+# hace es pausar LO BASTANTE, ni siempre. Y se comprobo DONDE pausa: se parte
+# el audio por las rachas de silencio y se transcribe cada trozo (3 semillas,
+# 6 frases). NI UNA de las pausas cae dentro de una frase -- todas caen en un
+# final de frase; lo que falla es que se salta algunas (3-4 de 5). Asi que
+# alargar la pausa que el modelo YA hizo no puede meter aire donde no toca,
+# que era el fallo historico (0,86 s tras coma cuando el "\n" iba en cada
+# costura de trozo, cayera donde cayera).
+#
+#   1. TEXTO: costura con ESPACIO, siempre. Los ids son entonces identicos a
+#      los de " ".join, asi que el HABLA es bit a bit la de /tts/stream. Eso no
+#      es un parecido: es la garantia de calidad mas fuerte que hay aqui, y la
+#      comprueba scripts/ws_fidelidad.py por md5.
+#   2. AUDIO: cuando una racha de fotogramas callados llega a
+#      RESPIRO_FOTOGRAMAS -- el modelo esta pausando --, se anaden
+#      RESPIRO_ALARGA fotogramas mas del MISMO suelo de sala.
+#
+# EL UMBRAL DE DETECCION Y EL TOPE SON DOS NUMEROS DISTINTOS, y antes eran uno
+# solo. Con "\n\n" las pausas eran de 5 a 24 fotogramas y el mismo 3 servia
+# para "esto es una pausa" y para "de aqui en adelante se recorta". Con costura
+# de espacio las pausas del modelo son de 2 a 6 fotogramas: un umbral de 3 no
+# dispara en las frases cortas -- medido con las 3 frases de ws_fidelidad, el
+# modelo pausa 2 fotogramas y no se insertaba NADA -- y un tope de 3 recorta
+# aire legitimo que ya se ha pagado. Asi que:
+#
+#   RESPIRO_FOTOGRAMAS = 2   el modelo esta pausando: aqui se inserta el aire
+#   RESPIRO_TOPE       = 8   maximo de callados que se emiten: aqui se recorta
+#
+# Y de paso sale una jerarquia que antes no habia: la pausa que el modelo hace
+# corta (una coma, 2 fotogramas) queda en 4, y la larga (un punto, 4-6) queda
+# en 6-8. El modelo decide DONDE y cuanto; esto solo suma.
+#
+# EL TOPE ALTO ADEMAS MEJORA LA CALIDAD. El recorte solo puede quitar audio, y
+# el fotograma de la costura lleva dentro el ataque de la palabra siguiente
+# (ver mas abajo): cuanto menos se recorte, menos ocasiones de comerselo. Con
+# el tope en 8 no se llega a recortar en una locucion normal.
+#
+# EL RELLENO ES EL PROPIO FOTOGRAMA, EN ESPEJO. Repetirlo tal cual metia un
+# escalon en el empalme y una periodicidad de 7,5 Hz; darle la vuelta no: el
+# fotograma invertido EMPIEZA por la ultima muestra del original, asi que el
+# empalme es continuo por construccion, y alternando invertido/original la
+# cadena entera lo es. Medido sobre el WAV: el salto maximo entre muestras
+# consecutivas es 0,1477 con alargue y 0,1477 sin el -- el mismo numero, o sea
+# que no se anade ni una discontinuidad.
+#
+# MEDIDO (misma locucion de 15,18 s de pared, transcrita con whisper.cpp):
+#   alargue   se oye    RTF     racha en el punto   WER
+#     0       15,07 s  1,008    3 fot (0,40 s)      6,5 %
+#     1       15,60 s  0,973    4 fot (0,53 s)      4,3 %
+#     2       16,13 s  0,941    5 fot (0,67 s)      4,3 %
+#     3       16,67 s  0,911    6 fot (0,80 s)      6,5 %
+# (el WER se mueve por ruido de whisper: el habla es la MISMA en las cuatro).
+#
+# Y el aire no solo es gratis: DA MARGEN. Cada fotograma insertado son 133 ms
+# que el reproductor gana para rellenar el bufer, que es justo lo que hace un
+# humano al respirar entre frases. De ahi que el defecto sea 2 y no 1.
+#
+# LO QUE ESTO NO ARREGLA: si el modelo decide no pausar en una frontera, ahi
+# no hay donde insertar. Se busco un ancla independiente y no la hay -- el
+# clasificador de EOS es plano (p < 0,001) en todas las fronteras internas, y
+# la posicion de LECTURA del texto no sirve porque va por delante del habla en
+# una cantidad variable (~0,3x el texto). La alternativa era cortar la locucion
+# en cada frase para saber donde cae la frontera, y sale igual de cara: medido,
+# una generate() por frase cuesta RTF 1,172 frente a 1,060 con una sola
+# (1,2 s de pared por cada corte, que es lo mismo que costaba el "\n\n").
+#
+# La referencia historica: 7,27 s callado con "\n" en toda costura (el fallo),
+# 2,51 s cosiendo con espacio (sin aire). El punto medio es esto, y ahora es
+# gratis.
+#
+# LO QUE NO SE PUEDE RECORTAR ES EL FOTOGRAMA ENTERO (2026-08-06)
+# La primera version tiraba el fotograma completo cuando su RMS medio bajaba
+# del umbral, con la idea de que el silencio y el habla no se solapan. NO ES
+# CIERTO, y se midio: 29 locuciones, 6 voces en espanol, 3 semillas, 2 textos,
+# 400 s de audio, fotograma a fotograma.
+#
+#   suelo de sala   RMS  p50 0,00073   p99 0,00503   MAX 0,00554
+#   habla           RMS  MIN 0,00185   p1  0,00504   p50 0,055
+#
+# Es decir: el suelo LLEGA a 0,0055 y hay habla en 0,0018. Con la media de
+# 133 ms las dos poblaciones se pisan y NINGUN umbral las separa (el mejor
+# posible deja 13 fotogramas mal clasificados). El motivo es de bulto: el
+# fotograma de la COSTURA es medio silencio y medio palabra -- el ataque de
+# la primera palabra tras la pausa entra a los 70-120 ms de sus 133 --, asi
+# que su media queda en 0,003-0,0045 y el recorte se llevaba el ataque
+# entero. Medido en las mismas 29 locuciones: 9 de las 54 costuras (17 %)
+# perdian el arranque de la palabra, y la muestra mas fuerte que se tiraba
+# llegaba a |x| = 0,145 -- a -17 dBFS eso no es suelo de sala, es la voz.
+# El WER no lo ve (2,5 % con recorte contra 3,0 % sin el: whisper rellena la
+# consonante que falta), pero se oye como que "el audio se corta un poco".
+#
+# EL ARREGLO: decidir con el PICO, y recortar solo la CABEZA callada.
+# La amplitud de pico del fotograma si separa las dos cosas en la costura,
+# con un hueco vacio entre medias:
+#
+#   costuras que son silencio de verdad   pico |x| <= 0,0185
+#   costuras que llevan el ataque dentro  pico |x| >= 0,0406
+#
+# RESPIRO_PICO = 0,03 cae en ese hueco. Un fotograma por debajo se tira
+# entero, como antes; uno por encima NO se tira: se emite desde justo antes
+# de su primera muestra fuerte (con RESPIRO_PRERROLLO de margen para no
+# cortar la rampa del ataque) y se recorta solo el silencio de delante,
+# ~84 ms de media. El contador de callados NO se rearma al rescatar: la
+# pausa sigue midiendo lo mismo, que es justo lo que este bloque vino a
+# arreglar. En habla floja continuada (RMS bajo el umbral pero con picos)
+# la primera muestra fuerte llega antes del prerrollo, asi que el fotograma
+# sale entero y no se recorta nada.
+#
+# MEDIDO en el mismo corpus, antes y despues:
+#   recorte total        34,27 s -> 33,67 s (de 400 s: el aire no cambia)
+#   pico max descartado  0,1452 -> 0,0290  (deja de tirarse voz)
+#   costuras con ataque perdido  9/54 -> 0/54
+#
+# EL AIRE NO ERA SUELO DE SALA: ERA EL ATAQUE DE LA PALABRA SIGUIENTE, Y AL
+# REVES (2026-08-15)
+#
+# EL SINTOMA, textual: "la respiracion entre cada frase es algo que no es muy
+# realista, me da un poco de risa porque lo lee muy raro".
+#
+# Y no era una impresion. El fotograma que se repetia en espejo NO es suelo de
+# sala: es el fotograma de la COSTURA, y este bloque ya sabia desde el 6 de
+# agosto que ahi dentro esta el ataque de la palabra siguiente -- por eso el
+# recorte del tope decide con el PICO y no con la media. Lo que no se hizo fue
+# aplicar esa misma prueba al ALARGUE. Medido sobre la locucion de 6 frases con
+# la que se vio el fallo (sp-Spk1_man, semilla 11, 3 pausas), fotograma a
+# fotograma:
+#
+#   fotograma copiado   rms      pico     centro temporal de la energia
+#   pausa 1 (fot 21)    0,00507  0,03522  0,929
+#   pausa 2 (fot 42)    0,00504  0,03223  0,915
+#   pausa 3 (fot 62)    0,00175  0,00739  0,352
+#   suelo de sala de verdad (interior de una pausa que el modelo GENERA con
+#   "\n\n")             0,00188  0,00674  ~0,5
+#
+# Centro temporal 0,93 quiere decir que casi toda la energia del fotograma esta
+# en su ULTIMO decimo. Y la envolvente por bloques de 10 ms lo remata: los
+# primeros 110 ms van entre -56 y -64 dBFS (eso si es suelo) y los ultimos 20
+# suben a -47,9 y -37,3. Eso es el arranque de una palabra, no una respiracion.
+# Su pico llega a 0,0352, por ENCIMA del RESPIRO_PICO = 0,03 con el que este
+# mismo bloque decide "aqui dentro hay voz".
+#
+# Asi que lo que se emitia en cada final de frase era, literalmente:
+#   1. el fotograma entero -> el arranque de la palabra, 20 ms
+#   2. ese mismo fotograma INVERTIDO -> el arranque, del reves (empieza a
+#      -37,7 dBFS y se apaga en 10 ms: un golpe seco que se traga)
+#   3. el fotograma otra vez -> el arranque, por segunda vez
+#   4. y ahora si, la palabra
+# Tres golpes de energia separados 133 ms = una modulacion de 7,5 Hz. La misma
+# periodicidad que el espejo venia a evitar, pero con el ataque dentro. Por eso
+# "lo lee muy raro": es un tartamudeo con un chasquido al reves en medio.
+#
+# EL ESPEJO NO ERA EL CULPABLE, LO ERA EL MATERIAL. Sobre ruido plano el espejo
+# no tiene nada que invertir; sobre una rampa de 25 dB, si. Y la comprobacion
+# que daba luz verde -- "el salto maximo entre muestras no cambia" -- media
+# continuidad de MUESTRA, que el espejo garantiza por construccion, y no
+# continuidad de ENVOLVENTE, que es lo que oye el oido.
+#
+# EL ARREGLO: EL SUELO DE VERDAD, Y DELANTE DEL ATAQUE
+#   1. El fotograma se parte por el PIE del ataque (_partir_pausa): la cabeza
+#      callada por un lado y el ataque con su rampa por el otro.
+#   2. El aire se hace SOLO con la cabeza (_aire_de_pausa), en espejo alternado
+#      como siempre -- ahora sobre ruido plano, donde el espejo es inocuo.
+#   3. Y se mete ENTRE las dos: cabeza, aire, ataque. La palabra ya no se parte.
+#
+# MEDIDO sobre la misma locucion, con el aire insertado bajo la lupa
+# (scripts/deriva/pausas/): golpes = arranques de energia por encima de
+# -45 dBFS dentro del aire; rango = recorrido de la envolvente dentro del aire;
+# eco = cuanto suenan los 30 ms de DELANTE del aire por encima del aire (o sea,
+# ataque abandonado al otro lado de la pausa); mod = modulacion a 7,5 Hz.
+#
+#   variante                          golpes  rango   eco    mod   salto
+#   sin aire (referencia)                  -      -     -      -   0,0000
+#   espejo del fotograma entero, detras    4   30,1  +6,3   3,27   0,0022
+#   suelo de verdad, detras                0    8,2  +19,4  2,58   0,0236
+#   suelo de verdad, delante  <- ESTO      0   11,8   -2,0  1,06   0,0015
+#   silencio digital, delante              0  186,5  +6,4  16,17   0,0049
+#
+# El habla no cambia en ninguna: quitando los fotogramas de suelo, lo que queda
+# es muestra a muestra el de /tts/stream con " ".join.
+#
+# EL SILENCIO DIGITAL SE DESCARTO POR MEDIDA, no por gusto: dejar 267 ms a cero
+# entre frases abre un agujero en el suelo de sala (recorrido de 186 dB, y una
+# modulacion de 16 dB a 7,5 Hz) que suena a puerta de ruido abriendo y cerrando.
+# La grabacion de una persona en una sala no calla a cero; el modelo tampoco.
+#
+# VIBEVOICE_RESPIRO=0 lo apaga (ni alargue ni recorte: el audio sale bit a bit
+# como el de /tts/stream con " ".join), y cada sesion puede pedirlo o
+# rechazarlo con el campo `respiro`. El umbral y el tope tienen mando por si
+# otra voz tiene un suelo de ruido distinto.
+RESPIRO_ACTIVO = os.environ.get("VIBEVOICE_RESPIRO", "1") not in ("0", "no")
+# Callados SEGUIDOS a partir de los cuales se da por hecho que el modelo esta
+# pausando y se le mete el aire. 2 y no 1 porque un solo fotograma flojo lo da
+# tambien una oclusiva (la /p/ de "pendientes" deja 133 ms casi mudos) y ahi
+# no hay pausa ninguna: alargarlo partiria la palabra.
+RESPIRO_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_RESPIRO_FOTOGRAMAS", "2"))
+# Fotogramas de suelo de sala que se INSERTAN ahi: el aire de la frase, que ya
+# no se le pide al modelo. 0 deja solo el recorte. Cada uno son 133 ms de pausa
+# y 133 ms de margen para el bufer del reproductor; ver la tabla de arriba.
+RESPIRO_ALARGA = int(os.environ.get("VIBEVOICE_RESPIRO_ALARGA", "2"))
+# Callados seguidos que se emiten como mucho. Es la red de seguridad contra una
+# pausa desbocada -- un cliente que meta "\n\n" en su propio texto se lleva las
+# de 24 fotogramas del modelo --, no el regulador de la pausa normal: con
+# costura de espacio no se llega.
+RESPIRO_TOPE = int(os.environ.get("VIBEVOICE_RESPIRO_TOPE", "8"))
+RESPIRO_UMBRAL = float(os.environ.get("VIBEVOICE_RESPIRO_UMBRAL", "0.006"))
+# Cada cuanto mira el websocket si el modelo se quedo sin texto por delante.
+# Es tiempo que el modelo pasa PARADO esperando que se le pida mas; ver
+# sesion_ws.vigilar() para la medida.
+PERIODO_VIGIA = float(os.environ.get("VIBEVOICE_PERIODO_VIGIA", "0.01"))
+# Amplitud de pico por encima de la cual un fotograma NO se tira aunque su
+# media diga "callado": lleva senal dentro. Con 0 se vuelve al recorte de
+# fotograma entero de la primera version (y a comerse los ataques).
+RESPIRO_PICO = float(os.environ.get("VIBEVOICE_RESPIRO_PICO", "0.03"))
+# Muestras que se dejan DELANTE de esa primera muestra fuerte, para no cortar
+# la rampa del ataque ni meter un escalon audible en la costura. 240 = 10 ms
+# a 24 kHz; ahi la senal esta todavia en el suelo, asi que el empalme no suena.
+RESPIRO_PRERROLLO = int(os.environ.get("VIBEVOICE_RESPIRO_PRERROLLO", "240"))
+# Lo mismo, pero para PARTIR el fotograma donde se mete el aire, que es otra
+# cosa: ahi no basta con no cortar la rampa, hay que dejarla ENTERA al otro
+# lado de la pausa. La primera muestra que pasa de RESPIRO_PICO es el ataque ya
+# a -30 dBFS; su pie cae 20-30 ms antes. 960 = 40 ms, en medio de la meseta
+# medida (ver _partir_pausa). Con 240 el arranque de la palabra se quedaba
+# delante del aire y se oia dos veces.
+RESPIRO_PIE = int(os.environ.get("VIBEVOICE_RESPIRO_PIE", "960"))
+
+# LA COLA DE LA LOCUCION: EL EOS LLEGA UN FOTOGRAMA ANTES DE QUE LA VOZ CALLE
+#
+# EL SINTOMA: "todos los audios terminan abruptamente y la ultima palabra no se
+# entiende bien como termina". Y NO era el respiro: medido con las mismas tres
+# frases y dos semillas, el audio con `respiro` y sin el termina EXACTAMENTE
+# igual -- los ultimos 12 fotogramas tienen el mismo RMS muestra a muestra y la
+# ultima muestra fuerte cae en el mismo sitio. El respiro alarga pausas de
+# ENTRE frases; en el final no toca nada, porque el recorte solo entra pasados
+# RESPIRO_TOPE callados seguidos y la locucion se acaba antes.
+#
+# LA CAUSA ESTA EN EL BUCLE DE MICROSOFT
+# (modeling_vibevoice_streaming_inference.py, lineas 770-853). Por cada ventana
+# de texto se generan TTS_SPEECH_WINDOW_SIZE = 6 latentes, y el orden dentro de
+# la vuelta es:
+#
+#     speech_latent = sample_speech_tokens(...)     # se genera el fotograma
+#     audio_chunk   = acoustic_tokenizer.decode(...)
+#     audio_streamer.put(audio_chunk, ...)          # se emite
+#     ...
+#     if tts_eos_logits[0] > 0.5:                   # <- el EOS se mira DESPUES
+#         finished_tags[...] = True
+#         audio_streamer.end(diffusion_indices)
+#
+# El clasificador de EOS mira el estado DESPUES de emitir el fotograma, y el
+# `for` de los 6 latentes NO se rompe: sigue generando y llamando a put() con
+# los que queden (upstream solo deja de guardarlos en `audio_chunks`). O sea
+# que tras el EOS se generan, se pagan y se DECODIFICAN hasta 5 fotogramas mas
+# -- 0,67 s -- que el streamer tiraba a la basura: AudioStreamer.put() los
+# ignora por `finished_flags`, y ColaAudioSesion.put() por `self.cerrado`.
+#
+# Y en esos fotogramas esta la caida de la ultima palabra. El decodificador
+# acustico es CAUSAL: las muestras del fotograma k salen de los latentes hasta
+# k, asi que la cola de una consonante que se apaga a caballo de la frontera
+# vive en el fotograma k+1. Tirarlo es cortar la palabra en su decaimiento, que
+# es exactamente "no se entiende bien como termina".
+#
+# MEDIDO en la VM (openvino, 6 pasos, cfg 3,5, sp-Spk1_man, 3 frases), antes:
+#
+#   semilla   ultima muestra >= 0,03   cola tras ella   pico de los ultimos 5 ms
+#     11              a 4,6 ms del fin      4,6 ms        0,0322  (-29,8 dBFS)
+#
+# Es decir: el fichero se acaba con la voz a -30 dBFS, tres veces por encima
+# del suelo de sala. Eso no es un final, es un corte.
+#
+# EL ARREGLO: NO CERRAR EN EL EOS, SINO UNOS FOTOGRAMAS DESPUES
+# El streamer se queda el EOS del clasificador (`end(indices)`) sin cerrar,
+# emite hasta COLA_FINAL fotogramas mas y cierra de verdad con el `end()` sin
+# indices que generate() hace siempre al salir del bucle. Cuesta CERO: esos
+# fotogramas ya se generaban y se decodificaban igual, solo que se tiraban.
+#
+# Y no se emiten a ciegas: en cuanto uno de ellos es suelo de sala de verdad
+# (pico por debajo de COLA_FINAL_PICO) se cierra ahi mismo, con ese fotograma
+# dentro. Asi la locucion acaba SIEMPRE aterrizando en silencio -- la cola
+# natural entera y ni un fotograma mas de relleno.
+COLA_FINAL = int(os.environ.get("VIBEVOICE_COLA_FINAL", "5"))
+# Pico por debajo del cual un fotograma de la cola ya es suelo de sala y no hay
+# nada mas que esperar. El mismo umbral que separa "silencio" de "aqui dentro
+# hay voz" en el respiro, por el mismo motivo y con la misma medida.
+COLA_FINAL_PICO = float(os.environ.get("VIBEVOICE_COLA_FINAL_PICO",
+                                       str(RESPIRO_PICO)))
+
+# LO QUE LA VENTANA NO DA: CUANDO EL EOS CAE EN EL ULTIMO LATENTE
+# La cola de arriba es gratis porque se aprovecha lo que la ventana de 6 ya
+# genero. Pero si el EOS cae en el latente numero 6 no queda NADA que
+# aprovechar, y ahi el final sigue en seco. Medido en 20 locuciones (4 textos
+# x 5 semillas): 13 se llevaron su fotograma de cola y 7 no, y los 3 finales
+# que seguian cortando con la voz por encima de -35 dBFS estaban entre esos 7.
+# Es 1 de cada 6 por pura aritmetica de la ventana.
+#
+# EL ARREGLO: pedirle UN bloque mas, y solo cuando de verdad hace falta. El
+# clasificador de EOS se envuelve para APLAZAR una sola vez su "se acabo", y
+# solo si se dan las dos condiciones a la vez:
+#
+#   - el EOS cae en el ultimo latente del bloque (no queda cola que heredar), y
+#   - el fotograma que se acaba de emitir todavia SUENA (pico >= COLA_FINAL_PICO):
+#     el modelo quiere parar en mitad del decaimiento de una palabra.
+#
+# Aplazado el EOS, generate() abre otro bloque de 6 -- ya sin texto que leer --
+# y de ahi sale la cola de verdad, que el streamer corta en cuanto aterriza en
+# suelo de sala. Solo se aplaza UNA vez por generate(): pase lo que pase, el
+# modelo se para en el bloque siguiente y el freno de MARGEN_EOS ni se entera
+# (6 posiciones contra un margen de 30 + 1,0x el texto).
+#
+# SE MIDIO Y NO VALE: VIENE APAGADO. La idea era buena y el mecanismo funciona
+# -- salta cuando tiene que saltar --, pero lo que el modelo hace con el bloque
+# de mas no es siempre apagar la palabra. Banco de 20 locuciones (4 textos x 5
+# semillas) con el aplazamiento puesto, frente al original:
+#
+#   19 de 20   igual o mejor (la cola mediana sube de 97 a 252 ms)
+#    1 de 20   PEOR, y de la mala manera: 4,27 s -> 6,13 s de audio. Al no
+#              dejarle parar, el modelo no remató la palabra: EMPEZO OTRA. Son
+#              1,9 s de habla que el texto no pedia, y encima esa locucion
+#              termino cortada a -17,9 dBFS, que es peor que el fallo original.
+#
+# Inventarse contenido es un precio que un arreglo de la cola no puede pagar:
+# el fallo que se venia a corregir se oye mal, pero al menos dice lo que ponia.
+# Asi que el defecto es 0 y esto queda como palanca para volver a medirlo
+# (VIBEVOICE_COLA_INSISTIR=1) si algun dia hay forma de distinguir "esta
+# apagando la palabra" de "esta arrancando otra" antes de emitirlo.
+#
+# Lo que SI se queda es la cola gratis de arriba (COLA_FINAL), que no puede
+# inventar nada porque no le pide al modelo ni un fotograma de mas.
+#
+# CON EL DECODIFICADOR SOLAPADO NO SE ACTIVA NUNCA. La condicion mira el pico
+# del ultimo fotograma emitido, y con VIBEVOICE_SOLAPAR_DECODER=1 ese pico lo
+# rellena otro hilo que puede ir uno o dos fotogramas por detras: se estaria
+# decidiendo con el fotograma equivocado. Mejor no hacer nada que hacerlo mal.
+COLA_INSISTIR = int(os.environ.get("VIBEVOICE_COLA_INSISTIR", "0"))
+
+# Lo que el streamer sabe y el clasificador de EOS necesita: como sono el
+# ultimo fotograma y en que latente del bloque va. Un dict de modulo basta
+# porque _candado_modelo garantiza UNA generacion a la vez; lo pone a cero
+# quien arranca cada generate().
+#
+# QUIEN CUENTA LOS FOTOGRAMAS ES EL STREAMER, NO EL CLASIFICADOR. La primera
+# version contaba llamadas al clasificador y estaba MAL: upstream lo llama
+# TRES veces por fotograma -- una dentro del forward_tts_lm de la rama buena
+# (linea 466, su `logits`), otra en el de la rama negativa, y la que de verdad
+# decide en la linea 848 --, asi que "una llamada = un fotograma" no se
+# cumple. Se vio en el banco: el aplazamiento saltaba 18 veces de 40 y el
+# audio salia BIT A BIT EL MISMO, porque caia en una llamada cuyo resultado
+# generate() ni mira. put() del streamer, en cambio, es exactamente uno por
+# fotograma acustico y ocurre ANTES de las tres llamadas de ese fotograma.
+_REMATE = {"pico": 0.0, "fotogramas": 0, "aplazados": 0, "armado": False}
+
+
+def remate_cero() -> None:
+    _REMATE.update(pico=0.0, fotogramas=0, aplazados=0, armado=False)
 
 _SESIONES: dict = {}
 _FIN = object()   # centinela: se acabo el audio de la sesion
@@ -946,9 +2238,33 @@ class TextoEnCurso:
             return self._sellado
 
     def restante(self) -> list:
-        """Texto que entro pero que el modelo no llego a decir."""
+        """Texto que entro pero que el modelo no llego a decir.
+
+        El tope con _disponible() importa tras un sellado por tope de caché:
+        mientras el modelo remata con su EOS sigue pidiendo ventanas y
+        `consumidos` avanza en vacio MAS ALLA del corte, asi que contar desde
+        `consumidos` a secas se comia esos tokens -- hasta MARGEN_EOS por cada
+        costura de tope -- y la generate() siguiente arrancaba sin ellos."""
         with self._cond:
-            return self._ids[self.consumidos:]
+            return self._ids[min(self.consumidos, self._disponible()):]
+
+    def en_prorroga(self) -> bool:
+        """Sellado, texto servido entero y ya MAS ALLA del exceso donde los
+        EOS legitimos llegan (medido: <= 0,36x el texto; se retiene desde
+        RETENER_FACTOR = 0,5x). El audio generado a partir de aqui es
+        sospechoso: solo se suelta si el EOS acaba llegando. Es la senal con
+        la que ColaAudioSesion retiene en vez de emitir.
+
+        OJO, no es "texto agotado": entre agotar el texto y la prorroga hay
+        un remate LEGITIMO de ~0,3x tokens aun por decir (el texto se lee a
+        6,25 tokens/s de audio pero se habla a ~4,7-5), y ese remate debe
+        seguir goteando en directo. Una vez cierta no vuelve a ser falsa:
+        sellar congela el buffer y `consumidos` solo crece."""
+        with self._cond:
+            disponible = self._disponible()
+            return (self._sellado and self.consumidos >= disponible
+                    and self.consumidos - disponible
+                        > MARGEN_EOS + RETENER_FACTOR * disponible)
 
     def _disponible(self) -> int:
         """Cuanto texto puede ver el bucle. Solo es menos que todo cuando el
@@ -990,6 +2306,35 @@ class TextoEnCurso:
             self.consumidos = ini + len(trozo)
             self.ventanas += 1
             with self._cond:
+                # EL FRENO DE VERDAD contra un EOS que no llega. Tras sellar,
+                # las lecturas mas alla del texto devuelven vacio, el modelo
+                # sigue DICIENDO lo que lleva leido de adelanto -- que es un
+                # remate legitimo de hasta ~0,36x el texto, ver MARGEN_EOS --
+                # y el contrato es que cierre con su EOS al acabarselo. Si
+                # sigue pidiendo ventanas mucho mas alla de eso, esta
+                # generando parloteo sin contenido detras y no va a parar
+                # solo: se desmonta desde aqui. Sellar otra vez (que es lo
+                # unico que hacia el tope) no frena nada, porque las lecturas
+                # YA devolvian vacio.
+                #
+                # Contra _disponible() y no contra len(_ids) a proposito: tras
+                # un sellado por tope de caché lo servible acaba en _corte, y
+                # medir contra el buffer entero dejaba al guardia ciego justo
+                # ahi -- con 500 tokens pendientes para la generate() siguiente
+                # habrian hecho falta 500 posiciones de descarrile antes de
+                # saltar. Sin tope, _disponible() ES len(_ids) y no cambia nada.
+                disponible = self._disponible()
+                exceso = self.consumidos - disponible
+                margen = MARGEN_EOS + MARGEN_EOS_FACTOR * disponible
+                if self._sellado and exceso > margen:
+                    print(f"[sesion] locucion descarrilada: {exceso} posiciones "
+                          f"pedidas tras el final del texto ({disponible} "
+                          f"tokens, margen {margen:.0f}) sin EOS; se corta",
+                          flush=True)
+                    raise LocucionDescarrilada(
+                        f"el modelo agoto el texto ({disponible} tokens) "
+                        f"y no cerro con su EOS tras {exceso} posiciones de mas "
+                        f"(margen {margen:.0f}); se corta la locucion")
                 if self.posicion() > self.tope and self._corte is None:
                     # No cabe mas en esta locucion. Se corta AQUI, en el borde
                     # de una ventana ya servida: el siguiente vistazo devuelve 0
@@ -1035,24 +2380,174 @@ class TextoEnCurso:
             self.esperado += time.monotonic() - marca
 
 
+def _recortar_callado(trozo):
+    """De un fotograma que el tope del respiro manda recortar, lo que hay que
+    EMITIR. None si esta callado de verdad y se puede tirar entero.
+
+    El fotograma dura 133 ms y el ataque de la palabra siguiente cae DENTRO de
+    el, asi que la media no vale para decidir (ver el bloque RESPIRO). Se mira
+    el pico: si no llega a RESPIRO_PICO es suelo de sala y se va entero; si
+    llega, se devuelve desde RESPIRO_PRERROLLO muestras antes de la primera
+    fuerte -- se tira solo la cabeza callada y el ataque se salva.
+
+    Se aplana a 1-D porque a partir de aqui el trozo puede ser mas corto que
+    un fotograma y lo unico que se hace con el es concatenarlo (a_pcm16 ya
+    hace reshape(-1), y `numel` no cambia de sentido)."""
+    plano = trozo.reshape(-1)
+    if RESPIRO_PICO <= 0:
+        return None
+    # nonzero() y no argmax(): argmax no promete devolver la PRIMERA de varias
+    # posiciones maximas, y aqui la primera es justo lo que se busca.
+    fuertes = torch.nonzero(plano.abs() >= RESPIRO_PICO)
+    if fuertes.numel() == 0:
+        return None
+    primera = int(fuertes[0])
+    return plano[max(0, primera - RESPIRO_PRERROLLO):]
+
+
+def _partir_pausa(trozo):
+    """(cabeza callada, resto) del fotograma donde se va a meter el aire.
+
+    La primera muestra que pasa de RESPIRO_PICO no es el principio de la
+    palabra: es donde el ataque YA esta a -30 dBFS. El PIE del ataque cae
+    20-30 ms antes (medido: la envolvente del fotograma de la costura sube de
+    -56 a -48 a -37 dBFS en bloques de 10 ms). Cortar en la muestra fuerte deja
+    esa rampa al otro lado de la pausa, y entonces se oye el arranque de la
+    palabra, luego el aire, y luego la palabra otra vez.
+
+    Asi que se corta RESPIRO_PIE muestras antes de la primera fuerte, y no
+    RESPIRO_PRERROLLO. Se probo tambien un retroceso adaptativo -- ir hacia
+    atras por bloques de 5 ms mientras sigan por encima del suelo del propio
+    fotograma -- y da EL MISMO corte (32 ms antes en los dos fotogramas de la
+    medida), asi que se queda el numero fijo: no depende de como redondee la
+    coma flotante, y ws_fidelidad.py lo reproduce sin margen de duda.
+
+    MEDIDO barriendo el retroceso (locucion de 6 frases, 3 pausas), con el eco
+    = cuanto suenan los 30 ms de DELANTE del aire por encima del aire:
+
+        pie      eco     golpes en el aire   recorrido de la envolvente
+        10 ms   +3,8 dB        3                  23,0 dB
+        20 ms   -1,6 dB        0                  11,8 dB
+        40 ms   -2,2 dB        0                  11,8 dB
+        60 ms   -2,0 dB        0                  11,9 dB
+
+    A partir de 20 ms el ataque queda entero al otro lado y la meseta es plana;
+    40 ms cae en medio de ella.
+
+    Sin ataque dentro, resto sale vacio y el aire va detras del fotograma
+    entero, que es donde iba siempre."""
+    plano = trozo.reshape(-1)
+    if RESPIRO_PICO <= 0:
+        return plano, plano[:0]
+    fuertes = torch.nonzero(plano.abs() >= RESPIRO_PICO)
+    if fuertes.numel() == 0:
+        return plano, plano[:0]
+    corte = max(0, int(fuertes[0]) - RESPIRO_PIE)
+    return plano[:corte], plano[corte:]
+
+
+def _aire_de_pausa(suelo, muestras: int) -> list:
+    """`muestras` de aire hechas con `suelo`, en espejo alternado.
+
+    El espejo es el mismo truco de siempre -- la copia invertida EMPIEZA por la
+    ultima muestra del original, asi que cada junta es continua por
+    construccion --, pero ahora se aplica al SUELO DE SALA y no al fotograma
+    entero. Sobre ruido plano el espejo no tiene nada que invertir; sobre un
+    ataque de palabra si, y eso es lo que sonaba al reves.
+
+    El ultimo trozo se recorta para dar exactamente `muestras` y no romper la
+    cuenta de fotogramas: el corte cae en ruido de -55 dBFS, y el salto que
+    deja se midio en 0,0015 (el habla llega a 0,20).
+
+    Se devuelven copias y no vistas: el suelo puede venir del trozo que ya va
+    camino de la cola, y nadie debe compartir memoria con lo ya emitido."""
+    plano = suelo.reshape(-1)
+    if muestras <= 0 or plano.numel() == 0:
+        return []
+    fuera, puestas, k = [], 0, 0
+    while puestas < muestras:
+        pieza = (torch.flip(plano, [0]) if k % 2 == 0 else plano.clone())
+        if puestas + pieza.numel() > muestras:
+            pieza = pieza[:muestras - puestas].clone()
+        fuera.append(pieza)
+        puestas += pieza.numel()
+        k += 1
+    return fuera
+
+
 class ColaAudioSesion:
     """El `audio_streamer` que espera generate(), volcado a una cola asincrona.
 
     No cierra la cola de la sesion al terminar: una sesion larga puede encadenar
     varias generate() (al llegar al tope de caché) sobre el MISMO flujo de audio.
+
+    LA PRORROGA SE RETIENE, Y ES EL RECORTE DE VERDAD
+    El guardia de MARGEN_EOS corta un descarrile, pero esto es streaming: para
+    cuando salta, lo emitido ya no se puede desenviar. Asi
+    que el audio generado en la PRORROGA (TextoEnCurso.en_prorroga: pasado el
+    exceso donde los EOS legitimos llegan) no se emite: se retiene aqui.
+
+      - EOS limpio: generate() llama a end() y lo retenido se suelta entero,
+        en orden. No se pierde ni un trozo; el precio es que ese ultimo tramo
+        llega de golpe al final en vez de gotear.
+      - Descarrile: LocucionDescarrilada salta desde la LECTURA de texto y
+        desmonta la pila de generate() SIN pasar por end() -- upstream no lo
+        llama en ningun finally, se comprobo --, asi que lo retenido muere
+        con este objeto y el oyente no lo oye.
+
+    Y el coste durante la locucion es CERO a proposito: mientras quede texto
+    por delante, put() emite exactamente igual que antes, y el remate
+    legitimo tras agotarse el texto -- ~0,3x tokens aun por decir, 10-15 s en
+    una locucion larga alimentada deprisa -- sigue goteando en directo, que
+    para eso el oyente lo esta escuchando. En una locucion normal la
+    prorroga NI EMPIEZA: el EOS llega antes (exceso medido <= 0,36x frente al
+    umbral de 0,5x) y no se retiene ni un trozo. Retener desde que el texto
+    se agota, que fue el primer diseno, estrangulaba justo ese remate: 10-15 s
+    de silencio en mitad de la escucha y el final a chorro.
+
+    Lo que NO promete: en un descarrile de verdad, el parloteo generado ENTRE
+    el final del contenido real y el umbral de prorroga (del orden de 15 s en
+    un texto de 300 tokens) si llega al oyente; lo que se corta es el resto,
+    que con el margen antiguo eran minutos. Para afinar mas haria falta saber
+    POR DONDE VA hablando el modelo, y eso el bucle de generate() no lo
+    cuenta: solo expone el EOS, que es justo lo que falla en un descarrile.
     """
 
-    def __init__(self, lazo, cola):
+    def __init__(self, lazo, cola, texto=None, respiro=False, cola_final=None):
         self.lazo, self.cola = lazo, cola
+        # El TextoEnCurso de ESTA generate(): la fuente de la senal de
+        # prorroga. Sin el (None) no se retiene nunca, put() como siempre.
+        self.texto = texto
         self.cerrado = False
         self.trozos = 0
+        self.retenidos = []   # el audio de la prorroga, a la espera del EOS
         # Lo pone SesionViva.abortar() cuando el cliente se larga. Por la via
         # HTTP nadie lo toca nunca, asi que ahi el comportamiento no cambia.
         self.cancelado = False
+        # El aire de la frase (ver el bloque RESPIRO): al llegar a
+        # RESPIRO_FOTOGRAMAS callados se alarga la pausa con suelo de sala
+        # propio, y pasado RESPIRO_TOPE se recorta lo que el modelo siga
+        # callando. Los contadores arrancan de cero en cada generate() porque
+        # _generar() monta una cola nueva: en la costura de un tope de caché
+        # eso da un poco de aire de mas al empezar, que es el lado prudente --
+        # nunca se come audio.
+        self.respiro = respiro
+        self._callado_seguido = 0
+        self._sonado = False      # ya salio algun fotograma con voz dentro
+        # Ultimo fotograma que era suelo de sala ENTERO. Es el material de
+        # repuesto para el aire cuando el fotograma de la costura casi no tiene
+        # cabeza callada; ver put().
+        self._suelo = None
+        # La cola de la ultima palabra (ver el bloque COLA FINAL). Aqui vive el
+        # arreglo del "final en seco": el EOS del clasificador ya no cierra la
+        # cola, la cierra el end() sin indices del final de generate().
+        self.remate = RemateEOS(cola_final)
 
     def put(self, trozos, indices):
-        # Tras end() lo que llegue sobra: generate() no sale del bucle de 6
-        # latentes aunque el EOS salte a mitad, y esos ultimos son silencio.
+        # Tras el cierre de verdad lo que llegue sobra. OJO: el cierre ya NO es
+        # el EOS del clasificador -- generate() sigue dando hasta 5 fotogramas
+        # mas del bucle de 6 latentes, y ahi esta el decaimiento de la ultima
+        # palabra; los deja pasar `remate` (bloque COLA FINAL).
         if self.cerrado:
             return
         # UNICO punto de corte que ofrece generate(): no mira ningun flag
@@ -1065,23 +2560,134 @@ class ColaAudioSesion:
         for i, idx in enumerate(indices):
             if int(idx) != 0:
                 continue
-            self.trozos += 1
-            self.lazo.call_soon_threadsafe(
-                self.cola.put_nowait, trozos[i].detach().float().cpu())
+            if not self.remate.deja_pasar(trozos[i]):
+                continue
+            trozo = trozos[i].detach().float().cpu()
+            if not self.respiro:
+                self._emitir(trozo)
+                continue
+            # Un fotograma "callado" es el suelo de sala de una pausa del
+            # modelo, y una pausa del modelo es SIEMPRE un final de frase
+            # (comprobado transcribiendo los trozos entre pausa y pausa; ver
+            # el bloque RESPIRO). Asi que aqui se hacen las dos mitades del
+            # respiro: en cuanto se confirma la pausa se ALARGA con suelo de
+            # sala propio -- el aire, gratis --, y pasado RESPIRO_TOPE se
+            # RECORTA lo que el modelo siga callando.
+            if float(trozo.pow(2).mean().sqrt()) >= RESPIRO_UMBRAL:
+                self._callado_seguido = 0
+                self._sonado = True
+                self._emitir(trozo)
+                continue
+            self._callado_seguido += 1
+            if self._callado_seguido > RESPIRO_TOPE:
+                # El recorte NO es a ciegas: el fotograma de la costura lleva
+                # dentro el ataque de la palabra siguiente y tirarlo entero se
+                # lo comia. Solo se tira lo que de verdad esta callado; lo que
+                # lleva senal se emite desde justo antes de ella.
+                trozo = _recortar_callado(trozo)
+                if trozo is not None:
+                    self._emitir(trozo)
+                continue
+            # El aire va ENTRE frases: ni delante de la primera ni detras de la
+            # ultima. Delante solo retrasaria el primer sonido, que es la
+            # latencia que mas se nota (de ahi `_sonado`); detras -- ya con el
+            # EOS visto, o sea dentro de la cola final -- son 267 ms de silencio
+            # pegados al final que nadie oye como pausa y que solo retrasan el
+            # turno del que escucha. Medido: sin esta guarda, una locucion corta
+            # se llevaba 400 ms de cola (1 fotograma de aterrizaje + 2 de aire
+            # insertado) donde bastan 133.
+            if (self._callado_seguido != RESPIRO_FOTOGRAMAS or not self._sonado
+                    or self.remate.visto or RESPIRO_ALARGA <= 0):
+                self._emitir(trozo)
+                # Suelo de sala de repuesto para el aire: solo vale el
+                # fotograma que esta callado ENTERO (pico por debajo del
+                # umbral), no el de la costura. En una pausa siempre acaba de
+                # pasar uno, porque el aire se mete en el SEGUNDO callado.
+                if float(trozo.abs().max()) < RESPIRO_PICO:
+                    self._suelo = trozo.reshape(-1).clone()
+                continue
+            # AQUI VA EL AIRE, y va DENTRO del fotograma, no detras.
+            #
+            # Este fotograma es el de la costura: sus primeros 110 ms son suelo
+            # de sala y los ultimos 20 son el arranque de la palabra siguiente
+            # (medido; ver el bloque RESPIRO). Meter el aire detras del
+            # fotograma entero dejaba ese arranque al otro lado de la pausa --
+            # se oia el principio de la palabra, luego 267 ms de pausa, y luego
+            # la palabra otra vez -- y ademas lo repetia, porque el material que
+            # se copiaba era ESE fotograma.
+            #
+            # Asi que se parte por el pie del ataque y se emite cabeza, aire,
+            # ataque. El aire se hace solo con la cabeza, que es suelo de sala
+            # de verdad; si no queda cabeza suficiente (un ataque que empieza
+            # muy pronto) se usa el ultimo fotograma que era suelo entero, que
+            # en una pausa siempre acaba de pasar.
+            cabeza, ataque = _partir_pausa(trozo)
+            fuente = cabeza if cabeza.numel() >= trozo.numel() // 4 else self._suelo
+            if fuente is None or fuente.numel() == 0:
+                fuente = trozo.reshape(-1)
+            if cabeza.numel():
+                self._emitir(cabeza)
+            # El aire mide RESPIRO_ALARGA fotogramas EXACTOS, se haga con lo que
+            # se haga: asi la pausa sigue creciendo lo que se anuncia y la
+            # cuenta de fotogramas del flujo no se descuadra.
+            for extra in _aire_de_pausa(fuente, RESPIRO_ALARGA * trozo.numel()):
+                self._emitir(extra)
+            if ataque.numel():
+                self._emitir(ataque)
+
+    def _emitir(self, trozo) -> None:
+        """Un fotograma a la cola -- o a la reserva, si la locucion ya esta en
+        prorroga y hay que esperar al EOS para soltarlo."""
+        self.trozos += 1
+        if self.texto is not None and self.texto.en_prorroga():
+            self.retenidos.append(trozo)
+        else:
+            self.lazo.call_soon_threadsafe(self.cola.put_nowait, trozo)
 
     def end(self, indices=None):
+        # Aqui SOLO se llega con un cierre legitimo (el EOS del modelo, o el
+        # fin del bucle de generate()): lo retenido era el remate de verdad y
+        # se suelta entero. Mismo hilo y misma via que put(), asi que el orden
+        # con lo ya emitido se conserva. Un descarrile no pasa por aqui.
+        #
+        # El EOS del clasificador (el unico end() que llega CON indices) no
+        # cierra: se aguanta para que baje la cola de la ultima palabra, y
+        # cierra el end() sin indices con el que generate() sale del bucle.
+        if self.remate.retener_cierre(indices):
+            return
         self.cerrado = True
+        if self.retenidos:
+            # Que quede en el log: un EOS que llego DESPUES del umbral de
+            # prorroga es raro (los medidos llegan antes) y merece verse.
+            print(f"[sesion] EOS en plena prorroga: se sueltan "
+                  f"{len(self.retenidos)} trozos retenidos "
+                  f"(~{self.segundos_retenidos():.1f} s)", flush=True)
+        for trozo in self.retenidos:
+            self.lazo.call_soon_threadsafe(self.cola.put_nowait, trozo)
+        self.retenidos = []
+
+    def segundos_retenidos(self) -> float:
+        return sum(t.numel() for t in self.retenidos) / RITMO
 
 
 class SesionViva:
     """Una generate() viva en su hilo, con una cola de texto por delante."""
 
-    def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo):
+    def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo,
+                 respiro=True, cola_final=None):
         self.nombre = nombre
         self.voz = voz
         self.cfg_scale = cfg_scale
         self.semilla = semilla
         self.pasos = pasos
+        # El respiro (pausa de verdad en cada punto; ver el bloque RESPIRO) es
+        # por sesion Y por servicio: el campo `respiro` de la peticion manda,
+        # pero VIBEVOICE_RESPIRO=0 lo apaga globalmente.
+        self.respiro = bool(respiro) and RESPIRO_ACTIVO
+        # Fotogramas de cola tras el EOS (bloque COLA FINAL). None = el defecto
+        # del servicio; va por sesion para poder medir el antes y el despues
+        # sin reiniciar nada, que es como se midio.
+        self.cola_final = cola_final
         self.lazo = lazo
         self.cola = asyncio.Queue()
         self.visto = time.time()
@@ -1092,6 +2698,8 @@ class SesionViva:
         self.error = None
         self.eos_temprano = 0     # veces que el modelo callo con texto pendiente
         self.abortada = False     # el cliente se fue: cortar sin miramientos
+        self._hablado = False     # ya entro texto: los siguientes llevan costura
+        self._cola_punt = ""      # puntuacion final retenida; ver alimentar()
         self._pendiente = []
         self._alimentador = None
         self._audio = None        # el ColaAudioSesion de la generate() en curso
@@ -1110,21 +2718,75 @@ class SesionViva:
     def alimentar(self, texto: str) -> int:
         """Encola texto. Va al alimentador vivo si lo hay; si no, a la reserva
         para la generate() siguiente."""
-        # Exactamente como lo tokeniza el procesador para una peticion normal
-        # (process_input_with_cached_prompt: text.strip() + "\n"), asi que una
-        # frase por sesion produce los mismos tokens que esa frase suelta.
-        # VERIFICADO: alimentar frase a frase da audio IDENTICO BIT A BIT al de
-        # mandar el texto entero en una sola llamada -- siempre que se compare
-        # contra el texto unido con SALTOS DE LINEA, no con espacios. Unir con
-        # espacios da otro audio (5,33 s frente a 6,80 s) porque es otro texto,
-        # no porque la sesion haga nada raro. Comparar contra la referencia
-        # equivocada costo media investigacion.
-        ids = _estado["procesador"].tokenizer.encode(
-            texto.strip() + "\n", add_special_tokens=False)
+        # EL SEPARADOR ENTRE TROZOS ES PROSODIA, no un detalle de formato.
+        # Antes cada trozo se tokenizaba como texto.strip() + "\n", que es lo
+        # que hace el procesador con una peticion suelta. Pero el modelo trata
+        # el salto de linea como frontera de PARRAFO y mete una pausa larga y
+        # ademas ERRATICA. Medido (Mac, torch-mps, misma semilla 11, 6 trozos
+        # de un texto seguido, silencio = tramos bajo el 2 % del pico):
+        #
+        #   "\n" en cada costura      30,9 s · 7,3 s callado · pausas de
+        #                             0,9 s (tras una COMA), 2,4 s y 1,6 s
+        #   "\n" solo tras .!?        31,7 s · 5,9 s callado · aun una de 2,7 s
+        #   espacio en toda costura   28,1 s · 2,5 s callado · la mas larga
+        #                             0,37 s, y el WER identico (10 %)
+        #
+        # La pausa de 0,9 s tras la coma era el caso mas grave: el troceador
+        # de arriba (scripts/narrador.py) corta por comas o por espacios para
+        # arrancar pronto, y el "\n" acababa incrustado en mitad de una frase
+        # del LLM. Asi que la BASE es coser los trozos con espacio -- el LLM
+        # separa sus frases con ". ", no con saltos de linea -- y el unico
+        # "\n" garantizado es el del final de la locucion, que lo pone
+        # cerrar() igual que el procesador en una peticion suelta.
+        #
+        # Y el espacio se queda EN TODA costura, tambien con `respiro`. Hubo
+        # una version (6 de agosto) que ponia "\n\n" tras cada punto para que
+        # el modelo pausara de verdad; funcionaba, pero le costaba al modelo
+        # generar 4,2 s de silencio que el tope de ColaAudioSesion tiraba acto
+        # seguido -- RTF 1,46 en sesion frente a 1,04 con espacio, y el
+        # reproductor seco. El aire ahora se INSERTA en el audio y no se le
+        # pide al modelo; las medidas, en el bloque RESPIRO de arriba. Un
+        # cliente que QUIERA una pausa de parrafo puede seguir mandando el
+        # "\n" dentro de su propio texto: ese no se toca.
+        #
+        # El espacio va como PREFIJO del trozo siguiente, no como sufijo del
+        # anterior, porque el BPE funde " y" en un token: sufijo daria un
+        # token de espacio suelto y OTRO texto. VERIFICADO con el tokenizador:
+        # encode(trozo) + encode(" resto") == encode("trozo resto") token a
+        # token, asi que alimentar por trozos sigue dando EXACTAMENTE los
+        # mismos ids -- y por tanto el mismo audio bit a bit -- que el texto
+        # continuo equivalente en una sola llamada (se comprueba por md5 en
+        # scripts/ws_fidelidad.py, ahora contra " ".join).
+        #
+        # LA PUNTUACION FINAL SE RETIENE hasta saber que viene detras. El
+        # pretokenizador de Qwen2 deja que un tramo de puntuacion absorba los
+        # saltos de linea que le sigan (" ?[^\s\p{L}\p{N}]+[\r\n]*"), asi que
+        # "texto." + "\n" del cierre tokeniza DISTINTO segun se codifique
+        # junto (un token ".\n") o por separado ("." y "\n") -- se midio: era
+        # el unico token de 120 que divergia de la peticion unica, y con el
+        # su audio. Retener el tramo final de puntuacion y soltarlo pegado a
+        # lo siguiente (el trozo que viene, o el "\n" del cierre) restaura la
+        # igualdad exacta. Cortar delante de la puntuacion es seguro: letras
+        # y digitos no absorben nada, encode("texto")+encode(".") ==
+        # encode("texto."). El retardo es de un token y el modelo de todas
+        # formas no habla hasta tener dos ventanas por delante.
         self.visto = time.time()
         with self._cond:
             if self.cerrada:
                 raise HTTPException(409, f"sesion '{self.nombre}' ya cerrada")
+            # Sin tocar la puntuacion: `respiro` ya no cambia NI UN TOKEN, solo
+            # el audio (ver el bloque RESPIRO). Por eso una sesion con respiro
+            # y otra sin el generan el mismo habla, y las dos la misma que
+            # /tts/stream con " ".join.
+            pieza = (self._cola_punt + (" " if self._hablado else "")
+                     + texto.strip())
+            m = _COLA_PUNTUACION.search(pieza)
+            self._cola_punt = m.group(0) if m else ""
+            if m:
+                pieza = pieza[:m.start()]
+            ids = _estado["procesador"].tokenizer.encode(
+                pieza, add_special_tokens=False)
+            self._hablado = True
             al = self._alimentador
             if al is not None and al.alimentar(ids):
                 return len(ids)
@@ -1136,6 +2798,20 @@ class SesionViva:
         """Termina la locucion limpiamente: el modelo dice lo que le queda y
         cierra con su EOS."""
         with self._cond:
+            if self.cerrada:
+                return
+            # El texto sellado termina en "\n", igual que el de una peticion
+            # normal (text.strip() + "\n"): es la unica frontera de parrafo
+            # legitima -- el final -- y con ella el EOS sale como siempre. Se
+            # codifica PEGADO a la puntuacion retenida (".\n" es UN token para
+            # el BPE); ver el bloque de alimentar().
+            if self._hablado or self._cola_punt:
+                ids = _estado["procesador"].tokenizer.encode(
+                    self._cola_punt + "\n", add_special_tokens=False)
+                self._cola_punt = ""
+                al = self._alimentador
+                if al is None or not al.alimentar(ids):
+                    self._pendiente.extend(ids)
             self.cerrada = True
             al = self._alimentador
             self._cond.notify_all()
@@ -1256,6 +2932,11 @@ class SesionViva:
             # NO es un fallo: no se guarda en self.error ni se imprime traza.
             print(f"[sesion] {self.nombre}: generacion abortada, el cliente se fue",
                   flush=True)
+        except LocucionDescarrilada as e:
+            # EOS que no llego: ya esta contado en el print del guardia. Se
+            # registra como error para que el websocket lo cuente al cliente
+            # antes del 'hecho', sin traza -- no hay pila que investigar.
+            self.error = str(e)
         except Exception as e:
             import traceback
             self.error = f"{type(e).__name__}: {e}"
@@ -1311,7 +2992,11 @@ class SesionViva:
     def _generar(self, al: TextoEnCurso):
         procesador = _estado["procesador"]
         base = prefijo_voz(self.voz)
-        audio = ColaAudioSesion(self.lazo, self.cola)
+        # Con el alimentador puesto: es quien le dice a la cola cuando la
+        # locucion entra en prorroga y hay que retener (ver ColaAudioSesion).
+        audio = ColaAudioSesion(self.lazo, self.cola, texto=al,
+                                respiro=self.respiro,
+                                cola_final=self.cola_final)
         with self._cond:
             # Bajo el candado y comprobando abortada: si el cliente se fue entre
             # que se armo la cola y que se registra, abortar() no la habria
@@ -1319,6 +3004,9 @@ class SesionViva:
             if self.abortada:
                 audio.cancelado = True
             self._audio = audio
+        # Fuera del try: el `finally` lo mira, y si se resolviera dentro podria
+        # no estar definido cuando algo falle antes de llegar a esa linea.
+        solapado = _estado.get("solapado")
         _candado_modelo.acquire()
         try:
             _ajustar_pasos(self.pasos)
@@ -1342,6 +3030,11 @@ class SesionViva:
             entradas.pop("tts_text_ids")
             al.posicion_inicial = int(entradas["tts_lm_input_ids"].shape[1])
             self.generaciones += 1
+            # El envoltorio va SOLO a generate(); self._audio sigue siendo la
+            # cola de verdad, que es a la que abortar() le pone `cancelado` y
+            # de la que se leen los `retenidos` al salir.
+            destino = StreamerSolapado(solapado, audio) if solapado else audio
+            remate_cero()   # por generate(), igual que en _sintetizar
             with torch.no_grad():
                 _estado["modelo"].generate(
                     **entradas,
@@ -1354,10 +3047,29 @@ class SesionViva:
                     show_progress_bar=False,
                     return_speech=False,
                     all_prefilled_outputs=copy.deepcopy(base),
-                    audio_streamer=audio,
+                    audio_streamer=destino,
                 )
         finally:
+            # ANTES de soltar el candado: si generate() salio por excepcion --
+            # descarrile o aborto -- nadie llamo a end(), y el worker podria
+            # seguir decodificando trozos de ESTA locucion mientras otra sesion
+            # entra y le mueve el estado del decodificador por debajo. Ademas,
+            # `retenidos` no esta completo hasta que el worker termina de emitir.
+            if solapado is not None:
+                with contextlib.suppress(Exception):
+                    solapado.drenar()
             _candado_modelo.release()
+            if audio.retenidos:
+                # Se llega aqui con retenidos solo cuando NO hubo end(): un
+                # descarrile (o un aborto) desmonto la pila de generate(). Es
+                # EL recorte funcionando -- este audio se genero sin texto
+                # detras y el oyente no lo oye --, y el numero es la medida
+                # de cuanto parloteo se le ahorro.
+                print(f"[sesion] {self.nombre}: se descartan "
+                      f"{len(audio.retenidos)} trozos retenidos "
+                      f"(~{audio.segundos_retenidos():.1f} s) generados en la "
+                      f"prorroga sin EOS", flush=True)
+                audio.retenidos = []
             with self._cond:
                 self._audio = None
 
@@ -1418,6 +3130,16 @@ class PeticionTTS(BaseModel):
     # Casi siempre suena bien, pero de vez en cuando el sorteo cae mal y sale
     # un clip que ni whisper entiende. Con semilla fija eso deja de ser una
     # loteria: la misma peticion da exactamente el mismo audio.
+    #
+    # LA SEMILLA NO ES LO UNICO QUE HAY QUE FIJAR PARA QUE ESO SE CUMPLA
+    # El ruido es el unico sorteo, pero no el unico estado que arrastra una
+    # sintesis. El decodificador acustico es causal y en streaming, asi que el
+    # audio depende TAMBIEN de las colas de sus convoluciones al empezar. En
+    # torch eso no da problema -- generate() crea una cache nueva por llamada --,
+    # pero con el motor openvino ese estado vive en el IR compilado, que es uno
+    # para todo el proceso, y se colaba de una peticion a la siguiente: misma
+    # semilla y md5 distinto. Lo arregla AcusticoOV en pkgs/vibevoice-ov/motor.py
+    # haciendo que el estado siga al objeto cache de cada generate().
     semilla: Optional[int] = Field(None, ge=0, lt=2**31,
                                    description="fija el ruido de la difusion; "
                                                "misma semilla = mismo audio")
@@ -1438,6 +3160,18 @@ class PeticionTTS(BaseModel):
     # ardilla o a resaca. De ahi el rango cerrado.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
+    # Agrupado de la rama incondicional del CFG: una pasada del backbone cada
+    # N fotogramas en vez de una por fotograma. Ver NEG_CADA y TtsLmOV. None =
+    # lo que diga VIBEVOICE_NEG_CADA. Va por peticion para poder medirlo sin
+    # reiniciar el servicio ni pelearse con las variables de la unidad.
+    neg_cada: Optional[int] = Field(None, ge=1, le=6)
+
+    # Fotogramas de cola que se emiten tras el EOS del clasificador, donde se
+    # apaga la ultima palabra (ver el bloque COLA FINAL). 0 = el corte en seco
+    # de antes; None = lo que diga VIBEVOICE_COLA_FINAL. Va por peticion para
+    # poder medir el antes y el despues con el MISMO binario.
+    cola_final: Optional[int] = Field(None, ge=0, le=6)
+
 
 class PeticionSesion(BaseModel):
     """Texto que se le mete a una sesion viva. La voz y los ajustes solo se
@@ -1451,6 +3185,13 @@ class PeticionSesion(BaseModel):
     cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
     semilla: Optional[int] = Field(None, ge=0, lt=2**31)
     pasos: Optional[int] = Field(None, ge=4, le=20)
+    # Aire en cada final de frase (ver el bloque RESPIRO). Solo se mira al
+    # CREAR la sesion, como la voz. respiro=False da el audio pelado del
+    # modelo, bit a bit el de /tts/stream con " ".join: ni alargue ni recorte.
+    respiro: bool = True
+    # Cola de la ultima palabra; ver el bloque COLA FINAL. Como la voz, solo se
+    # mira al CREAR la sesion.
+    cola_final: Optional[int] = Field(None, ge=0, le=6)
     # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
     fin: bool = False
 
@@ -1480,12 +3221,84 @@ def health() -> dict:
         "rtf_esperado": RTF_MEDIDO,
         "ocupado": _candado.locked() or _candado_modelo.locked(),
         "auth": "bearer" if TOKEN else "abierta",
+        # Que IR y que ajustes hay puestos DE VERDAD. Sin esto, comprobar un
+        # despliegue exige leer la unidad de systemd y creerse que nadie ha
+        # dejado un drop-in por medio.
+        "ir": {"lm": Path(IR_LM).name, "cabeza": Path(IR_CABEZA).name,
+               "acustico": Path(IR_ACUSTICO).name} if MOTOR == "openvino" else {},
+        "hilos": {"total": HILOS, "decoder": HILOS_DECODER,
+                  "solapado": SOLAPAR_DECODER},
+        "neg_cada": NEG_CADA,
+        # La cola de la ultima palabra, que es global a las dos vias (ver el
+        # bloque COLA FINAL). Fuera de "sesiones" porque /tts/stream la lleva
+        # igual.
+        "cola_final": {"fotogramas": COLA_FINAL, "umbral_pico": COLA_FINAL_PICO,
+                       "insistir": COLA_INSISTIR and not SOLAPAR_DECODER},
         "sesiones": {"activas": SESIONES_ACTIVAS,
                      "abiertas": sorted(_SESIONES),
                      "espera_texto_s": ESPERA_TEXTO,
                      "tope_cache": TOPE_CACHE,
+                     "respiro": {"activo": RESPIRO_ACTIVO,
+                                 "fotogramas": RESPIRO_FOTOGRAMAS,
+                                 "alarga": RESPIRO_ALARGA,
+                                 "tope": RESPIRO_TOPE,
+                                 "umbral_rms": RESPIRO_UMBRAL,
+                                 "umbral_pico": RESPIRO_PICO,
+                                 "prerrollo": RESPIRO_PRERROLLO,
+                                 "pie": RESPIRO_PIE},
                      "websocket": "/tts/sesion/ws"},
     }
+
+
+@app.get("/crono")
+def crono(reset: bool = True) -> dict:
+    """Reparto del tiempo de la ULTIMA tanda de generaciones, y lo pone a cero.
+
+    Se lee despues de un banco, no durante: mezcla todas las generate() que
+    hayan pasado desde el ultimo reset. `motor` son los tiempos por componente
+    del camino OpenVINO (suman mas del 100 % del reloj de pared, porque el
+    decodificador corre en otro hilo); `tuberia` dice quien espera a quien.
+    """
+    datos = {"tuberia": dict(CRONO_TUBERIA)}
+    try:                                    # solo existe con motor openvino
+        import motor as _motor
+        datos["motor"] = {k: {"s": v[0], "n": v[1],
+                              "ms": (v[0] / v[1] * 1000) if v[1] else 0.0}
+                          for k, v in _motor.CRONO.items()}
+        if reset:
+            for v in _motor.CRONO.values():
+                v[0], v[1] = 0.0, 0
+    except Exception as e:                  # noqa: BLE001
+        datos["motor"] = {"sin_datos": str(e)}
+    m = datos.get("motor") or {}
+    t = datos["tuberia"]
+    if t["generaciones"] and isinstance(m.get("tts_lm"), dict):
+        # Lo que NO es ninguna de las tres piezas compiladas: el LM de texto en
+        # torch, el conector acustico, el clasificador de EOS y el despacho de
+        # Python. Es la partida que nadie mira y en la que hay que buscar
+        # cuando las tres piezas ya no dan mas.
+        piezas = sum(m[k]["s"] for k in ("tts_lm", "cabeza", "acustico"))
+        fot = m["acustico"]["n"] or 1
+        datos["reparto_ms_por_fotograma"] = {
+            "generate": 1000 * t["generate"] / fot,
+            "tts_lm": 1000 * m["tts_lm"]["s"] / fot,
+            "cabeza": 1000 * m["cabeza"]["s"] / fot,
+            "acustico": 1000 * m["acustico"]["s"] / fot,
+            "resto": 1000 * (t["generate"] - piezas) / fot,
+            "fotogramas": fot,
+        }
+    if t["generaciones"]:
+        datos["resumen"] = {
+            "generate_s": t["generate"],
+            "contrapresion_pct": 100 * t["contrapresion"] / t["generate"],
+            "worker_ocupado_pct": 100 * t["trabajo_worker"] / t["generate"],
+            "worker_hambre_pct": 100 * t["hambre_worker"] / t["generate"],
+            "decode_ms": 1000 * t["trabajo_worker"] / max(1, t["decodes"]),
+            "decodes": t["decodes"],
+        }
+    if reset:
+        crono_cero()
+    return datos
 
 
 @app.get("/voces")
@@ -1510,12 +3323,12 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
         # El candado se toma DENTRO del generador: si hay otra sintesis en
         # curso, esta espera su turno sin bloquear el bucle de eventos.
         async with _candado:
-            streamer = StreamerCancelable()
+            streamer = StreamerCancelable(pet.cola_final)
             lazo = asyncio.get_running_loop()
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
                 None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
-                pet.semilla, pet.pasos,
+                pet.semilla, pet.pasos, pet.neg_cada,
             )
             try:
                 yield cabecera_wav_flujo(ritmo)
@@ -1604,7 +3417,8 @@ async def sesion_texto(nombre: str, pet: PeticionSesion,
     nueva = s is None
     if nueva:
         s = SesionViva(nombre, pet.voz or VOZ_DEFECTO, pet.cfg_scale,
-                       pet.semilla, pet.pasos, asyncio.get_running_loop())
+                       pet.semilla, pet.pasos, asyncio.get_running_loop(),
+                       respiro=pet.respiro, cola_final=pet.cola_final)
         _SESIONES[nombre] = s
     elif pet.voz is not None and pet.voz != s.voz:
         raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
@@ -1689,9 +3503,11 @@ async def sesion_borrar(nombre: str, _=Depends(autorizar)) -> dict:
 # Por debajo es SesionViva, la misma clase, sin una rama especial. Asi que
 # respeta _candado_modelo igual (lo toma _generar), suelta el candado mientras
 # espera texto igual (TextoEnCurso._esperar, via al_pausar/al_reanudar) y
-# tokeniza igual (texto.strip() + "\n"). De ahi que el audio salga IDENTICO bit
-# a bit al de la via HTTP, que es lo que se comprueba por md5. El HTTP se queda
-# intacto: es lo que corre en la VM y lo que se prueba con curl.
+# tokeniza igual (trozos cosidos con espacio y un "\n" al final; el respiro no
+# toca el texto, solo el audio -- ver alimentar() y el bloque RESPIRO). De
+# ahi que el audio salga IDENTICO bit a bit al de la via HTTP con los mismos
+# ajustes, que es lo que se comprueba por md5. El HTTP se queda intacto: es
+# lo que corre en la VM y lo que se prueba con curl.
 #
 # PROTOCOLO
 # Del cliente al servidor, mensajes de TEXTO con JSON:
@@ -1765,6 +3581,12 @@ class AbrirSesionWS(BaseModel):
     cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
     semilla: Optional[int] = Field(None, ge=0, lt=2**31)
     pasos: Optional[int] = Field(None, ge=4, le=20)
+    # Pausa de verdad en cada punto (ver el bloque RESPIRO). False = la
+    # locucion de antes, bit a bit.
+    respiro: bool = True
+    # Cola de la ultima palabra; ver el bloque COLA FINAL. 0 vuelve al corte en
+    # seco de antes, que es contra lo que se midio.
+    cola_final: Optional[int] = Field(None, ge=0, le=6)
     # Aceptado solo para poder dar un error claro; ver el bloque VELOCIDAD.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
@@ -1861,8 +3683,17 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
         Se SONDEA el estado en vez de colgar una devolucion de llamada dentro de
         TextoEnCurso porque 'esperando' tiene dos fuentes -- el bucle parado sin
         texto por delante y el hueco ENTRE dos generate() -- y solo estado() las
-        junta. 100 ms es dos ordenes de magnitud mas fino que lo que tarda una
-        frase y no cuesta nada medible.
+        junta.
+
+        EL PERIODO SI SE NOTA, y estaba en 100 ms. Este evento es lo unico que
+        le dice al cliente "manda ya la frase siguiente": mientras no salga, el
+        modelo esta PARADO sin nada que decir. Sondear cada 100 ms le regala al
+        modelo una espera de 0 a 100 ms en CADA frontera de frase, y el
+        asistente alimenta frase a frase. Medido con 6 frases (4 pasadas): con
+        100 ms la sesion va a RTF 0,985 alimentada frase a frase frente a 0,959
+        de golpe; con 10 ms las dos van igual. No es gratis del todo -- son 100
+        vueltas por segundo de un dict y un corte de lista -- pero al lado de
+        los 133 ms que cuesta un fotograma no se mide.
         """
         antes = False
         try:
@@ -1872,7 +3703,7 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
                     antes = ahora
                     await evento(tipo="esperando", esperando=ahora,
                                  s=transcurrido())
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(PERIODO_VIGIA)
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             return
 
@@ -1980,7 +3811,7 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
             nombre = None
             return
         s = SesionViva(nombre, cfg.voz, cfg.cfg_scale, cfg.semilla, cfg.pasos,
-                       lazo)
+                       lazo, respiro=cfg.respiro, cola_final=cfg.cola_final)
         # El audio ya sale por aqui: que GET /tts/sesion/{id}/audio no lo robe.
         s.escuchando = True
         _SESIONES[nombre] = s
@@ -2039,7 +3870,36 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
             await ws.close()
 
 
+def identificar_codigo() -> None:
+    """Deja en el registro QUE FICHERO se esta ejecutando y su huella.
+
+    NO ES DECORACION. El 6 de agosto se perdieron horas midiendo un fallo del
+    respiro contra un servicio que NO tenia el respiro: un drop-in olvidado en
+    /run/systemd/system/voz-stream.service.d/prueba.conf reescribia ExecStart
+    para apuntar a una copia de trabajo en /var/lib/voz-prueba/voz_stream.py.
+    Como /run es tmpfs, el drop-in sobrevive a daemon-reload y a
+    `nixos-rebuild switch` -- la generacion nueva se instalaba, el servicio se
+    reiniciaba y seguia arrancando el fichero viejo. El despliegue decia que si
+    y el proceso corria codigo de cinco commits antes, con el freno de guia en
+    un 0.80 que ya no estaba en ninguna configuracion.
+
+    Nada en el arranque lo delataba: la unidad en /etc apuntaba al store, y
+    solo el cmdline del PID contaba la verdad. Con esta linea, un
+    `journalctl -u voz-stream | grep codigo` la cuenta sola.
+    """
+    try:
+        ruta = Path(__file__).resolve()
+        datos = ruta.read_bytes()
+        huella = hashlib.sha256(datos).hexdigest()[:12]
+        print(f"[arranque] codigo {ruta} sha256:{huella} "
+              f"({len(datos.splitlines())} lineas)", flush=True)
+    except Exception as e:
+        # Nunca impedir el arranque por no poder identificarse.
+        print(f"[arranque] no se pudo identificar el codigo: {e}", flush=True)
+
+
 def main() -> None:
+    identificar_codigo()
     # workers=1 SIEMPRE: cada worker cargaria su propio modelo (~2,3 GB) y la
     # VM de 5 GB no aguanta dos.
     uvicorn.run(

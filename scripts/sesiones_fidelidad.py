@@ -82,8 +82,13 @@ class Sesion:
         self._hilo = None
 
     def texto(self, frase, fin=False):
+        # respiro=False a proposito: lo que se compara aqui es la maquinaria
+        # de alimentacion contra 'junta' (" ".join), bit a bit. El respiro
+        # cambia los tokens ("\n" tras cada punto) y recorta silencios, asi
+        # que con el puesto la igualdad seria contra otra referencia; su
+        # prueba vive en scripts/ws_fidelidad.py.
         cuerpo = {"texto": frase, "voz": self.voz, "cfg_scale": self.cfg,
-                  "semilla": self.semilla, "fin": fin}
+                  "semilla": self.semilla, "fin": fin, "respiro": False}
         return json.load(_pedir(f"{self.url}/tts/sesion/{self.nombre}", self.token, cuerpo))
 
     def escuchar(self):
@@ -221,7 +226,11 @@ def main():
                                 "muda": len(hip) == 0 or not set(hip) & set(ref)})
             else:
                 if modo == "junta":
-                    pcm, dur = sintetizar("\n".join(frases), a.voz_url,
+                    # Con ESPACIOS, no con saltos de linea: es como la sesion
+                    # cose los trozos desde que se midio que el "\n" mete
+                    # pausas de parrafo erraticas (hasta 2,7 s) en cada
+                    # costura; ver SesionViva.alimentar() en voz_stream.py.
+                    pcm, dur = sintetizar(" ".join(frases), a.voz_url,
                                           a.token_voz, a.voz, a.cfg, semilla, ruta)
                 else:
                     s = Sesion(a.voz_url, a.token_voz, f"{modo}-{semilla}",

@@ -1,0 +1,26 @@
+meta {
+  name: Modelos
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{api}}/v1/models
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+docs {
+  # Que motores hay de verdad
+
+  El catalogo con la forma de OpenAI. `vibevoice` solo aparece si voz-stream
+  responde: se sondea antes de anunciarlo, para que un 503 no salga a mitad de
+  una sintesis.
+
+  Con solo Piper levantado salen cuatro entradas —`tts-1`, `tts-1-hd`,
+  `gpt-4o-mini-tts` y `piper`— que son el mismo motor por cuatro nombres.
+}

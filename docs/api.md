@@ -9,6 +9,7 @@ propia documentación interactiva en `/docs` y el esquema en `/openapi.json`.
 - [Autenticación](#autenticación)
 - [`POST /tts` — texto a voz](#post-tts--texto-a-voz)
 - [`POST /stt` — voz a texto](#post-stt--voz-a-texto)
+- [`POST /v1/audio/speech` — la fachada de OpenAI](#post-v1audiospeech--la-fachada-de-openai)
 - [`GET /voces`](#get-voces)
 - [`GET /health`](#get-health)
 - [Errores](#errores)
@@ -37,6 +38,8 @@ sentido en una red de confianza, y el módulo no deja combinarlo con `abrirCorta
 |---|---|
 | `POST /tts` | sí |
 | `POST /stt` | sí |
+| `POST /v1/audio/speech` | sí |
+| `GET /v1/models` | sí — es lo que espera un cliente de OpenAI |
 | `GET /voces` | no |
 | `GET /health` | no — para poder monitorizarla sin repartir el secreto |
 | `GET /docs`, `GET /openapi.json` | no |
@@ -157,6 +160,106 @@ El tiempo de espera hacia `whisper-server` es de **300 segundos**, holgado a pro
 
 ---
 
+## `POST /v1/audio/speech` — la fachada de OpenAI
+
+Lo mismo que `/tts`, pero hablando el dialecto que ya habla todo el mundo. El código es
+[`pkgs/voz-api/voz_api/openai_api.py`](../pkgs/voz-api/voz_api/openai_api.py).
+
+No sustituye a nada: `/tts` sigue igual. Existe porque cualquier cliente que ya sintetiza voz —una
+librería, un agente, un plugin— trae el formato de OpenAI de fábrica, y así el adaptador se escribe una
+vez aquí en vez de una vez por cliente.
+
+```python
+from openai import OpenAI
+
+cli = OpenAI(base_url="http://voz:8080/v1", api_key=TOKEN)
+r = cli.audio.speech.create(model="tts-1", voice="nova",
+                            input="El backup de anoche terminó sin errores.")
+open("nota.mp3", "wb").write(r.content)
+```
+
+### Parámetros
+
+| Campo | Tipo | Por defecto | Notas |
+|---|---|---|---|
+| `model` | string | — | qué motor. Ver la tabla de abajo |
+| `input` | string | — | el texto, 1-8000 caracteres |
+| `voice` | string | la de defecto | una voz real de este servidor, o una canónica de OpenAI |
+| `response_format` | string | `mp3` | `mp3`, `opus`, `aac`, `flac`, `wav`, `pcm` |
+| `speed` | float | `1.0` | 0,25-4,0. **Multiplicador de rapidez**: 2,0 es el doble de rápido |
+| `instructions` | string | — | se acepta y **se ignora**; ningún motor de aquí las admite |
+
+### Los modelos
+
+| `model` | Motor | RTF | Notas |
+|---|---|---|---|
+| `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts` | Piper | 0,042 | los nombres canónicos van todos aquí |
+| `piper` | Piper | 0,042 | el mismo, por su nombre |
+| `vibevoice`, `vibevoice-realtime-0.5b`, `voz-stream` | VibeVoice vía `voz-stream` | 0,75 | solo si el servicio está levantado |
+
+`tts-1-hd` **no** va a VibeVoice a propósito. `voz-stream` es un servicio opcional que en la mayoría de
+despliegues no está arrancado, y mandar ahí el modelo por defecto de un cliente convertiría «compatible»
+en «falla a veces». Quien quiera VibeVoice lo pide por su nombre.
+
+`GET /v1/models` sondea `voz-stream` antes de anunciarlo, así que devuelve solo lo que de verdad
+responde en esta máquina.
+
+### Las voces canónicas de OpenAI
+
+`alloy`, `nova`, `echo` y compañía no existen aquí. Un cliente que las trae fijas en el código no puede
+pedir otra cosa, así que **caen a la voz por defecto** y lo dicen en la cabecera `X-Voz-Sustituida` en
+vez de devolver un error. Para dirigirlas a voces concretas:
+
+```nix
+services.voz-api.vocesOpenAI = {
+  alloy = "es_MX-claude-high";
+  nova  = "es_ES-davefx-medium";
+};
+```
+
+Los nombres reales del servidor (`es_MX-claude-high`, `sp-Spk0_woman`…) se pueden pasar tal cual en
+`voice` y tienen preferencia sobre el mapa.
+
+### Tres diferencias que conviene conocer
+
+Todas se anuncian en cabeceras `X-`, así que un cliente puede detectarlas sin leer esto:
+
+1. **`speed` va invertido respecto a Piper.** En OpenAI es rapidez (2,0 = el doble de rápido) y en
+   Piper `length_scale` es duración. La traducción se hace aquí, en un único sitio.
+2. **En VibeVoice `speed` se recorta a 0,85-1,20.** Es el rango en el que estirar el tiempo con WSOLA no
+   se oye (ver [`estirar.py`](../pkgs/vibevoice-cli/estirar.py)). Se recorta en vez de rechazar la
+   petición, y se dice en `X-Velocidad`.
+3. **El modo sesión no cabe en este contrato.** En la API de OpenAI una petición es un texto entero y una
+   respuesta un audio entero; la locución continua sigue en su endpoint nativo del puerto 8082. Es lo que
+   de verdad distingue a VibeVoice, y degradarlo para que entrase sería perder justo eso.
+
+### Errores de la fachada
+
+Con la forma que espera el SDK, no con la de `/tts`:
+
+```json
+{"error": {"message": "modelo 'gpt-5-tts' no existe en este servidor; disponibles: [...]",
+           "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}
+```
+
+| Código | Cuándo |
+|---|---|
+| `400` | `voice` que no existe ni aquí ni en OpenAI, `response_format` desconocido, JSON inválido |
+| `401` | token ausente o incorrecto |
+| `404` | `model` desconocido (`code: model_not_found`) |
+| `502` / `503` | `voz-stream` falló o no responde |
+
+Los `422` de Pydantic se traducen a `400`: OpenAI nunca devuelve `422` y hay clientes que lo tratan como
+fallo de transporte y reintentan en bucle.
+
+### Comprobarlo
+
+```bash
+python scripts/openai_compat.py --base http://voz:8080 --token "$TOKEN"
+```
+
+---
+
 ## `GET /voces`
 
 Las voces instaladas y cuál se usa por defecto.
@@ -214,7 +317,8 @@ Los tres campos que hay que mirar:
 
 ## Errores
 
-Todos los errores devuelven `{"detail": "…"}`.
+Todos los errores de la API nativa devuelven `{"detail": "…"}`. Los de `/v1/*` usan la forma de OpenAI,
+que está en [su propia sección](#errores-de-la-fachada).
 
 | Código | Cuándo | Mensaje |
 |---|---|---|

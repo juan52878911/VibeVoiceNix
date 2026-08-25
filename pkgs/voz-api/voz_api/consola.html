@@ -134,8 +134,8 @@
     </div>
     <div class="fila">
       <div><label for="s-voz">Voz</label><select id="s-voz"></select></div>
-      <div><label for="s-cfg">Expresividad <b id="v-cfg">4.5</b></label>
-        <input type="range" id="s-cfg" min="1.5" max="4.5" step="0.1" value="4.5"></div>
+      <div><label for="s-cfg">Expresividad <b id="v-cfg">3.5</b></label>
+        <input type="range" id="s-cfg" min="1.5" max="4.5" step="0.1" value="3.5"></div>
     </div>
     <div class="fila">
       <div><label for="s-vel">Velocidad <b id="v-vel">1.00</b></label>
@@ -145,10 +145,7 @@
       <div><label for="s-semilla">Semilla</label>
         <input type="number" id="s-semilla" min="0" placeholder="al azar"></div>
     </div>
-    <p class="nota">Expresividad alta suena más marcada pero cuesta fidelidad:
-      medido, el WER sube de 9,7 % a 16,7 % al ir de 3,0 a 4,5. La velocidad
-      estira el tiempo sin tocar el tono. Con semilla fija, el mismo texto da
-      siempre exactamente el mismo audio.</p>
+    <p class="nota">Entre 3,0 y 3,5 la fidelidad es la misma (WER 9,7 %); 3,5 entona más y habla un 7 % más despacio. A 4,5 el peor caso se dobla. La velocidad estira el tiempo sin tocar el tono. Con semilla fija, el mismo texto da siempre el mismo audio.</p>
     <div class="btns">
       <button id="b-str" disabled>Generar y escuchar</button>
       <button id="b-stop" class="sec" hidden>Detener</button>

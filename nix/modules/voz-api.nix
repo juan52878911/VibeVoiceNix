@@ -7,6 +7,7 @@
 let
   cfg = config.services.voz-api;
   whisperCfg = config.services.homelab-whisper;
+  streamCfg = config.services.voz-stream;
 
   dirVoces = pkgs.vozPiperVoces.paquete cfg.voces;
 in
@@ -54,6 +55,29 @@ in
       '';
     };
 
+    vibevoiceURL = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "http://127.0.0.1:8082";
+      description = ''
+        Donde escucha voz-stream, para que `POST /v1/audio/speech` pueda servir
+        tambien VibeVoice (`model: "vibevoice"`). Si es null se apunta al de
+        esta maquina cuando `services.voz-stream.enable` esta puesto; si no lo
+        esta, el modelo simplemente no aparece en `GET /v1/models`.
+      '';
+    };
+
+    vocesOpenAI = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      example = { alloy = "es_MX-claude-high"; nova = "es_ES-davefx-medium"; };
+      description = ''
+        Mapa de las voces canonicas de OpenAI (`alloy`, `nova`, ...) a voces
+        reales de este servidor. Un cliente que las trae fijas en el codigo no
+        puede pedir otra cosa; sin mapa caen todas a `vozDefecto`.
+      '';
+    };
+
     ficheroToken = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -79,6 +103,10 @@ in
         message = "services.voz-api.vozDefecto (${cfg.vozDefecto}) tiene que estar en services.voz-api.voces";
       }
       {
+        assertion = lib.all (v: lib.elem v cfg.voces) (lib.attrValues cfg.vocesOpenAI);
+        message = "services.voz-api.vocesOpenAI apunta a voces que no estan en services.voz-api.voces";
+      }
+      {
         assertion = cfg.abrirCortafuegos -> cfg.ficheroToken != null;
         message = "abrir voz-api en la LAN sin ficheroToken deja el TTS/STT accesible a cualquiera de la red";
       }
@@ -98,6 +126,21 @@ in
         VOZ_FFMPEG = "${pkgs.ffmpeg}/bin/ffmpeg";
         VOZ_HOST = cfg.direccion;
         VOZ_PORT = toString cfg.puerto;
+      }
+      # La fachada de OpenAI delega en voz-stream cuando le piden VibeVoice.
+      # Solo se declara la URL si hay a quien llamar; sin ella el codigo prueba
+      # igualmente en 127.0.0.1:8082, y como `GET /v1/models` sondea antes de
+      # anunciar, un puerto muerto se traduce en "ese modelo no existe" y no en
+      # un 503 a mitad de una peticion.
+      // lib.optionalAttrs (cfg.vibevoiceURL != null || streamCfg.enable) {
+        VOZ_VIBEVOICE_URL =
+          if cfg.vibevoiceURL != null
+          then cfg.vibevoiceURL
+          else "http://127.0.0.1:${toString streamCfg.puerto}";
+      }
+      // lib.optionalAttrs (cfg.vocesOpenAI != { }) {
+        VOZ_OPENAI_VOCES = lib.concatStringsSep ","
+          (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.vocesOpenAI);
       };
 
       serviceConfig = {

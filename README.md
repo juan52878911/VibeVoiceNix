@@ -357,7 +357,7 @@ Tres servicios, tres puertos:
 
 | Servicio | Puerto | Qué expone |
 |---|---|---|
-| `voz-api` | **8080** | `/tts`, `/stt`, `/voces`, `/health` y la consola en `/` |
+| `voz-api` | **8080** | `/tts`, `/stt`, `/voces`, `/health`, `/v1/audio/speech` y la consola en `/` |
 | `homelab-whisper` | 8081 | solo loopback — no se abre nunca |
 | `voz-stream` | **8082** | TTS expresivo en streaming |
 
@@ -402,6 +402,34 @@ la generación normal: no es una versión degradada.
 
 > Bruno **no** es buen cliente para esto: espera a tener la respuesta completa. Usa `curl -sN`, la consola
 > del navegador, o la colección de [`bruno/`](bruno/) para el resto de rutas.
+
+### Como si fuera OpenAI
+
+La misma síntesis en el dialecto que ya habla todo el mundo, para enchufar clientes que no saben nada de
+este stack:
+
+```python
+from openai import OpenAI
+
+cli = OpenAI(base_url="http://voz:8080/v1", api_key=TOKEN)
+r = cli.audio.speech.create(model="tts-1", voice="nova", input="El backup terminó sin errores.")
+open("nota.mp3", "wb").write(r.content)
+```
+
+`tts-1`, `tts-1-hd` y `gpt-4o-mini-tts` van a **Piper**; `vibevoice` va al 8082 y solo aparece en
+`GET /v1/models` si ese servicio responde. Los seis formatos de OpenAI (`mp3`, `opus`, `aac`, `flac`,
+`wav`, `pcm`) están cubiertos, y las voces canónicas (`nova`, `alloy`…) caen a la de defecto avisando en
+`X-Voz-Sustituida` en vez de dar error — un cliente que las trae fijas no puede pedir otra cosa.
+
+Lo que **no** cabe en ese contrato es el modo sesión: en la API de OpenAI una petición es un texto entero
+y una respuesta un audio entero. La locución continua se queda en su endpoint nativo, que es justo lo que
+la hace valer.
+
+Comprobarlo de un tirón:
+
+```bash
+python scripts/openai_compat.py --base http://voz:8080 --token "$TOKEN"
+```
 
 ### Desde Python
 
@@ -572,8 +600,76 @@ curl -s -X POST http://voz:8080/tts -H "Authorization: Bearer $TOKEN" -H 'Conten
 python scripts/fidelidad.py      # banco: texto -> voz -> whisper -> texto, mide WER
 python scripts/narrador.py       # pone voz a un LLM según escribe
 python scripts/asistente.py      # Ollama -> voz, en la terminal
-python scripts/asistente_web.py  # lo mismo, con página en el navegador
+
+# Las herramientas del asistente: el catálogo, una llamada suelta y el ciclo
+# entero (el modelo decide, se ejecuta, se le devuelve, contesta).
+pkgs/vibevoice/.venv/bin/python scripts/herramientas.py listar
+pkgs/vibevoice/.venv/bin/python scripts/herramientas.py llamar leer_correo filtro=importantes
+pkgs/vibevoice/.venv/bin/python scripts/herramientas.py ciclo "¿qué tengo mañana?"
+
+# Y la prueba de punta a punta: levanta un puente propio en el 8099, manda
+# preguntas y lee los mismos marcos que el navegador. No reproduce nada.
+pkgs/vibevoice/.venv/bin/python scripts/herramientas_extremo.py
+
+# El de la página habla por la sesión de WebSocket, así que necesita el
+# paquete `websockets`: hay que arrancarlo con el venv, no con el python suelto.
+pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py
+
+# En un Mac, además: whisper NATIVO sobre Metal. Es la mitad de la latencia.
+./scripts/whisper-mac.sh &
+pkgs/vibevoice/.venv/bin/python scripts/asistente_web.py \
+    --whisper-url http://127.0.0.1:8083
 ```
+
+**En un Mac, `whisper` en Docker cuesta 2,1 s por frase y nativo 0,28 s, con la
+misma transcripción palabra por palabra.** No es que el modelo `small` sea
+lento: es que los contenedores en macOS corren en una VM Linux que no ve Metal.
+Bajar a `base` ahorra otros 0,18 s y casi dobla los errores, así que no
+compensa. Los números y la batería, en `scripts/whisper-mac.sh` y
+`scripts/escucha_fidelidad.py`.
+
+**Se le puede cortar hablando.** La página baja el volumen en cuanto el VAD oye
+voz (~0,15 s) y calla del todo cuando la huella confirma que es una persona y
+no él mismo (~0,6 s), sin esperar a saber qué se ha dicho. Después entiende:
+«espera» o «¿cómo?» devuelven un «¿qué pasa?» sin pasar por el LLM ni por la
+compuerta; «para» le deja callado; «sigue» retoma por donde iba. Y si la
+interrupción no era para él, vuelve solo a su frase. Al cortarse guarda **lo
+que llegó a decir y lo que le quedaba** por separado, que es lo que hace que
+«detalla eso último» signifique algo.
+
+**Y usa herramientas.** Calendario, correo, estado del servidor, notas de
+proyectos, recordatorios y búsqueda web: el modelo decide cuál le hace falta,
+se ejecuta, se le devuelve el resultado y contesta con él por voz. Los **datos
+son simulados** y viven en un fichero editable (`herramientas_simuladas.json`);
+el mecanismo —uso de herramientas nativo de la API de Anthropic contra
+MiniMax— es el de verdad.
+
+Lo que **escribe o envía** (crear un evento, mandar un correo, apuntar un
+recordatorio, borrar una nota) **se confirma en voz alta antes**. Y no por
+prompt: las herramientas de escritura literalmente no ejecutan nada, la única
+función que escribe está detrás de una acción anotada, y el sí lo clasifica una
+lista cerrada de palabras sin pasar por el modelo. Un malentendido de whisper
+—9,7 % de WER medio, medido aquí— no puede acabar en un correo enviado.
+
+```
+«¿Qué tengo mañana?»            -> consultar_calendario -> contesta
+«Mándale un correo a Elena…»    -> prepara, no envía    -> «voy a enviar un correo
+                                                           a Elena Cardona, asunto…
+                                                           ¿lo hago?»
+«sí»                            -> lo envía             -> «Enviado.»  (0,004 s:
+                                                           es un WAV pregrabado)
+```
+
+El perfil se elige **en la página**: `General` lo ve todo, `Servidor` solo la
+máquina y las notas, `Agenda` solo agenda, correo y recordatorios. Cambiar de
+perfil cambia la voz, las coletillas y el juego de herramientas a la vez.
+
+**El detalle completo:** [docs/asistente-herramientas.md](docs/asistente-herramientas.md)
+
+La página manda **cada frase a la misma sesión** en vez de una petición por
+frase, así que la respuesta entera es una sola locución. La velocidad distinta
+de 1 no viaja al servidor —el WebSocket la rechaza a propósito—: la aplica el
+navegador al reproducir, y eso mueve el tono. La página lo dice.
 
 **Medido con el asistente** (qwen3:1.7b contra la VM):
 
@@ -590,8 +686,8 @@ conviene desactivarlo.
 
 ### Bruno
 
-La colección en [`bruno/`](bruno/) cubre estado, TTS, STT y streaming, con entornos para LAN, túnel y
-local. El token va como variable secreta, fuera del repo.
+La colección en [`bruno/`](bruno/) cubre estado, TTS, STT, streaming y la fachada de OpenAI, con entornos
+para LAN, túnel y local. El token va como variable secreta, fuera del repo.
 
 </details>
 
@@ -657,6 +753,7 @@ Este README es el resumen. El detalle está en [`docs/`](docs/):
 | [opciones.md](docs/opciones.md) | todas las opciones NixOS, sus aserciones y configuraciones de ejemplo |
 | [rendimiento.md](docs/rendimiento.md) | las mediciones de Piper, whisper y la iGPU contra la CPU |
 | [hardware-y-portabilidad.md](docs/hardware-y-portabilidad.md) | GPU por passthrough, RAM y llevar el stack al Mac |
+| [asistente-herramientas.md](docs/asistente-herramientas.md) | el asistente con herramientas: qué pedirle, por qué escribir se confirma en voz alta, qué está simulado y cómo cambiarlo por lo real |
 
 ## Licencias
 
