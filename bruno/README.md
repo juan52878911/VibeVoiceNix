@@ -30,6 +30,7 @@ Estado/       salud y voces — sin token, para comprobar que responde
 TTS/          generar audio con Piper (rápido: RTF 0,04)
 STT/          transcribir audio con whisper
 Streaming/    VibeVoice, en el puerto 8082
+OpenAI/       la misma sintesis en el dialecto de OpenAI (`/v1/audio/speech`)
 ```
 
 ## El flujo que querrás probar primero

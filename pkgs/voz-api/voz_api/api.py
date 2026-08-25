@@ -5,6 +5,10 @@ Pensada para que un agente tipo OpenClaw mande y entienda notas de voz:
                         WhatsApp y Telegram como nota de voz)
   POST /stt   audio  -> texto (acepta lo que sea, ffmpeg normaliza a 16 kHz mono)
 
+Y la misma sintesis, traducida al dialecto que habla todo el mundo, en
+`POST /v1/audio/speech` (ver openai_api.py). Esa fachada tambien sabe delegar
+en voz-stream para VibeVoice.
+
 Las voces de Piper se cargan bajo demanda y se quedan en memoria; whisper corre
 como servidor aparte (whisper-server) para no recargar el modelo en cada llamada.
 
@@ -96,9 +100,13 @@ def cargar_voz(nombre: str) -> PiperVoice:
     return _voces[nombre]
 
 
-def convertir(wav_bytes: bytes, formato: str) -> bytes:
-    """Pasa el WAV de Piper al formato pedido con ffmpeg."""
-    args = FORMATOS[formato]
+def convertir(wav_bytes: bytes, args: list[str] | None) -> bytes:
+    """Pasa un WAV al formato pedido con ffmpeg. `args` None -> tal cual.
+
+    Recibe los argumentos de codec y no el nombre del formato porque hay dos
+    catalogos: los tres formatos de `/tts` (FORMATOS) y los seis de la fachada
+    de OpenAI (openai_api.FORMATOS), que no coinciden.
+    """
     if args is None:
         return wav_bytes
     proc = subprocess.run(
@@ -109,9 +117,23 @@ def convertir(wav_bytes: bytes, formato: str) -> bytes:
     if proc.returncode != 0:
         raise HTTPException(
             status_code=500,
-            detail=f"ffmpeg fallo al convertir a {formato}: {proc.stderr.decode()[:300]}",
+            detail=f"ffmpeg fallo al convertir: {proc.stderr.decode()[:300]}",
         )
     return proc.stdout
+
+
+def sintetizar_piper(texto: str, voz: str, length_scale: float) -> bytes:
+    """Sintetiza con Piper y devuelve el WAV entero.
+
+    `length_scale` es escala de DURACION: >1 habla mas lento. Quien reciba una
+    velocidad en el sentido contrario -- como el `speed` de OpenAI -- tiene que
+    invertirla ANTES de llamar aqui.
+    """
+    v = cargar_voz(voz or VOZ_DEFECTO)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        v.synthesize_wav(texto, wf, syn_config=SynthesisConfig(length_scale=length_scale))
+    return buf.getvalue()
 
 
 class PeticionTTS(BaseModel):
@@ -167,18 +189,14 @@ def tts(pet: PeticionTTS, _=Depends(autorizar)) -> Response:
     if formato not in FORMATOS:
         raise HTTPException(400, f"formato debe ser uno de {sorted(FORMATOS)}")
 
-    voz = cargar_voz(pet.voz or VOZ_DEFECTO)
     ini = time.perf_counter()
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        voz.synthesize_wav(pet.texto, wf, syn_config=SynthesisConfig(length_scale=pet.velocidad))
-    wav_bytes = buf.getvalue()
+    wav_bytes = sintetizar_piper(pet.texto, pet.voz or VOZ_DEFECTO, pet.velocidad)
     proc = time.perf_counter() - ini
 
     with wave.open(io.BytesIO(wav_bytes)) as wf:
         dur = wf.getnframes() / wf.getframerate()
 
-    audio = convertir(wav_bytes, formato)
+    audio = convertir(wav_bytes, FORMATOS[formato])
     return Response(
         content=audio,
         media_type=MIMES[formato],
