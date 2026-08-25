@@ -34,6 +34,31 @@ QUE SE MIDE, UNA VEZ ALINEADO
   tilt          inclinacion espectral en dB por octava, de cada uno. Un clon
                 mas apagado que el original sale con tilt mas negativo.
 
+TEXTURA (--textura): tres firmas de lo que suena "robotico" cuando el tono y el
+timbre ya coinciden. Con el triplete original / ciclo del codec / clon entero se
+puede separar de quien es la culpa. MEDIDO sobre cuatro voces reales:
+
+    metrica                  CODEC   disp.   GENERAR   suelo semilla
+    nitidez de ataques        -1,5 %  +-6,5    -3,6 %       1,6 %
+    planitud de sibilantes    -8,0 %  +-20     -5,5 %      16,8 %
+    modulacion 4-8 Hz         -1,7 %  +-4,2    +1,5 %       3,1 %
+    modulacion 8-16 Hz        -4,5 %  +-6,5    +0,3 %       4,6 %
+    modulacion 16-32 Hz      -21,5 %  +-13     -3,6 %       2,7 %
+    modulacion 32-64 Hz      -22,1 %  +-9,1    +4,8 %       5,5 %
+
+Cada efecto contra el suelo de ruido QUE LE CORRESPONDE, y no vale mezclarlos:
+el ciclo del codec es una reconstruccion determinista del MISMO audio, asi que
+cualquier diferencia es real y su suelo es cero; el clon dice el mismo texto
+pero es otra realizacion, asi que su suelo es la variabilidad entre semillas.
+
+Lo que dicen estos numeros: **el codec NO emborrona los ataques ni el ritmo
+silabico**, que era la prediccion fuerte de la hipotesis de los 7,5 latentes por
+segundo. Lo que si pierde es una quinta parte de la modulacion RAPIDA (16-64 Hz)
+-- el grano, la aspereza --, consistente en direccion en las cuatro voces en la
+banda de 32-64 Hz. Y la generacion apenas resta nada mas alla de la loteria de
+la semilla. Si ese 22 % es audible o no, estas metricas no lo dicen: eso lo
+decide una escucha A/B entre el original y el ciclo.
+
 Solo numpy, como el resto del repo.
 """
 import argparse
@@ -187,12 +212,120 @@ def bandas(x_ref, x_cmp, hz=RITMO):
             for lo, hi in cortes if ((f >= lo) & (f < hi)).sum()]
 
 
+# ==========================================================================
+# TEXTURA: lo que suena "robotico" cuando el tono y el timbre ya coinciden
+#
+# El sospechoso es la tasa de fotogramas del codec acustico: 7,5 latentes por
+# segundo, o sea uno cada 133 ms. Para comparar, EnCodec va a 75 Hz, DAC a 86 y
+# Mimi a 12,5. Un ataque de oclusiva dura 5-20 ms y una /s/ es estructura fina
+# de ruido: todo eso tiene que caber en 64 dimensiones por cada 133 ms.
+#
+# Si esa es la causa, tiene tres firmas medibles, y las tres se comparan mejor
+# CONTRA EL CICLO del codec (audio -> z -> audio, sin modelo de lenguaje) que
+# contra el clon entero: lo que ya aparezca en el ciclo es del codec y no tiene
+# arreglo sin entrenar; lo que solo aparezca en el clon es de la generacion.
+# ==========================================================================
+
+ENV_VENTANA, ENV_SALTO = 512, 64          # envolvente a 24000/64 = 375 Hz
+BANDAS_ENV = [(100, 800), (800, 2500), (2500, 8000)]
+
+
+def envolventes(x, hz=RITMO):
+    """Envolvente de energia por banda, muestreada a 375 Hz.
+
+    Salto de 64 muestras y no 256: con 256 la envolvente va a 93,75 Hz y su
+    Nyquist (46,9 Hz) corta justo la banda de transitorios que se quiere mirar.
+    """
+    v = np.hanning(ENV_VENTANA).astype(np.float32)
+    n = max(1, (len(x) - ENV_VENTANA) // ENV_SALTO)
+    esp = np.empty((n, ENV_VENTANA // 2 + 1), dtype=np.float32)
+    for i in range(n):
+        esp[i] = np.abs(np.fft.rfft(x[i * ENV_SALTO:i * ENV_SALTO + ENV_VENTANA] * v))
+    f = np.fft.rfftfreq(ENV_VENTANA, 1 / hz)
+    return {(lo, hi): np.sqrt(((esp[:, (f >= lo) & (f < hi)] ** 2).sum(1)))
+            for lo, hi in BANDAS_ENV}, hz / ENV_SALTO
+
+
+def espectro_modulacion(x, hz=RITMO, banda=(2500, 8000)):
+    """Cuanta energia tiene la envolvente en cada rango de modulacion.
+
+    Se normaliza por la energia total de la envolvente, asi que no depende del
+    volumen: son proporciones. La banda 20-64 Hz es la de los transitorios; si
+    el codec los emborrona, cae ahi.
+    """
+    envs, hz_env = envolventes(x, hz)
+    e = envs[banda]
+    if len(e) < 64:
+        return {}
+    e = e - e.mean()
+    E = np.abs(np.fft.rfft(e * np.hanning(len(e)))) ** 2
+    f = np.fft.rfftfreq(len(e), 1 / hz_env)
+    total = E[(f > 0.5)].sum() or 1.0
+    rangos = [(0.5, 2), (2, 4), (4, 8), (8, 16), (16, 32), (32, 64)]
+    return {f"{lo:g}-{hi:g}Hz": float(E[(f >= lo) & (f < hi)].sum() / total)
+            for lo, hi in rangos}
+
+
+def nitidez_ataques(x, hz=RITMO, banda=(2500, 8000)):
+    """Cuanto sube la envolvente en sus subidas mas bruscas, en dB por segundo.
+
+    Un ataque de consonante es una subida casi vertical. Si el codec la
+    redondea, este numero baja. Se toma el percentil 95 de la derivada positiva
+    para quedarse con los ataques de verdad y no con el ruido de fondo.
+    """
+    envs, hz_env = envolventes(x, hz)
+    e = envs[banda]
+    if len(e) < 16:
+        return 0.0
+    e = 20 * np.log10(e + 1e-6)
+    d = np.diff(e) * hz_env                # dB por segundo
+    d = d[d > 0]
+    return float(np.percentile(d, 95)) if len(d) else 0.0
+
+
+def planitud_sibilantes(x, hz=RITMO, lo=4000, hi=9000, percentil=85):
+    """Planitud espectral dentro de las fricativas, en 4-9 kHz.
+
+    Una /s/ humana es ruido: su espectro es casi plano y la planitud (media
+    geometrica / media aritmetica) se acerca a 1. Si el codec la reconstruye con
+    estructura -- picos, armonicos falsos -- la planitud baja y se oye metalica.
+    Se miran solo los fotogramas donde esa banda manda, que son las fricativas.
+    """
+    v = np.hanning(N_FFT).astype(np.float32)
+    m = np.array([np.abs(np.fft.rfft(x[i:i + N_FFT] * v)) ** 2
+                  for i in range(0, max(1, len(x) - N_FFT), SALTO)])
+    if m.size == 0:
+        return 0.0
+    f = np.fft.rfftfreq(N_FFT, 1 / hz)
+    alta = (f >= lo) & (f < hi)
+    baja = (f >= 200) & (f < 2000)
+    razon = m[:, alta].sum(1) / (m[:, baja].sum(1) + 1e-12)
+    sel = razon >= np.percentile(razon, percentil)
+    if sel.sum() < 3:
+        return 0.0
+    p = m[sel][:, alta] + 1e-12
+    return float(np.mean(np.exp(np.log(p).mean(1)) / p.mean(1)))
+
+
+def textura(x, hz=RITMO):
+    """Las tres firmas juntas, para UN audio."""
+    mod = espectro_modulacion(x, hz)
+    return {"ataques_dB_s": nitidez_ataques(x, hz),
+            "planitud_sib": planitud_sibilantes(x, hz),
+            "mod_4_8": mod.get("4-8Hz", 0.0),
+            "mod_8_16": mod.get("8-16Hz", 0.0),
+            "mod_16_32": mod.get("16-32Hz", 0.0),
+            "mod_32_64": mod.get("32-64Hz", 0.0)}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("original")
     ap.add_argument("clonados", nargs="+")
     ap.add_argument("--bandas", action="store_true", help="desglose por bandas de frecuencia")
+    ap.add_argument("--textura", action="store_true",
+                    help="espectro de modulacion, nitidez de ataques y planitud de sibilantes")
     args = ap.parse_args()
     xr, hz = leer_wav(args.original)
     print(f"{'clon':30} {'f0_corr':>8} {'f0_err':>7} {'rango':>13} {'ratio':>6} "
@@ -207,6 +340,11 @@ def main():
               f"{m.get('rango_ref', 0):5.1f}->{m.get('rango_cmp', 0):5.1f}st "
               f"{m.get('rango_ratio', float('nan')):6.2f} {m['mel_dist']:6.3f} "
               f"{m['ltas_dist']:6.2f} {m['tilt_ref']:6.2f}/{m['tilt_cmp']:6.2f}")
+        if args.textura:
+            t = textura(xc)
+            print(f"      ataques {t['ataques_dB_s']:6.1f} dB/s | sibilantes {t['planitud_sib']:.3f} | "
+                  f"modulacion 4-8 {t['mod_4_8']:.3f}  8-16 {t['mod_8_16']:.3f}  "
+                  f"16-32 {t['mod_16_32']:.3f}  32-64 {t['mod_32_64']:.3f}")
         if args.bandas:
             for lo, hi, d in bandas(xr, xc, hz):
                 signo = "+" if d >= 0 else ""
