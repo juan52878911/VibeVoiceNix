@@ -210,8 +210,29 @@ Módulo: [`nix/modules/voz-stream.nix`](../nix/modules/voz-stream.nix).
 | `direccion` | `str` | `"0.0.0.0"` | Interfaz de escucha. |
 | `abrirCortafuegos` | `bool` | `false` | Abre el puerto en la LAN. Con el túnel activo no hace falta. |
 | `ficheroToken` | `nullOr path` | `null` | Igual que en `voz-api`: fuera del store. |
+| `vocesPropias` | `nullOr path` | `null` | Directorio de la máquina con prefijos `.pt` propios. Fuera del store. |
 | `solaparDecodificador` | `bool` | `true` | Corre el decodificador acústico **a la vez** que el bucle: −21 % de RTF. |
 | `hilosDecodificador` | `int` | `0` | Hilos para el decodificador solapado. 0 = la mitad de `hilos`. |
+
+**`vocesPropias` está fuera del `/nix/store` por el mismo motivo que `ficheroToken`, y el motivo aquí es
+más fuerte todavía: un prefijo `.pt` **es** la voz clonable de una persona. Meterlo en el flake lo
+publicaría en el repositorio. Los `.pt` se suben aparte y se suman a las 61 voces oficiales; si uno
+propio se llama igual que una oficial, gana el propio.
+
+```bash
+scp mi_voz.pt root@voz:/var/lib/voz/voces-propias/
+ssh root@voz systemctl restart voz-stream
+```
+
+El directorio lo crea `systemd-tmpfiles` con `0755` —el servicio corre con `DynamicUser` y tiene que
+poder leerlo— y `ExecStartPre` monta un directorio combinado con **enlaces** en `RuntimeDirectory`: son
+96 MB de voces oficiales que ya están en el store y el servicio solo las lee. Se rehace en cada arranque,
+así que nunca queda un enlace apuntando a una voz que ya no está. Sin voces propias no se monta nada y
+`VIBEVOICE_VOCES` apunta directo al store, como siempre.
+
+Los prefijos se fabrican con [`scripts/clonar_voz.py`](../scripts/clonar_voz.py), que **no cabe en la
+VM** — ver [clonado-de-voz.md §7.9](clonado-de-voz.md). Se hacen en una estación de trabajo y aquí llega
+el `.pt`, de 2,6 a 8,4 MB.
 
 **`solaparDecodificador` es la palanca de RTF más reciente, y la forma correcta de usar los hilos que
 sobran.** El decodificador acústico se lleva el 42 % del tiempo y —comprobado leyendo el bucle de
