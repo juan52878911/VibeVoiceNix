@@ -295,8 +295,15 @@ def subcomando_datos(args):
     _, modelo = cargar_modelo(args.modelo, args.cache, disp, 10, con_encoder=True)
     tok = modelo.model.acoustic_tokenizer
 
+    # Se excluyen los `._*`: macOS deja uno por fichero al escribir en volumenes
+    # que no soportan atributos extendidos, y son metadatos AppleDouble, no
+    # audio. Sin este filtro la lista se DUPLICA -- 4.903 wav reales y 4.903 de
+    # basura -- y cada uno gasta un ffmpeg que falla. Medido: la generacion baja
+    # de 7x a 3x tiempo real. No corrompe nada, porque el try/except los
+    # descarta, pero tarda el doble.
     fuentes = sorted(p for ext in ("*.wav", "*.flac", "*.mp3", "*.opus")
-                     for p in Path(args.corpus).rglob(ext))
+                     for p in Path(args.corpus).rglob(ext)
+                     if not p.name.startswith("._"))
     if args.mezclar:
         # los ficheros vienen ordenados y eso pone todas las voces femeninas
         # primero: con --max-min se entrenaria casi solo con ellas
