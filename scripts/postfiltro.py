@@ -82,6 +82,44 @@ OJO CON LA LICENCIA: entrenado con OpenSLR 72 (espanol colombiano), que es
 CC BY-SA 4.0. Para uso propio da igual; si algun dia se distribuyen los pesos,
 el share-alike viaja con ellos.
 
+LA VIA ADVERSARIAL: PROBADA Y DESCARTADA POR PRESUPUESTO, NO POR LA IDEA
+Se anadio un discriminador multi-periodo de HiFi-GAN (1,06 M) y se ajusto v5
+con el durante 8 epocas. EMPEORA, y de forma monotona:
+
+    v5 (sin discriminador)   +54,9 %
+    adv, epoca 2             +51,2 %
+    adv, epoca 8             +41,9 %
+
+La causa esta medida, no supuesta. El discriminador se quedo clavado en 0,497
+desde la primera epoca, que en LSGAN es exactamente el equilibrio de azar. Con
+el generador congelado y entrenando SOLO el discriminador:
+
+    tarea                        separacion tras 150 pasos
+    real vs filtrado por v5              +0,000
+    real vs ciclo crudo                  +0,000
+    real vs real + ruido 0,02            +0,001
+    real vs ruido puro                   +0,180
+
+Ni con normalizacion de pesos ni con 5x el learning rate. Y alargando a 1.500
+pasos sobre la tarea facil (real vs ciclo crudo) se ve lo que pasa de verdad:
+
+    paso   100   separacion +0,0001
+    paso   300              +0,0004
+    paso   600              +0,0010
+    paso  1000              +0,0019
+    paso  1500              +0,0047
+
+APRENDE, pero a un ritmo que necesitaria del orden de 100.000 pasos para dar
+una senal util -- que es justamente lo que entrena HiFi-GAN. El ajuste fino de
+aqui hizo 2.792. A ese ritmo la separacion era ~0,008: gradiente de ruido, que
+arrastro al generador fuera del optimo de reconstruccion sin darle nada a
+cambio. De ahi que empeore cuanto mas entrena.
+
+Conclusion: la via adversarial no esta descartada por equivocada -- es la
+tecnica estandar para textura -- sino por PRESUPUESTO. Pide dias de GPU, no
+horas de portatil. Si algun dia hay una GPU decente, es lo primero que hay que
+retomar, y el arnes (`postfiltro.py adversarial`) ya esta escrito y probado.
+
 EL RIESGO QUE HAY QUE VIGILAR
 Los pares se hacen con z del ENCODER, pero en produccion la z viene muestreada
 por la cabeza de difusion. Son distribuciones parecidas pero no iguales, asi que
@@ -286,6 +324,80 @@ class PerdidaModulacion(nn.Module):
         return (d * w[None, None, :]).sum() / (d.numel() * w.mean())
 
 
+# ==========================================================================
+# DISCRIMINADOR
+#
+# La tercera pieza. Las dos perdidas de reconstruccion -- multi-STFT y
+# modulacion -- comparan promedios, y el grano de una voz es justo lo que un
+# promedio borra: no hay una respuesta "correcta" que copiar, hay una
+# TEXTURA que tiene que ser plausible. Eso es lo que un discriminador sabe
+# exigir y una L1 espectral no.
+#
+# Se usa el discriminador multi-periodo de HiFi-GAN, no uno espectral: la onda
+# se dobla en 2D con periodos primos y cada rama ve la estructura periodica a
+# esa escala. Los periodos pequenos (2, 3, 5 muestras a 24 kHz) caen justo en
+# la microestructura de ciclo a ciclo, que es donde vive el jitter que el
+# codec plancha.
+# ==========================================================================
+
+class RamaPeriodo(nn.Module):
+    """Una rama del discriminador: dobla la onda cada `periodo` muestras."""
+
+    def __init__(self, periodo, canales=(16, 64, 128, 256)):
+        super().__init__()
+        self.periodo = periodo
+        capas, ant = [], 1
+        for c in canales:
+            capas.append(nn.Conv2d(ant, c, (5, 1), (3, 1), padding=(2, 0)))
+            ant = c
+        self.convs = nn.ModuleList(capas)
+        self.final = nn.Conv2d(ant, 1, (3, 1), padding=(1, 0))
+        self.act = nn.LeakyReLU(0.1)
+
+    def forward(self, x):                       # (B, 1, T)
+        b, c, t = x.shape
+        if t % self.periodo:
+            x = nn.functional.pad(x, (0, self.periodo - t % self.periodo), "reflect")
+            t = x.shape[-1]
+        x = x.view(b, c, t // self.periodo, self.periodo)
+        rasgos = []
+        for conv in self.convs:
+            x = self.act(conv(x))
+            rasgos.append(x)                    # para la perdida de rasgos
+        return self.final(x), rasgos
+
+
+class Discriminador(nn.Module):
+    """Varias ramas con periodos primos, para que no compartan alineamiento."""
+
+    def __init__(self, periodos=(2, 3, 5, 7, 11)):
+        super().__init__()
+        self.ramas = nn.ModuleList([RamaPeriodo(p) for p in periodos])
+
+    def forward(self, x):
+        salidas, rasgos = [], []
+        for r in self.ramas:
+            s, f = r(x)
+            salidas.append(s); rasgos.append(f)
+        return salidas, rasgos
+
+
+def perdida_rasgos(reales, falsos):
+    """Distancia entre las activaciones internas del discriminador.
+
+    Es el ancla que evita que el generador persiga solo al discriminador: le
+    pide que las representaciones intermedias coincidan, no solo el veredicto.
+    Sin esto un GAN de audio se va a ruido plausible pero equivocado.
+    """
+    total = 0.0
+    n = 0
+    for fr, ff in zip(reales, falsos):
+        for a, b in zip(fr, ff):
+            total = total + nn.functional.l1_loss(b, a.detach())
+            n += 1
+    return total / max(1, n)
+
+
 # ------------------------------------------------------------------ datos --
 def subcomando_datos(args):
     """Corpus de habla real -> pares (ciclo del codec, original) en .npy."""
@@ -465,6 +577,102 @@ def subcomando_aplicar(args):
             print(f"{nom:22} {r[k]:9.4f}")
 
 
+# ---------------------------------------------------------- adversarial --
+def subcomando_adversarial(args):
+    """Ajuste fino de un post-filtro que YA funciona, con discriminador.
+
+    Se parte de un checkpoint entrenado, no de cero. Un GAN de audio desde
+    cero es inestable y aqui no hace falta: v5 ya cierra el 55 % del hueco, y
+    lo que se busca es la textura que las perdidas de reconstruccion no saben
+    pedir. Ademas el limite del residuo sigue puesto, asi que por mucho que el
+    discriminador empuje, el generador no puede inventar energia donde no la
+    hay -- es un estabilizador estructural, no una esperanza.
+    """
+    disp = "mps" if torch.backends.mps.is_available() else "cpu"
+    sucio = torch.from_numpy(np.load(Path(args.pares) / "sucio.npy"))
+    limpio = torch.from_numpy(np.load(Path(args.pares) / "limpio.npy"))
+    n = len(sucio)
+    idx = torch.randperm(n, generator=torch.Generator().manual_seed(7))
+    corte = max(1, int(n * 0.05))
+    val, ent = idx[:corte], idx[corte:]
+
+    ck = torch.load(args.partir_de, map_location="cpu", weights_only=False)
+    gen = PostFiltro(base=ck.get("base", 24), limite=ck.get("limite", 0.0)).to(disp)
+    gen.load_state_dict(ck["estado"])
+    dis = Discriminador().to(disp)
+    print(f"generador {sum(p.numel() for p in gen.parameters())/1e6:.2f} M "
+          f"(desde {args.partir_de}), discriminador "
+          f"{sum(p.numel() for p in dis.parameters())/1e6:.2f} M")
+    print(f"{len(ent)} trozos de entrenamiento, {len(val)} de validacion")
+
+    # lr bajo en el generador: viene de un optimo y solo hay que moverlo un poco
+    og = torch.optim.AdamW(gen.parameters(), lr=args.lr_gen, betas=(0.8, 0.99))
+    od = torch.optim.AdamW(dis.parameters(), lr=args.lr_dis, betas=(0.8, 0.99))
+    p_stft, p_mod = PerdidaMultiSTFT(disp), PerdidaModulacion(disp)
+
+    def reconstruccion(y, obj):
+        return p_stft(y, obj) + args.peso_mod * p_mod(y, obj)
+
+    mejor = float("inf")
+    for ep in range(1, args.epocas + 1):
+        gen.train(); dis.train()
+        perm = ent[torch.randperm(len(ent))]
+        ac_g = ac_d = ac_a = 0.0
+        pasos = 0
+        t0 = time.perf_counter()
+        for k in range(0, len(perm) - args.lote + 1, args.lote):
+            b = perm[k:k + args.lote]
+            x = sucio[b].unsqueeze(1).to(disp)
+            y = limpio[b].unsqueeze(1).to(disp)
+            gy = gen(x)
+
+            # --- discriminador: LSGAN, reales a 1 y falsos a 0 ---
+            sr, _ = dis(y)
+            sf, _ = dis(gy.detach())
+            ld = sum(((r - 1) ** 2).mean() + (f ** 2).mean() for r, f in zip(sr, sf)) / len(sr)
+            od.zero_grad(); ld.backward()
+            torch.nn.utils.clip_grad_norm_(dis.parameters(), 1.0)
+            od.step()
+
+            # --- generador: reconstruccion + adversarial + rasgos ---
+            sr, fr = dis(y)
+            sf, ff = dis(gy)
+            la = sum(((f - 1) ** 2).mean() for f in sf) / len(sf)
+            lrec = reconstruccion(gy, y)
+            lg = lrec + args.peso_adv * la + args.peso_rasgos * perdida_rasgos(fr, ff)
+            og.zero_grad(); lg.backward()
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), 1.0)
+            og.step()
+
+            ac_g += lrec.item(); ac_d += ld.item(); ac_a += la.item(); pasos += 1
+
+        # la validacion se juzga SOLO por reconstruccion: la perdida
+        # adversarial no es comparable entre epocas porque el discriminador
+        # cambia bajo ella
+        gen.eval(); vac, vn = 0.0, 0
+        with torch.no_grad():
+            for k in range(0, len(val), args.lote):
+                b = val[k:k + args.lote]
+                x = sucio[b].unsqueeze(1).to(disp); y = limpio[b].unsqueeze(1).to(disp)
+                vac += reconstruccion(gen(x), y).item(); vn += 1
+        vl = vac / max(1, vn)
+        marca = ""
+        if vl < mejor:
+            mejor = vl
+            torch.save({"estado": gen.state_dict(), "base": ck.get("base", 24),
+                        "limite": ck.get("limite", 0.0)}, args.salida)
+            marca = "  <- guardado"
+        # siempre se guarda el ultimo tambien: en un GAN el mejor por
+        # reconstruccion no tiene por que ser el que mejor suena
+        torch.save({"estado": gen.state_dict(), "base": ck.get("base", 24),
+                    "limite": ck.get("limite", 0.0)}, str(args.salida) + ".ultimo")
+        print(f"epoca {ep:3d}  recon {ac_g/pasos:.4f}  disc {ac_d/pasos:.4f}  "
+              f"adv {ac_a/pasos:.4f}  valid {vl:.4f}  "
+              f"{time.perf_counter()-t0:.0f} s{marca}", flush=True)
+    print(f"\nmejor validacion por reconstruccion: {mejor:.4f}")
+    print(f"guardados {args.salida} (mejor) y {args.salida}.ultimo")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -496,6 +704,19 @@ def main():
     e.add_argument("--peso-mod", type=float, default=1.0,
                    help="peso de la perdida de modulacion frente a la multi-STFT")
     e.set_defaults(f=subcomando_entrenar)
+
+    v = sub.add_parser("adversarial", help="ajuste fino con discriminador")
+    v.add_argument("--pares", required=True)
+    v.add_argument("--partir-de", required=True, help="checkpoint que ya funciona")
+    v.add_argument("--salida", default="postfiltro-adv.pt")
+    v.add_argument("--epocas", type=int, default=10)
+    v.add_argument("--lote", type=int, default=16)
+    v.add_argument("--lr-gen", type=float, default=5e-5)
+    v.add_argument("--lr-dis", type=float, default=2e-4)
+    v.add_argument("--peso-mod", type=float, default=1.0)
+    v.add_argument("--peso-adv", type=float, default=1.0)
+    v.add_argument("--peso-rasgos", type=float, default=2.0)
+    v.set_defaults(f=subcomando_adversarial)
 
     a = sub.add_parser("aplicar", help="pasar un wav por el post-filtro")
     a.add_argument("entrada"); a.add_argument("salida")
