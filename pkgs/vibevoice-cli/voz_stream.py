@@ -1302,6 +1302,22 @@ def a_dispositivo(obj):
         copia.key_cache = [a_dispositivo(t) for t in obj.key_cache]
         copia.value_cache = [a_dispositivo(t) for t in obj.value_cache]
         return copia
+    # transformers >= 4.56 guarda el DynamicCache por capas (.layers, cada una
+    # con .keys/.values) y ya sin key_cache. Los .pt oficiales de Microsoft
+    # vienen del formato viejo y entran por la rama de arriba; los que fabrica
+    # scripts/clonar_voz.py con la libreria de hoy entran por esta. Sin ella el
+    # prefijo clonado se queda en CPU EN SILENCIO y la primera generacion en
+    # GPU aborta con "Passed CPU tensor to MPS op".
+    if hasattr(obj, "layers") and all(
+            hasattr(c, "keys") and hasattr(c, "values") for c in obj.layers):
+        copia = copy.copy(obj)
+        copia.layers = []
+        for capa in obj.layers:
+            capa_copia = copy.copy(capa)
+            capa_copia.keys = a_dispositivo(capa.keys)
+            capa_copia.values = a_dispositivo(capa.values)
+            copia.layers.append(capa_copia)
+        return copia
     if isinstance(obj, dict):
         # copy() y no dict(): el prefijo es un BaseModelOutputWithPast y
         # generate() accede a sus atributos, no lo trata como dict pelado.
