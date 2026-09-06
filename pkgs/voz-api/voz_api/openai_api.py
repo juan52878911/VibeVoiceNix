@@ -106,6 +106,11 @@ MOTORES = {
     "vibevoice": "vibevoice",
     "vibevoice-realtime-0.5b": "vibevoice",
     "voz-stream": "vibevoice",
+    # Mismo camino (:8082): que modelo hay detras lo decide
+    # services.voz-stream.motor, y /health lo dice. Los alias existen para
+    # que un cliente pueda pedir "qwen3tts" sin que la fachada lo rechace.
+    "qwen3tts": "vibevoice",
+    "qwen3-tts-0.6b": "vibevoice",
 }
 
 # Las once voces canonicas de OpenAI. Aqui no existen; la lista sirve para

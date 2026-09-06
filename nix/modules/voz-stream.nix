@@ -24,6 +24,42 @@ let
 
   # RuntimeDirectory = "voz-stream" lo pone systemd en /run/voz-stream.
   dirCombinado = "/run/voz-stream/voces";
+
+  esQwen = cfg.motor == "qwen3tts";
+  q = cfg.qwen3tts;
+  modeloQwen = if q.modeloPropio != null then q.modeloPropio else "${pkgs.qwen3TtsPesos}";
+
+  # El entorno del shim de Qwen3 (pkgs/qwen3tts-cli/voz_stream_qwen.py).
+  envQwen = {
+    QWEN3TTS_BIN = "${pkgs.qwen3TtsC}/bin/qwen_tts";
+    QWEN3TTS_MODELO = modeloQwen;
+    QWEN3TTS_VOCES = dirCombinado;
+    QWEN3TTS_CUANT = q.cuantizacion;
+    QWEN3TTS_HILOS = toString q.hilos;
+    QWEN3TTS_VOZ_DEFECTO = q.vozDefecto;
+    QWEN3TTS_IDIOMA = q.idiomaDefecto;
+    QWEN3TTS_TROZO = toString q.trozo;
+    QWEN3TTS_RTF = toString q.rtfEsperado;
+    VOZ_STREAM_HOST = cfg.direccion;
+    VOZ_STREAM_PUERTO = toString cfg.puerto;
+    MALLOC_ARENA_MAX = "2";
+  };
+
+  # Con Qwen3 no hay voces oficiales: el directorio combinado son solo las
+  # propias, en los cuatro formatos que entiende el shim.
+  combinarVocesQwen = pkgs.writeShellScript "voz-stream-combinar-voces-qwen" ''
+    set -eu
+    rm -rf ${dirCombinado}
+    mkdir -p ${dirCombinado}
+    n=0
+    for f in ${cfg.vocesPropias}/*.bin ${cfg.vocesPropias}/*.qvoice \
+             ${cfg.vocesPropias}/*.wav ${cfg.vocesPropias}/*.txt; do
+      [ -e "$f" ] || continue
+      ln -sf "$f" ${dirCombinado}/
+      n=$((n + 1))
+    done
+    echo "[voces] $n ficheros de voz propios (qwen3tts)"
+  '';
 in
 {
   options.services.voz-stream = {
@@ -32,6 +68,69 @@ in
       hace un pico de ~4,6 GB al cargar (materializa el fp32 antes de
       cuantizarlo), asi que conviene mirar la memoria libre antes de activarlo
     '';
+
+    motor = lib.mkOption {
+      type = lib.types.enum [ "vibevoice" "qwen3tts" ];
+      default = "vibevoice";
+      description = ''
+        Que modelo hay detras de :8082. El contrato HTTP es el mismo
+        (POST /tts/stream, GET /voces, GET /health); cambia lo que hay debajo.
+
+          vibevoice   VibeVoice-Realtime-0.5B con OpenVINO (lo medido: RTF
+                      0,75 en la VM, sesiones KV, 61 voces oficiales).
+          qwen3tts    Qwen3-TTS-0.6B-Base con el motor C: 10 idiomas y clonado
+                      cruzado, sin sesiones, sin voces oficiales (solo las de
+                      `vocesPropias`), y con la puerta de RTF por medir en
+                      esta CPU (ver docs/comparativa-motores.md).
+      '';
+    };
+
+    qwen3tts = {
+      cuantizacion = lib.mkOption {
+        type = lib.types.enum [ "int8" "int4" ];
+        default = "int8";
+        description = "Cuantizacion del talker y el code predictor en el motor C.";
+      };
+      hilos = lib.mkOption {
+        type = lib.types.int;
+        default = 0;
+        description = "Hilos del motor C. 0 = todos los de la VM.";
+      };
+      vozDefecto = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Voz cuando la peticion no trae `voz`. Tiene que estar en `vocesPropias`.";
+      };
+      idiomaDefecto = lib.mkOption {
+        type = lib.types.str;
+        default = "es";
+        description = "Idioma cuando la peticion no trae `idioma` (es, en, pt, fr, it, de, ru, ja, ko, zh).";
+      };
+      trozo = lib.mkOption {
+        type = lib.types.int;
+        default = 160;
+        description = ''
+          Caracteres por trozo: Qwen3 acelera el ritmo pasados ~100-150 (issue
+          #239, cerrado sin arreglo), asi que el shim corta por frase y
+          sintetiza los trozos seguidos con la misma semilla. 0 = sin cortar.
+        '';
+      };
+      rtfEsperado = lib.mkOption {
+        type = lib.types.float;
+        default = 1.0;
+        description = "Lo que se anuncia en X-RTF-Esperado. Ponerlo al valor MEDIDO en esta VM.";
+      };
+      modeloPropio = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = "/var/lib/voz/qwen3/juan";
+        description = ''
+          Un checkpoint afinado (LoRA fusionada o SFT) en formato Hugging Face,
+          FUERA del store por la misma razon que `vocesPropias`: es la voz de
+          una persona. null = los pesos oficiales del 0.6B-Base.
+        '';
+      };
+    };
 
     puerto = lib.mkOption {
       type = lib.types.port;
@@ -177,13 +276,23 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [{
-      assertion = vv.enable;
-      message = ''
-        services.voz-stream necesita services.vibevoice.enable = true: usa su
-        mismo modelo, sus voces y su configuracion de pasos de difusion.
-      '';
-    }];
+    assertions = [
+      {
+        assertion = esQwen || vv.enable;
+        message = ''
+          services.voz-stream (motor vibevoice) necesita services.vibevoice.enable
+          = true: usa su mismo modelo, sus voces y su configuracion de pasos.
+        '';
+      }
+      {
+        assertion = !esQwen || cfg.vocesPropias != null;
+        message = ''
+          services.voz-stream con motor qwen3tts necesita vocesPropias: el
+          0.6B-Base no trae voces, solo clona las que se le den (.bin, .qvoice
+          o .wav + .txt fabricados con scripts/clonar_voz_qwen.py).
+        '';
+      }
+    ];
 
     # El directorio tiene que existir y ser legible por el DynamicUser del
     # servicio. Se crea vacio si no esta; los .pt se suben aparte.
@@ -192,12 +301,12 @@ in
     ];
 
     systemd.services.voz-stream = {
-      description = "TTS en streaming (VibeVoice)";
+      description = "TTS en streaming (${cfg.motor})";
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
-      environment = {
+      environment = if esQwen then envQwen else {
         VIBEVOICE_MODELO = "${pesos.modelo}";
         # Con voces propias se apunta al directorio COMBINADO que monta
         # ExecStartPre; sin ellas, directo al del store y no se monta nada.
@@ -241,7 +350,7 @@ in
         # Enlaces, no copias: son 96 MB de voces oficiales que ya estan en el
         # store, y el servicio solo las lee.
         ExecStartPre = lib.mkIf (cfg.vocesPropias != null)
-          (pkgs.writeShellScript "voz-stream-combinar-voces" ''
+          (if esQwen then combinarVocesQwen else pkgs.writeShellScript "voz-stream-combinar-voces" ''
             set -eu
             rm -rf ${dirCombinado}
             mkdir -p ${dirCombinado}
@@ -258,7 +367,10 @@ in
             echo "[voces] $propias propias sobre $(ls ${pesos.voces}/*.pt | wc -l) oficiales"
           '');
 
-        ExecStart = "${pkgs.vibevoice-env}/bin/python ${pesos.inferencia}/bin/voz-stream.py";
+        ExecStart =
+          if esQwen
+          then "${pkgs.voz-api}/bin/python ${pkgs.qwen3ttsCodigo}/bin/voz-stream-qwen.py"
+          else "${pkgs.vibevoice-env}/bin/python ${pesos.inferencia}/bin/voz-stream.py";
         EnvironmentFile = lib.mkIf (cfg.ficheroToken != null) cfg.ficheroToken;
 
         # El arranque carga el modelo y hace una sintesis de calentamiento:
@@ -305,6 +417,8 @@ in
     # marca como fallo: es un saneo oportunista, no un requisito de arranque.
     systemd.services.voz-stream-sin-swap = {
       description = "Devuelve a RAM las paginas que el arranque de voz-stream empujo al swap";
+      # El motor C carga por mmap y por peticion: no hay pico de arranque.
+      enable = !esQwen;
       after = [ "voz-stream.service" ];
       requires = [ "voz-stream.service" ];
       wantedBy = [ "multi-user.target" ];

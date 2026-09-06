@@ -79,15 +79,67 @@
         ];
       };
 
+      # La misma VM con Qwen3 detras de :8082. Existe para poder evaluar y
+      # desplegar el motor nuevo con un solo cambio de nombre:
+      #   nixos-rebuild switch --flake .#voz-qwen ...
+      # Solo tiene sentido si la puerta de RTF de docs/comparativa-motores.md
+      # se cumple en esta CPU.
+      nixosConfigurations.voz-qwen = nixpkgs.lib.nixosSystem {
+        system = sistemaDestino;
+        modules = [
+          disko.nixosModules.disko
+          { nixpkgs.overlays = [ overlayPropio ]; }
+          ./nix/options.nix
+          ./nix/disko.nix
+          ./nix/configuration.nix
+          ./nix/host.nix
+          ./nix/modules
+          {
+            # Las voces de Qwen (.bin/.qvoice/.wav+.txt) van al mismo
+            # directorio que los .pt de VibeVoice (configuration.nix):
+            # conviven, cada motor coge los suyos.
+            services.voz-stream.motor = "qwen3tts";
+            services.voz-stream.qwen3tts.vozDefecto = "juan";
+            # VibeVoice y sus IR sobran aqui: la RAM es para el motor C.
+            services.vibevoice.enable = nixpkgs.lib.mkForce false;
+            services.vibevoice.openvino.enable = nixpkgs.lib.mkForce false;
+          }
+        ];
+      };
+
+      # ------------------------------------------------------------------
+      # La VM taller: misma base, sin servicios, con Qwen3 y el motor actual
+      # para medir y doblar por lotes. Ver nix/taller.nix y
+      # scripts/modo_taller.sh.
+      # ------------------------------------------------------------------
+      nixosConfigurations.taller = nixpkgs.lib.nixosSystem {
+        system = sistemaDestino;
+        modules = [
+          disko.nixosModules.disko
+          { nixpkgs.overlays = [ overlayPropio ]; }
+          ./nix/options.nix
+          ./nix/disko.nix
+          ./nix/configuration.nix
+          ./nix/host.nix
+          ./nix/modules
+          ./nix/taller.nix
+        ];
+      };
+
       packages = forEachDev (system: pkgs:
         let pkgsCon = pkgs.extend overlayPropio;
         in {
           voz-api = pkgsCon.voz-api;
+          # Motor C de Qwen3-TTS: se construye en cualquier sistema (en el Mac
+          # sirve para el banco de calidad; en la VM, para la puerta de RTF).
+          qwen3-tts-c = pkgsCon.qwen3TtsC;
+          qwen3-tts-pesos = pkgsCon.qwen3TtsPesos;
         }
         # El entorno de VibeVoice solo se construye para el destino: las ruedas
         # de torch+cpu que fija el lock son linux-x86_64.
         // nixpkgs.lib.optionalAttrs (system == sistemaDestino) {
           vibevoice-env = pkgsCon.vibevoice-env;
+          qwen3-tts-env = pkgsCon.qwen3-tts-env;
           default = pkgsCon.voz-api;
         });
 
