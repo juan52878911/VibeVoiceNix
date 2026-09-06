@@ -52,8 +52,6 @@ el ritmo pasados ~100-150 caracteres (issue #239, cerrado sin arreglo).
 
 ## 3. Resultados
 
-(Se rellena con `banco_motores.py consolidar`; ver el CSV en `banco/*/`.)
-
 | motor | idioma | n | fallos | ECAPA media | ECAPA min | WER media | WER peor | sesgo st | car/s | RTF |
 |---|---|---|---|---|---|---|---|---|---|---|
 | VibeVoice **producción** (voz_stream, parches, MPS) | en | 6 | 0 | 0.528 | 0.433 | 12.5% | 28.6% | -0.1 | 22.1 | 1.08 |
@@ -105,10 +103,14 @@ cuenta):
 
 ## 4. Lo que se aprendió por el camino
 
-- **El x-vector clona mejor que el injerto** con esta referencia: 0,642 frente a
-  0,569 en la misma frase y semilla. Es coherente con lo que documenta el
-  motor C: el `.bin` lleva la identidad sin la sala de la grabación. El shim
-  sirve el `.bin` cuando existe, y `clonar_voz_qwen.py` lo fabrica siempre.
+- **El x-vector y el injerto dan la misma identidad media en español (0,536
+  frente a 0,533), pero el x-vector no tiene sesgo de tono (−0,2 st frente a
+  +1,0) y aguanta mejor el peor caso al cambiar de idioma** (inglés mínimo 0,314
+  frente a 0,187; francés 0,388 frente a 0,252). Es coherente con lo que
+  documenta el motor C: el `.bin` lleva la identidad sin la sala de la
+  grabación. El shim sirve el `.bin` cuando existe, y `clonar_voz_qwen.py` lo
+  fabrica siempre. (En una sola frase y semilla el x-vector llegó a 0,642
+  frente a 0,569: una semilla no es una medida.)
 - **Quitar los silencios de la referencia no ayuda a Qwen3**: con la misma
   grabación compactada a 27 s de voz (de 28 s con 46 % de silencio), ECAPA en
   español 0,529 frente a 0,536, y en inglés 0,344 frente a 0,410. El
