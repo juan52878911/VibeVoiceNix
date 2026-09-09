@@ -253,6 +253,11 @@ def main():
                     "--transcripcion/--salida")
     ap.add_argument("--sin-igualar-volumen", action="store_true",
                     help="no lleva todos los clips al mismo RMS antes de codificar")
+    ap.add_argument("--semilla", type=int, default=11,
+                    help="semilla del SORTEO del codificador acustico (e.sample usa "
+                         "torch.randn): con ella, la misma referencia da el mismo .pt. "
+                         "-1 = sin fijar (lo de antes). Con --lote, cada voz puede traer "
+                         "su 'semilla'; scripts/banco_semillas.py la elige midiendo")
     ap.add_argument("--techo-minimo", type=float, default=0.0,
                     help="no fabricar la voz si su techo ECAPA (una mitad de la referencia "
                          "contra la otra) queda por debajo; 0 = solo avisar. Medido: por "
@@ -290,7 +295,8 @@ def main():
                 raise SystemExit(f"la voz {k} del lote necesita 'salida' y 'refs'")
             grupos.append({"salida": g["salida"],
                            "audios": [r["audio"] for r in refs],
-                           "textos": [r["transcripcion"] for r in refs]})
+                           "textos": [r["transcripcion"] for r in refs],
+                           "semilla": g.get("semilla", args.semilla)})
     else:
         if not args.audio or not args.transcripcion or not args.salida:
             raise SystemExit("hacen falta --audio, --transcripcion y --salida "
@@ -299,7 +305,7 @@ def main():
             raise SystemExit(f"hay {len(args.audio)} --audio y {len(args.transcripcion)} "
                              "--transcripcion: tiene que haber uno por cada uno, en el mismo orden")
         grupos = [{"salida": args.salida, "audios": args.audio,
-                   "textos": args.transcripcion}]
+                   "textos": args.transcripcion, "semilla": args.semilla}]
 
     # los audios se leen ANTES de cargar el modelo: un fichero que falta o un
     # numero de transcripciones que no cuadra tiene que fallar en el primer
@@ -375,6 +381,11 @@ def main():
     for g in grupos:
         clips, texto = g["clips"], g["texto"]
         ids = torch.tensor([tok.encode(texto, add_special_tokens=False)], device=disp)
+        # El unico sorteo del clonado es e.sample() (torch.randn). Fijarlo
+        # hace el .pt reproducible: MEDIDO que dos clones de la misma
+        # referencia daban identidad QC 0,53 y 0,39 en dos corridas.
+        if g.get("semilla", -1) is not None and g.get("semilla", -1) >= 0:
+            torch.manual_seed(int(g["semilla"]))
         with torch.no_grad():
             # 1. cada clip por separado -> latentes -> escalado -> conector, y se
             #    concatenan los latentes en el orden en que llegaron. Codificar por
@@ -415,6 +426,7 @@ def main():
         # cuanto puede dar esta voz lo lee aqui, no lo vuelve a medir.
         salida.with_suffix(".json").write_text(json.dumps({
             "techo": g["techo"], "segundos": round(g["total"], 1),
+            "semilla_clon": g.get("semilla"),
             "muestras": len(clips), "fuentes": [str(a) for a in g["audios"]],
             "posiciones": n + M}, ensure_ascii=False, indent=1))
         print(f"\n{g['total']:.1f} s de referencia en {len(clips)} muestra(s) -> "
