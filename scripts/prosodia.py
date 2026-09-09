@@ -91,10 +91,15 @@ def leer_wav(ruta):
         return x, w.getframerate()
 
 
-def contorno(x, hz=RITMO, umbral_rms=0.01, umbral_corr=0.3):
+def contorno(x, hz=RITMO, umbral_rms=0.01, umbral_corr=0.3, f_min=60, f_max=400):
     """f0 por ventana; NaN donde no hay sonido tonal. Mismo detector que
-    sondeo_voz.py, pero devolviendo el contorno entero y no solo agregados."""
-    minimo, maximo = hz // 400, hz // 60
+    sondeo_voz.py, pero devolviendo el contorno entero y no solo agregados.
+
+    f_min/f_max acotan la busqueda. Con la banda entera (60-400 Hz) la
+    autocorrelacion cae a veces en el subarmonico y el clip sale una octava
+    grave (MEDIDO: -12,4 st en un clip de una voz de 247 Hz). Cuando se
+    conoce la voz, acotar a [f0/1,5, f0*1,5] no deja sitio a la octava."""
+    minimo, maximo = max(2, int(hz / f_max)), int(hz / f_min)
     f0 = []
     for i in range(0, len(x) - VENTANA, SALTO):
         t = x[i:i + VENTANA]

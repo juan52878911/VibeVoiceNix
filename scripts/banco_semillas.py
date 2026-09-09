@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from banco_duracion import cargar_modelo, construir_prefijo, hablar  # noqa: E402
 from banco_motores import TEXTOS, duracion_habla, escribir_wav  # noqa: E402
 from clonar_voz import RITMO, a_cpu, avisar_calidad, igualar_volumen, leer_audio  # noqa: E402
+from tono import f0_mediana, sesgo_st  # noqa: E402
 
 FRASES = [("es", "neutro"), ("es", "expresivo"), ("es", "largo"), ("en", "neutro")]
 
@@ -106,7 +107,7 @@ def main():
     huella = Huella()
     h_ref = huella(referencia)
     techo = techo_de_clips(clips)
-    f0_ref = descripcion(referencia)["hz"]
+    f0_ref = f0_mediana(referencia)
     whisper = None
     if not args.sin_wer:
         from faster_whisper import WhisperModel
@@ -132,11 +133,13 @@ def main():
                 dt = time.perf_counter() - t1
                 wav = salida / f"{args.nombre}-clon{sc}-{idioma}_{clave}_{ss}.wav"
                 escribir_wav(wav, x)
-                f0 = descripcion(x)["hz"]
+                # f0 acotada a la banda de la voz: sin ella el detector caia
+                # en la octava grave en algun clip (-12 st) y arrastraba la media
+                s_st = sesgo_st(x, f0_ref)
                 habla = duracion_habla(x)
                 fila = {"semilla_clon": sc, "idioma": idioma, "texto": clave, "semilla": ss,
                         "ecapa": round(float(huella(x) @ h_ref), 3),
-                        "sesgo_st": round(12 * math.log2(f0 / f0_ref), 2) if f0 and f0_ref else None,
+                        "sesgo_st": round(s_st, 2) if s_st is not None else None,
                         "car_s": round(len(texto) / habla, 1) if habla else None,
                         "dur_s": round(len(x) / RITMO, 2), "rtf": round(dt / (len(x) / RITMO), 2)}
                 if whisper is not None:
