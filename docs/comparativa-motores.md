@@ -155,3 +155,67 @@ Con lo medido:
    a 0,53) aunque se entienda todo. Es la siguiente medida que decide: referencia
    más limpia y larga, o el 1.7B (mejor SIM cruzado en el informe técnico),
    contra el mismo banco.
+
+## 7. El clon cruzado, cerrado (8 de septiembre de 2026)
+
+El punto 4 de arriba quedaba abierto: para doblar al inglés con la voz de una
+persona, ¿compensa el WER de Qwen3 lo que pierde de identidad? La respuesta es
+**no**, y esta vez con las voces del trabajo real, no con una de banco.
+
+### Cómo se midió, y en qué se diferencia de §2
+
+Dos voces del vídeo `PXL_20260829_002857474` de `dobla`, cortadas de la
+**anotación humana** (no de la diarización automática), y elegidas por su
+**techo** — la referencia partida en dos mitades, una contra otra:
+
+| voz | material | techo |
+|---|---|---|
+| Laura | 30,0 s | **0,946** |
+| Juan Pablo | 19,3 s | **0,598** |
+
+Elegirlas por el techo es lo que aporta esta medida. La de §2 usó una voz de
+techo 0,764, o sea el caso cómodo. Juan Pablo es el caso que rompe los
+doblajes: su propio audio, comparado consigo mismo, **no llega al umbral de
+"misma persona" (0,626)**. Ninguna de las dos mitades de un mismo hombre se
+reconoce como él.
+
+Mismas frases de §2, mismas semillas, mismo juez ECAPA, mismo día. Qwen3 con el
+motor C (`--int8`, injerto ICL); VibeVoice con el prefijo `.pt` de
+`clonar_voz.py` sobre **esa misma referencia**.
+
+### Resultado
+
+Identidad ECAPA media contra la referencia:
+
+| voz | motor | es | en | media | % de su techo |
+|---|---|---|---|---|---|
+| Laura (techo 0,946) | VibeVoice | 0,65 | **0,45** | **0,572** | 61 % |
+| Laura (techo 0,946) | Qwen3-0.6B | 0,52 | **0,30** | 0,433 | 46 % |
+| Juan Pablo (techo 0,598) | VibeVoice | 0,52 (n=4) | — | — | 87 % (solo es) |
+| Juan Pablo (techo 0,598) | Qwen3-0.6B | 0,36 | 0,20 | 0,295 | 49 % |
+
+La celda de VibeVoice en inglés sobre Juan Pablo quedó sin medir: el
+contenedor x86 emulado del Mac tardaba ~14 min por clip largo y la decisión ya
+estaba tomada con el resto. Está anotado como pendiente, no como cero.
+
+### Lo que dice
+
+1. **VibeVoice gana en las dos lenguas, y la brecha se abre en inglés**
+   (0,45 frente a 0,30). Como el doblaje es español→inglés, es el único caso
+   que cuenta. El oído lo confirmó antes que el coseno: Qwen3 en inglés "suena
+   muy bot" frente a un VibeVoice "un poco más natural".
+2. **El WER de 1,4 % no compensa.** Era la apuesta razonable — el 82 % de los
+   fallos residuales del doblaje son por WER, no por identidad — pero lo que se
+   entiende perfectamente y suena a robot no es un doblaje.
+3. **El techo manda sobre el motor.** Los dos rinden un porcentaje parecido del
+   techo de cada voz (46-61 %). Ninguno arregla una grabación mala: con techo
+   0,598 no hay motor que salve esa voz, y ahí el trabajo está en grabar mejor,
+   no en cambiar de modelo. (Dos voces son dos puntos: es indicio, no ley.)
+4. **RTF y memoria no se compararon**, y no se pueden con estos datos: Qwen3
+   corrió nativo en ARM (RTF 1,02-1,44, RSS 200 MB) y VibeVoice en un
+   contenedor x86 **emulado** (RTF 73,6, RSS 7,5 GB). La cifra de VibeVoice es
+   del emulador, no del motor; en la c7i real va a ~1,0.
+
+**Qwen3 se queda disponible, no descartado.** Su motor C funciona, cabe en
+200 MB y en español pierde bastante menos. Para monolingüe español o como plan
+B en una máquina pequeña tiene sitio. Para el doblaje al inglés, no.
