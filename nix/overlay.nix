@@ -115,6 +115,35 @@ in
     ];
   };
 
+  # ------------------------------------------------------------------
+  # Qwen3-TTS: el candidato a sustituir a VibeVoice. PyTorch CPU + qwen-tts +
+  # los mismos jueces (speechbrain, faster-whisper) que usan los bancos.
+  # ------------------------------------------------------------------
+  qwen3-tts-env = mkEntorno {
+    raiz = ../pkgs/qwen3-tts;
+    nombre = "qwen3-tts-env";
+    extraOverrides = componer [
+      (libsNativas {
+        paquetes = [ "torch" "torchaudio" "numpy" "scipy" "llvmlite" "ctranslate2" "sentencepiece" ];
+        extra.numba = p: [ p.tbb ];
+      })
+      arreglarSoundfile
+    ];
+  };
+
+  # Motor C de Qwen3-TTS y pesos del 0.6B-Base con hash fijo.
+  qwen3TtsC = final.callPackage ./pkgs/qwen3-tts-c.nix { };
+  qwen3TtsPesos = final.callPackage ./pkgs/qwen3-tts-weights.nix { };
+
+  # El shim de :8082 sobre el motor C (mismo contrato que voz_stream.py).
+  # Corre con el Python de voz-api (fastapi, uvicorn, numpy): sin torch.
+  # estirar.py va al lado porque el shim lo importa por ruta.
+  qwen3ttsCodigo = final.runCommand "qwen3tts-cli" { } ''
+    mkdir -p "$out/bin"
+    cp ${../pkgs/qwen3tts-cli/voz_stream_qwen.py} "$out/bin/voz-stream-qwen.py"
+    cp ${../pkgs/vibevoice-cli/estirar.py} "$out/bin/estirar.py"
+  '';
+
   # Voces de Piper y pesos de VibeVoice: descargas con hash fijo.
   vozPiperVoces = final.callPackage ./pkgs/piper-voices.nix { };
   vibevoicePesos = final.callPackage ./pkgs/vibevoice-weights.nix { };

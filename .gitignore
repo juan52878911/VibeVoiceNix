@@ -56,3 +56,7 @@ perfiles_voz.json
 # Son basura: 42.000 de estos dentro de un venv rompen `import transformers`.
 ._*
 .DS_Store
+
+# Banco de comparacion de motores: audio, voces clonadas y pesos enlazados. Una voz
+# clonada es la voz de una persona: no entra al repo (misma regla que vocesPropias).
+banco/

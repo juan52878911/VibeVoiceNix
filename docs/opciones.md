@@ -213,6 +213,28 @@ Módulo: [`nix/modules/voz-stream.nix`](../nix/modules/voz-stream.nix).
 | `vocesPropias` | `nullOr path` | `null` | Directorio de la máquina con prefijos `.pt` propios. Fuera del store. |
 | `solaparDecodificador` | `bool` | `true` | Corre el decodificador acústico **a la vez** que el bucle: −21 % de RTF. |
 | `hilosDecodificador` | `int` | `0` | Hilos para el decodificador solapado. 0 = la mitad de `hilos`. |
+| `motor` | `enum` | `"vibevoice"` | Qué modelo hay detrás de :8082: `vibevoice` (lo medido) o `qwen3tts` (Qwen3-TTS-0.6B-Base con el motor C). Mismo contrato HTTP. |
+| `qwen3tts.cuantizacion` | `enum` | `"int8"` | `int8` o `int4` en el motor C. |
+| `qwen3tts.hilos` | `int` | `0` | Hilos del motor C. 0 = todos. |
+| `qwen3tts.vozDefecto` | `str` | `""` | Voz cuando la petición no trae `voz`. Tiene que estar en `vocesPropias`. |
+| `qwen3tts.idiomaDefecto` | `str` | `"es"` | Idioma cuando la petición no trae `idioma`. |
+| `qwen3tts.trozo` | `int` | `160` | Caracteres por trozo: Qwen3 acelera el ritmo pasados ~100-150, así que el shim corta por frase con la misma semilla. 0 = sin cortar. |
+| `qwen3tts.rtfEsperado` | `float` | `1.0` | Lo que se anuncia en `X-RTF-Esperado`. Ponerlo al valor **medido** en la VM. |
+| `qwen3tts.modeloPropio` | `nullOr path` | `null` | Checkpoint afinado (formato HF) fuera del store. `null` = el 0.6B-Base oficial. |
+
+**`motor = "qwen3tts"`** cambia el proceso que hay detrás del puerto, no el contrato: `POST /tts/stream`,
+`GET /voces` y `GET /health` responden igual (el shim es
+[`pkgs/qwen3tts-cli/voz_stream_qwen.py`](../pkgs/qwen3tts-cli/voz_stream_qwen.py)). Lo que cambia:
+
+- Sin voces oficiales: el 0.6B-Base solo clona. `vocesPropias` es obligatorio y ahí van, por voz,
+  `<voz>.bin` (x-vector de 8 KB, la forma limpia), `<voz>.qvoice` (injerto ICL) o `<voz>.wav` + `.txt`.
+  Los fabrica [`scripts/clonar_voz_qwen.py`](../scripts/clonar_voz_qwen.py), que sí cabe en la VM.
+  Conviven con los `.pt` de VibeVoice en el mismo directorio.
+- Sin sesiones KV (`/tts/sesion/*`): `/health` lo declara con `sesiones.activas = false`.
+- `cfg_scale`, `pasos`, `neg_cada` y `cola_final` se aceptan y se ignoran (`/health.ignorados`).
+- Campo nuevo y opcional en la petición: `idioma` (`es`, `en`, `pt`, `fr`, `it`, `de`, `ru`, `ja`, `ko`,
+  `zh`). VibeVoice lo ignora.
+- La configuración `voz-qwen` del flake es `voz` con este motor y VibeVoice apagado.
 
 **`vocesPropias` está fuera del `/nix/store` por el mismo motivo que `ficheroToken`, y el motivo aquí es
 más fuerte todavía: un prefijo `.pt` **es** la voz clonable de una persona. Meterlo en el flake lo
@@ -392,6 +414,25 @@ para depurar.
 ```bash
 # El A/B del solapamiento: misma semilla, y el md5 tiene que salir igual
 VIBEVOICE_SOLAPAR_DECODER=0 python pkgs/vibevoice-cli/voz_stream.py
+```
+
+### Las del shim de Qwen3 (`motor = "qwen3tts"`)
+
+| Variable | Efecto |
+|---|---|
+| `QWEN3TTS_BIN` | el binario `qwen_tts` del motor C |
+| `QWEN3TTS_MODELO` | directorio del modelo (formato HF); el módulo pone el del store o `modeloPropio` |
+| `QWEN3TTS_VOCES` | directorio con `.bin` / `.qvoice` / `.wav`+`.txt` |
+| `QWEN3TTS_CUANT`, `QWEN3TTS_HILOS` | `int8`/`int4` y número de hilos |
+| `QWEN3TTS_VOZ_DEFECTO`, `QWEN3TTS_IDIOMA` | voz e idioma cuando la petición no los trae |
+| `QWEN3TTS_TROZO`, `QWEN3TTS_PAUSA` | caracteres por trozo y pausa entre trozos (s) |
+| `QWEN3TTS_RTF` | lo que se anuncia en `X-RTF-Esperado` |
+
+```bash
+# En el Mac, contra el motor C y los pesos construidos por Nix:
+nix build -o banco/motor-c .#qwen3-tts-c && nix build -o banco/modelo-0.6b .#qwen3-tts-pesos
+QWEN3TTS_BIN=banco/motor-c/bin/qwen_tts QWEN3TTS_MODELO=banco/modelo-0.6b QWEN3TTS_VOCES=banco/voces \
+  VOZ_STREAM_PUERTO=8083 python pkgs/qwen3tts-cli/voz_stream_qwen.py
 ```
 
 ---
