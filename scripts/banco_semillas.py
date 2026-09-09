@@ -160,9 +160,20 @@ def main():
               f"es {resumen[sc]['ecapa_es']:.3f}, en {resumen[sc]['ecapa_en']:.3f}) "
               f"sesgo {resumen[sc]['sesgo_st']:+.1f} st  WER {resumen[sc]['wer']}")
 
-    def orden(sc):
+    # PUNTUACION COMPUESTA, no solo identidad. MEDIDO en Laura (techo 0,814):
+    # cinco semillas dan ECAPA entre 0,626 y 0,655 (0,03 de rango) pero el
+    # TONO va de -1,9 a -6,2 st y el WER de 4,7 % a 11,3 %. Ordenar solo por
+    # ECAPA elegia la semilla de 0,655 con -3,3 st y 8,6 % de WER, y dejaba la
+    # de 0,648 con -1,9 st, 4,7 % y el mejor minimo. Equivalencias: 0,01 de
+    # ECAPA = 1 st de tono = 10 % de WER.
+    def puntuacion(sc):
         r = resumen[sc]
-        return (-r["ecapa"], abs(r["sesgo_st"] or 0), r["wer"] or 0)
+        return r["ecapa"] - 0.01 * abs(r["sesgo_st"] or 0) - 0.1 * (r["wer"] or 0)
+
+    def orden(sc):
+        return -puntuacion(sc)
+    for sc in resumen:
+        resumen[sc]["puntuacion"] = round(puntuacion(sc), 3)
     ganadora = sorted(resumen, key=orden)[0]
 
     with open(salida / f"{args.nombre}-semillas.csv", "w", newline="") as fh:
@@ -175,11 +186,11 @@ def main():
         "cfg": args.cfg, "pasos": args.pasos,
         "semillas": {str(k): v for k, v in resumen.items()}}, ensure_ascii=False, indent=1))
 
-    print("\n| semilla | ECAPA | min | es | en | sesgo st | car/s | WER |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("\n| semilla | puntuacion | ECAPA | min | es | en | sesgo st | car/s | WER |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for sc in sorted(resumen, key=orden):
         r = resumen[sc]
-        print(f"| {sc}{' *' if sc == ganadora else ''} | {r['ecapa']:.3f} | {r['ecapa_min']:.3f} | "
+        print(f"| {sc}{' *' if sc == ganadora else ''} | {r['puntuacion']:.3f} | {r['ecapa']:.3f} | {r['ecapa_min']:.3f} | "
               f"{r['ecapa_es']:.3f} | {r['ecapa_en']:.3f} | {r['sesgo_st']:+.1f} | {r['car_s']} | "
               f"{r['wer'] if r['wer'] is not None else '-'} |")
     print(f"\ntecho {techo}; ganadora {ganadora} -> {salida / (args.nombre + '.pt')} "

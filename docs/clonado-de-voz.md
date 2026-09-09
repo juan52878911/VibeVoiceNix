@@ -674,6 +674,76 @@ solo si no hay ni 4 s limpios). Los 0,890 y 0,608 cuadran con los 0,946 y 0,598
 que midió `dobla` con sus propios cortes de 30 y 19 s: la diferencia es qué
 segundos entran, no la métrica.
 
+### 7.11 La semilla del clonado: elegirla midiendo
+
+El clonado tenía un sorteo escondido. El codificador acústico devuelve una
+distribución y `clonar_voz.py` la muestrea (`e.sample`, `torch.randn`) sin
+fijar semilla: dos prefijos de la **misma** referencia salían distintos, y
+nadie lo medía porque cada `.pt` se fabricaba una vez. Se vio en el doblaje
+del vídeo de 4 voces: con las mismas referencias, la identidad QC de una voz
+dio 0,53 en una corrida y 0,39 en la siguiente. Esa varianza tapa cualquier
+mejora pequeña y, peor, decide por sorteo cómo suena una persona.
+
+Desde el 9 de septiembre de 2026:
+
+- `clonar_voz.py --semilla N` (por defecto 11; `-1` deja el sorteo libre)
+  fija el muestreo, así que la misma referencia da el mismo `.pt`. Con
+  `--lote`, cada voz puede traer su `semilla`. La ficha `<voz>.json` la guarda.
+- `scripts/banco_semillas.py` la **elige midiendo**: fabrica el prefijo con
+  varias semillas (el modelo cargado una vez), sintetiza las mismas frases con
+  las mismas semillas de síntesis, y mide cada clon contra la referencia:
+  ECAPA (media y mínimo), `sesgo_st` (el tono), `car/s` (el ritmo) y WER.
+  Ordena por identidad, desempata por tono y WER, deja `<voz>.pt` con la
+  ganadora y `<voz>.json` con la tabla entera. La tabla es lo importante: son
+  todos los tonos que el clonado puede sacar de esa grabación, y cuánto vale
+  cada uno.
+
+```bash
+python scripts/banco_semillas.py --audio ref.wav --transcripcion "..." \
+    --nombre laura --salida voces/         # 5 semillas x 4 frases x 2 sintesis
+```
+
+Medido el 9 de septiembre sobre las dos voces del banco de `dobla` (referencias
+del vídeo de 4 voces, 5 semillas de clonado × 4 frases × 2 semillas de
+síntesis, cfg 3, 6 pasos, MPS):
+
+| voz | semilla | puntuación | ECAPA | mín | es | en | tono | car/s | WER |
+|---|---|---|---|---|---|---|---|---|---|
+| Laura (techo 0,814, f0 247 Hz) | **1** | 0,625 | 0,648 | 0,496 | 0,695 | 0,507 | **−1,9 st** | 19,9 | **4,7 %** |
+| | 5 | 0,613 | **0,655** | 0,428 | 0,715 | 0,476 | −3,3 st | 19,9 | 8,6 % |
+| | 2 | 0,572 | 0,639 | 0,421 | 0,705 | 0,443 | −5,9 st | 19,6 | 8,0 % |
+| | 3 | 0,561 | 0,635 | 0,426 | 0,701 | 0,440 | −6,2 st | 19,5 | 11,3 % |
+| | 4 | 0,557 | 0,626 | 0,363 | 0,691 | 0,430 | −5,8 st | 19,7 | 10,6 % |
+| Juan Pablo (techo 0,51, f0 171 Hz) | **4** | 0,452 | 0,499 | 0,397 | 0,529 | 0,407 | −3,5 st | 21,3 | 11,3 % |
+| | 5 | 0,410 | 0,459 | 0,245 | 0,505 | 0,322 | −2,9 st | 21,3 | 19,8 % |
+| | 2 | 0,404 | 0,465 | 0,372 | 0,495 | 0,372 | −4,3 st | 21,5 | 17,9 % |
+| | 3 | 0,396 | 0,451 | 0,360 | 0,479 | 0,367 | −3,9 st | 21,2 | 16,0 % |
+| | 1 | 0,387 | 0,458 | 0,350 | 0,476 | 0,405 | −4,9 st | 21,9 | 21,7 % |
+
+Lo que dice la tabla:
+
+- **La semilla mueve el tono hasta 4 semitonos.** Con la misma referencia,
+  Laura sale entre −1,9 y −6,2 st de su tono real. Eso no es un matiz: −6 st
+  es otra voz. Y la identidad ECAPA apenas lo nota (0,626-0,655): el juez de
+  timbre es casi ciego al tono, que es justo lo que oye una persona.
+- **Por eso la elección no es solo por identidad.** La puntuación es
+  `ECAPA − 0,01·|tono en st| − 0,1·WER` (0,01 de ECAPA equivale a 1 st o a
+  10 % de WER). Ordenando solo por ECAPA salía la semilla 5 (−3,3 st, WER
+  8,6 %); con la compuesta, la 1 (−1,9 st, WER 4,7 %, el mejor mínimo y el
+  mejor inglés) por 0,007 de identidad menos.
+- **En la voz difícil la semilla vale más que en la buena.** Juan Pablo va de
+  0,451 a 0,499 de identidad y de 11 % a 22 % de WER según la semilla: la
+  mejor le saca un 10 % de identidad a la peor. Con techo 0,51 sigue siendo
+  una voz inclonable, pero el sorteo decidía si quedaba en 0,45 o en 0,50.
+- **Todas las semillas salen graves.** Las diez filas tienen tono negativo:
+  el sesgo de tono del clonado con este codificador va hacia abajo en estas
+  dos voces (en §7.8 iba hacia arriba en voces graves). Es sistemático, no de
+  la semilla, y sigue pendiente de corregir a la salida.
+
+El banco escribe `voces/<id>/semilla.json` para el banco de identidades de
+`dobla`, y el doblaje la usa (`--semilla-clon` es el valor por defecto para
+las voces sin ficha).
+
 ---
 
 > **Sobre clonar voces ajenas.** Esto convierte 15 segundos de audio en una voz
