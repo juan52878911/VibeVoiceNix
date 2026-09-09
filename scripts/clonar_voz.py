@@ -69,6 +69,7 @@ salen las cifras de arriba. La curva de "cuanto audio hace falta" esta medida en
 docs/clonado-de-voz.md §7.8; el script avisa cuando te quedas corto.
 """
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -238,12 +239,18 @@ def a_cpu(salida):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--audio", action="append", required=True,
+    ap.add_argument("--audio", action="append",
                     help="audio con la voz (opus, m4a, mp3, wav...; se convierte solo). "
                          "Se puede repetir para varias muestras")
-    ap.add_argument("--transcripcion", action="append", required=True,
+    ap.add_argument("--transcripcion", action="append",
                     help="lo que se dice en ese audio, LITERAL; uno por --audio y en el mismo orden")
-    ap.add_argument("--salida", required=True, help="fichero .pt a escribir")
+    ap.add_argument("--salida", help="fichero .pt a escribir")
+    ap.add_argument("--lote", help=
+                    "JSON con VARIAS voces para fabricar de una sentada, "
+                    "cargando el modelo UNA sola vez: una lista de "
+                    "{\"salida\": ruta.pt, \"refs\": [{\"audio\": ..., "
+                    "\"transcripcion\": ...}, ...]}. Excluye --audio/"
+                    "--transcripcion/--salida")
     ap.add_argument("--sin-igualar-volumen", action="store_true",
                     help="no lleva todos los clips al mismo RMS antes de codificar")
     ap.add_argument("--modelo", default=os.environ.get(
@@ -257,25 +264,65 @@ def main():
         disp = "mps" if torch.backends.mps.is_available() else "cpu"
     tipo = torch.float32
 
-    if len(args.audio) != len(args.transcripcion):
-        raise SystemExit(f"hay {len(args.audio)} --audio y {len(args.transcripcion)} "
-                         "--transcripcion: tiene que haber uno por cada uno, en el mismo orden")
-    clips = []
-    for ruta in args.audio:
-        c = leer_audio(ruta)
-        print(f"  {ruta}: {len(c)/RITMO:.1f} s", end="")
-        avisar_calidad(c, sangria="    ")
-        clips.append(c)
-    total = sum(len(c) for c in clips) / RITMO
-    if len(clips) > 1:
-        print(f"  {len(clips)} muestras, {total:.1f} s en total")
-    if total < 15:
-        print(f"[aviso] {total:.1f} s en total. Las cifras de esta herramienta estan "
-              f"medidas con 15,5 s y las voces oficiales llevan 22-33 s.")
-    avisar_heterogeneos(clips, args.audio)
-    if not args.sin_igualar_volumen and len(clips) > 1:
-        clips = igualar_volumen(clips)
-    texto = "".join(t if t.endswith("\n") else t + "\n" for t in args.transcripcion)
+    # ---------------------------------------------------- que hay que hacer --
+    # Un "grupo" es una voz: sus clips de referencia y el .pt que sale. Con
+    # --lote vienen varios en un JSON y el modelo se carga UNA vez para todos
+    # (cargarlo son ~40 s y el doblaje de un panel fabricaba un clon por
+    # hablante, cada uno en su proceso: cuatro voces eran cuatro cargas).
+    if args.lote:
+        if args.audio or args.transcripcion or args.salida:
+            raise SystemExit("--lote ya trae las voces: no se mezcla con "
+                             "--audio/--transcripcion/--salida")
+        try:
+            crudo = json.loads(Path(args.lote).read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            raise SystemExit(f"no se pudo leer --lote {args.lote}: {e}")
+        if not isinstance(crudo, list) or not crudo:
+            raise SystemExit("--lote tiene que ser una lista de voces no vacia")
+        grupos = []
+        for k, g in enumerate(crudo):
+            refs = g.get("refs") or []
+            if not g.get("salida") or not refs:
+                raise SystemExit(f"la voz {k} del lote necesita 'salida' y 'refs'")
+            grupos.append({"salida": g["salida"],
+                           "audios": [r["audio"] for r in refs],
+                           "textos": [r["transcripcion"] for r in refs]})
+    else:
+        if not args.audio or not args.transcripcion or not args.salida:
+            raise SystemExit("hacen falta --audio, --transcripcion y --salida "
+                             "(o un --lote con todo)")
+        if len(args.audio) != len(args.transcripcion):
+            raise SystemExit(f"hay {len(args.audio)} --audio y {len(args.transcripcion)} "
+                             "--transcripcion: tiene que haber uno por cada uno, en el mismo orden")
+        grupos = [{"salida": args.salida, "audios": args.audio,
+                   "textos": args.transcripcion}]
+
+    # los audios se leen ANTES de cargar el modelo: un fichero que falta o un
+    # numero de transcripciones que no cuadra tiene que fallar en el primer
+    # segundo, no despues de 40 s de carga (y con --lote, no a la tercera voz)
+    for g in grupos:
+        if len(g["audios"]) != len(g["textos"]):
+            raise SystemExit(f"{g['salida']}: {len(g['audios'])} audio(s) y "
+                             f"{len(g['textos'])} transcripcion(es)")
+        print(f"voz -> {g['salida']}")
+        clips = []
+        for ruta in g["audios"]:
+            c = leer_audio(ruta)
+            print(f"  {ruta}: {len(c)/RITMO:.1f} s", end="")
+            avisar_calidad(c, sangria="    ")
+            clips.append(c)
+        g["total"] = sum(len(c) for c in clips) / RITMO
+        if len(clips) > 1:
+            print(f"  {len(clips)} muestras, {g['total']:.1f} s en total")
+        if g["total"] < 15:
+            print(f"[aviso] {g['total']:.1f} s en total. Las cifras de esta herramienta estan "
+                  f"medidas con 15,5 s y las voces oficiales llevan 22-33 s.")
+        avisar_heterogeneos(clips, g["audios"])
+        if not args.sin_igualar_volumen and len(clips) > 1:
+            clips = igualar_volumen(clips)
+        g["clips"] = clips
+        g["texto"] = "".join(t if t.endswith("\n") else t + "\n"
+                             for t in g["textos"])
 
     from vibevoice.modular.modeling_vibevoice_streaming_inference import (
         VibeVoiceStreamingForConditionalGenerationInference)
@@ -296,41 +343,11 @@ def main():
     modelo.to(disp)
 
     tok = proc.tokenizer
-    ids = torch.tensor([tok.encode(texto, add_special_tokens=False)], device=disp)
 
+    # 4. ramas negativas del CFG: un solo <|image_pad|>, y la del tts con
+    #    tipo 1 sobre la SALIDA del lm negativo (no sobre su embedding). NO
+    #    dependen de la voz, asi que se calculan una vez para todo el lote.
     with torch.no_grad():
-        # 1. cada clip por separado -> latentes -> escalado -> conector, y se
-        #    concatenan los latentes en el orden en que llegaron. Codificar por
-        #    separado evita que el salto del empalme entre en la ventana
-        #    receptiva del encoder convolucional.
-        trozos = []
-        for c in clips:
-            n_c = math.ceil(len(c) / MUESTRAS_LATENTE)
-            e = m.acoustic_tokenizer.encode(torch.from_numpy(c)[None, None].to(disp, tipo))
-            z, _ = e.sample(dist_type=m.acoustic_tokenizer.std_dist_type)
-            rasgos = (z + m.speech_bias_factor) * m.speech_scaling_factor
-            trozos.append(m.acoustic_connector(rasgos[:, :n_c].to(tipo)))
-        conectado = torch.cat(trozos, dim=1)
-        n = conectado.shape[1]
-
-        # 2. rama de texto: prefill directo, sin plantilla ni tokens especiales
-        lm = modelo.forward_lm(input_ids=ids, attention_mask=torch.ones_like(ids),
-                               use_cache=True, return_dict=True)
-        M = lm.last_hidden_state.shape[1]
-
-        # 3. rama TTS: N latentes + M texto, TODO con tipo 0 y sin marcadores.
-        #    forward_tts_lm sobrescribe las M ultimas posiciones con el hidden
-        #    del lm, asi que ahi va relleno; y suma tts_input_types(mascara).
-        embeds = torch.cat(
-            [conectado, torch.zeros(1, M, conectado.shape[-1], device=disp, dtype=tipo)], 1)
-        tts = modelo.forward_tts_lm(
-            attention_mask=torch.ones(1, n + M, dtype=torch.long, device=disp),
-            inputs_embeds=embeds, lm_last_hidden_state=lm.last_hidden_state,
-            tts_text_masks=torch.zeros(1, n + M, dtype=torch.long, device=disp),
-            use_cache=True, return_dict=True)
-
-        # 4. ramas negativas del CFG: un solo <|image_pad|>, y la del tts con
-        #    tipo 1 sobre la SALIDA del lm negativo (no sobre su embedding).
         neg = torch.tensor([[tok.convert_tokens_to_ids("<|image_pad|>")]], device=disp)
         neg_lm = modelo.forward_lm(input_ids=neg, attention_mask=torch.ones_like(neg),
                                    use_cache=True, return_dict=True)
@@ -338,17 +355,54 @@ def main():
             input_ids=neg, attention_mask=torch.ones_like(neg),
             lm_last_hidden_state=neg_lm.last_hidden_state,
             tts_text_masks=torch.ones_like(neg), use_cache=True, return_dict=True)
+    neg_cpu = {"neg_lm": a_cpu(neg_lm), "neg_tts_lm": a_cpu(neg_tts)}
 
-    prefijo = {"lm": a_cpu(lm), "tts_lm": a_cpu(tts),
-               "neg_lm": a_cpu(neg_lm), "neg_tts_lm": a_cpu(neg_tts)}
-    salida = Path(args.salida)
-    salida.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(prefijo, salida)
-    print(f"\n{total:.1f} s de referencia en {len(clips)} muestra(s) -> "
-          f"{n} latentes + {M} tokens de texto = {n+M} posiciones")
-    print(f"prefijo escrito en {salida} ({salida.stat().st_size/2**20:.1f} MB)")
-    print("\nProbarlo:")
-    print(f"  VIBEVOICE_VOZ={salida.stem} ./scripts/voz-stream-mac.sh")
+    for g in grupos:
+        clips, texto = g["clips"], g["texto"]
+        ids = torch.tensor([tok.encode(texto, add_special_tokens=False)], device=disp)
+        with torch.no_grad():
+            # 1. cada clip por separado -> latentes -> escalado -> conector, y se
+            #    concatenan los latentes en el orden en que llegaron. Codificar por
+            #    separado evita que el salto del empalme entre en la ventana
+            #    receptiva del encoder convolucional.
+            trozos = []
+            for c in clips:
+                n_c = math.ceil(len(c) / MUESTRAS_LATENTE)
+                e = m.acoustic_tokenizer.encode(torch.from_numpy(c)[None, None].to(disp, tipo))
+                z, _ = e.sample(dist_type=m.acoustic_tokenizer.std_dist_type)
+                rasgos = (z + m.speech_bias_factor) * m.speech_scaling_factor
+                trozos.append(m.acoustic_connector(rasgos[:, :n_c].to(tipo)))
+            conectado = torch.cat(trozos, dim=1)
+            n = conectado.shape[1]
+
+            # 2. rama de texto: prefill directo, sin plantilla ni tokens especiales
+            lm = modelo.forward_lm(input_ids=ids, attention_mask=torch.ones_like(ids),
+                                   use_cache=True, return_dict=True)
+            M = lm.last_hidden_state.shape[1]
+
+            # 3. rama TTS: N latentes + M texto, TODO con tipo 0 y sin marcadores.
+            #    forward_tts_lm sobrescribe las M ultimas posiciones con el hidden
+            #    del lm, asi que ahi va relleno; y suma tts_input_types(mascara).
+            embeds = torch.cat(
+                [conectado, torch.zeros(1, M, conectado.shape[-1], device=disp, dtype=tipo)], 1)
+            tts = modelo.forward_tts_lm(
+                attention_mask=torch.ones(1, n + M, dtype=torch.long, device=disp),
+                inputs_embeds=embeds, lm_last_hidden_state=lm.last_hidden_state,
+                tts_text_masks=torch.zeros(1, n + M, dtype=torch.long, device=disp),
+                use_cache=True, return_dict=True)
+
+        prefijo = {"lm": a_cpu(lm), "tts_lm": a_cpu(tts), **neg_cpu}
+        salida = Path(g["salida"])
+        salida.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(prefijo, salida)
+        print(f"\n{g['total']:.1f} s de referencia en {len(clips)} muestra(s) -> "
+              f"{n} latentes + {M} tokens de texto = {n+M} posiciones")
+        print(f"prefijo escrito en {salida} ({salida.stat().st_size/2**20:.1f} MB)")
+        if not args.lote:
+            print("\nProbarlo:")
+            print(f"  VIBEVOICE_VOZ={salida.stem} ./scripts/voz-stream-mac.sh")
+    if args.lote:
+        print(f"\n{len(grupos)} voces con UNA sola carga del modelo")
     return 0
 
 

@@ -18,8 +18,15 @@ case "$MODELO" in
     URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
     SHA="60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"
     ;;
+  medium)
+    # el que usa el doblaje: con small, una reunion de Teams salia
+    # ininteligible ("en las zonas de aseo ir al a los otanos") y con medium
+    # se entiende; cuesta el 5% del tiempo total del doblaje (medido)
+    URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
+    SHA="6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208"
+    ;;
   *)
-    echo "modelo desconocido: $MODELO (usa 'small' o 'base')" >&2
+    echo "modelo desconocido: $MODELO (usa 'small', 'base' o 'medium')" >&2
     exit 1
     ;;
 esac
