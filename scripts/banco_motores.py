@@ -436,17 +436,40 @@ def referencia(args):
     fuente = taller / ("voces24k.wav" if (taller / "voces24k.wav").exists() else "audio24k.wav")
     x = leer_wav(fuente)
     anot = json.loads(Path(args.anotacion).read_text())
-    segs = [s for s in anot["segmentos"] if str(s.get("hablante")) == str(args.hablante)
+    todos = anot["segmentos"]
+    segs = [s for s in todos if str(s.get("hablante")) == str(args.hablante)
             and s.get("texto", "").strip()]
-    segs.sort(key=lambda s: float(s["ini"]))
+    ajenos = [(float(s["ini"]), float(s["fin"])) for s in todos
+              if str(s.get("hablante")) != str(args.hablante)]
+    def contaminacion(s):
+        ini, fin = float(s["ini"]), float(s["fin"])
+        return sum(max(0.0, min(fin, b) - max(ini, a)) for a, b in ajenos)
+
+    # La misma regla que dobla (doblar_video.py, seleccion de referencias):
+    # pureza antes que longitud, y los mas largos primero. Un segmento con
+    # otra voz encima envenena la referencia: MEDIDO, el hablante 1 del video
+    # de 4 voces daba techo 0,019 con sus solapes dentro y 0,746 sin ellos.
+    # Un clip sucio solo entra si con los limpios no se llega ni a 4 s.
+    segs = [s for s in segs if float(s["fin"]) - float(s["ini"]) >= 1.0]
+    limpios = sorted((s for s in segs if contaminacion(s) < 0.3),
+                     key=lambda s: float(s["fin"]) - float(s["ini"]), reverse=True)
+    sucios = sorted((s for s in segs if contaminacion(s) >= 0.3), key=contaminacion)
+    elegidos, acum = [], 0.0
+    for s in limpios:
+        if acum >= args.max:
+            break
+        elegidos.append(s); acum += float(s["fin"]) - float(s["ini"])
+    for s in sucios:
+        if acum >= 4.0:
+            break
+        print(f"  [aviso] solo {acum:.1f} s limpios; entra un clip con "
+              f"{contaminacion(s):.1f} s de otra voz encima")
+        elegidos.append(s); acum += float(s["fin"]) - float(s["ini"])
+    elegidos.sort(key=lambda s: float(s["ini"]))          # en orden temporal
     trozos, textos, total = [], [], 0.0
     hueco = np.zeros(int(0.2 * RITMO), np.float32)
-    for s in segs:
+    for s in elegidos:
         ini, fin = float(s["ini"]), float(s["fin"])
-        if fin - ini < 1.0:
-            continue
-        if total + (fin - ini) > args.max:
-            break
         trozos += [x[int(ini * RITMO):int(fin * RITMO)], hueco]
         textos.append(s["texto"].strip())
         total += fin - ini
@@ -455,7 +478,8 @@ def referencia(args):
     salida = Path(args.o)
     escribir_wav(salida, np.concatenate(trozos))
     salida.with_suffix(".txt").write_text(" ".join(textos) + "\n")
-    print(f"{salida}: {total:.1f} s de {len(textos)} segmentos; texto en {salida.with_suffix('.txt')}")
+    print(f"{salida}: {total:.1f} s de {len(textos)} segmentos "
+          f"({len(segs) - len(elegidos)} descartados); texto en {salida.with_suffix('.txt')}")
 
 
 def main():

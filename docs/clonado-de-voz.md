@@ -603,6 +603,77 @@ Es la misma lógica que el resto del repositorio: lo caro se hace fuera y a la
 máquina llega el artefacto pequeño. Un prefijo es a una voz lo que un `.onnx` de
 Piper es a las suyas.
 
+### 7.10 El techo de la voz: medirlo antes de clonar
+
+Toda la sección 7 mide clones contra su referencia, y §7.8 ya usaba un número
+que merece nombre propio: la referencia partida en dos mitades, una contra la
+otra, con la misma huella ECAPA. Es el **techo** de esa grabación, lo máximo que
+puede sacar cualquier motor con ese audio, y desde septiembre de 2026 se calcula
+antes de fabricar cada voz.
+
+Por qué importa quedó demostrado a base de perder tres doblajes
+([comparativa-motores.md §7](comparativa-motores.md)): dos voces del mismo
+vídeo, cortadas de la anotación humana, y dos destinos opuestos.
+
+| voz | material | techo | mejor clon (VibeVoice, es) | % del techo |
+|---|---|---|---|---|
+| Laura | 30,0 s | **0,946** | 0,65 | 61 % |
+| Juan Pablo | 19,3 s | **0,598** | 0,52 | 87 %, y aun así en la zona gris |
+| voz de trabajo (§2 de la comparativa) | 28,0 s | 0,764 | 0,54 | 71 % |
+
+Juan Pablo no llega al umbral de "misma persona" (0,626) **consigo mismo**: sus
+dos mitades no se reconocen. Ningún banco limpio, ninguna semilla y ningún motor
+lo subieron, porque el límite lo ponía la grabación. Sin este número se
+confunden dos problemas con arreglos opuestos: "el clon es malo" (más
+referencia, otra semilla, otro cfg) y "esta voz no se deja clonar" (grabar
+mejor, y nada más).
+
+Cómo se usa:
+
+```bash
+# solo medir: una grabacion, o varias de la misma voz
+python scripts/techo.py nota.opus
+# elegir referencia dentro de una charla: el mejor tramo de 25 s, no el mas largo
+python scripts/techo.py charla.wav --tramos 25 --salto 5
+```
+
+`clonar_voz.py` y `clonar_voz_qwen.py` lo imprimen **antes de cargar el modelo**
+y dejan una ficha `<voz>.json` junto al `.pt` (o al `.wav`/`.bin`) con el techo,
+los segundos y las fuentes. `--techo-minimo 0.70` se niega a fabricar por
+debajo; sin él solo avisa. El veredicto:
+
+| techo | qué esperar |
+|---|---|
+| ≥ 0,85 | buena: el clon puede pasar de 0,60 |
+| 0,70 – 0,85 | aceptable: la zona de las voces de trabajo |
+| 0,626 – 0,70 | floja: el clon queda en la zona gris; mejor regrabar |
+| < 0,626 | no se reconoce a sí misma: no hay clon que valga |
+
+Los dos motores probados rinden un porcentaje parecido del techo de cada voz
+(46-61 %). Con dos voces es indicio, no ley, pero apunta a que la palanca más
+grande de calidad, y la única que no cuesta CPU, es grabar referencias con
+techo alto: 25-30 s seguidos, micro cerca, sin solapes ni música.
+
+**Comprobación de la herramienta** (9 de septiembre de 2026, mismo juez): sobre
+la referencia de la comparativa da **0,764**, el mismo número que salió allí.
+Sobre los cuatro hablantes del vídeo de Laura y Juan Pablo, cortados con
+`banco_motores.py referencia` a partir de la anotación humana:
+
+| hablante | segmentos en orden, con solapes | sin solapes, los más largos primero (regla de `dobla`) |
+|---|---|---|
+| 1 (Laura) | **0,019** (23,6 s) | **0,890** (32,7 s) |
+| 2 (Juan Pablo) | sin segmentos limpios | 0,608 (11,7 s, un clip con 5,1 s de otra voz) |
+| 0 | 0,644 | 0,655 |
+| 3 | 0,653 | 0,653 |
+
+La primera columna es la lección: **un segmento con otra voz encima no baja el
+techo, lo destruye**. De 0,019 a 0,890 con el mismo material, solo quitando los
+tramos donde hablan a la vez. Por eso `referencia` aplica ahora la regla de
+pureza de `dobla` (contaminación < 0,3 s, los más largos primero, un clip sucio
+solo si no hay ni 4 s limpios). Los 0,890 y 0,608 cuadran con los 0,946 y 0,598
+que midió `dobla` con sus propios cortes de 30 y 19 s: la diferencia es qué
+segundos entran, no la métrica.
+
 ---
 
 > **Sobre clonar voces ajenas.** Esto convierte 15 segundos de audio en una voz

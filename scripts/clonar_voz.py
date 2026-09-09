@@ -253,6 +253,10 @@ def main():
                     "--transcripcion/--salida")
     ap.add_argument("--sin-igualar-volumen", action="store_true",
                     help="no lleva todos los clips al mismo RMS antes de codificar")
+    ap.add_argument("--techo-minimo", type=float, default=0.0,
+                    help="no fabricar la voz si su techo ECAPA (una mitad de la referencia "
+                         "contra la otra) queda por debajo; 0 = solo avisar. Medido: por "
+                         "debajo de 0,70 el clon lo limita la grabacion, no el motor")
     ap.add_argument("--modelo", default=os.environ.get(
         "VIBEVOICE_MODELO", str(Path.home() / ".cache/vibevoice-nix/modelo")))
     ap.add_argument("--cache", default=str(Path.home() / ".cache/vibevoice-nix"))
@@ -320,6 +324,17 @@ def main():
         avisar_heterogeneos(clips, g["audios"])
         if not args.sin_igualar_volumen and len(clips) > 1:
             clips = igualar_volumen(clips)
+        # El techo va ANTES de cargar el modelo: si la grabacion no se
+        # reconoce a si misma, 40 s de carga y un .pt no arreglan nada.
+        try:
+            from techo import techo_de_clips, informar as informar_techo
+            g["techo"] = techo_de_clips(clips)
+            informar_techo(g["techo"], sangria="  ", segundos=g["total"])
+        except ImportError:
+            g["techo"] = None          # sin speechbrain no hay techo; no es un error
+        if args.techo_minimo and (g["techo"] or 0) < args.techo_minimo:
+            raise SystemExit(f"{g['salida']}: techo {g['techo']} por debajo de "
+                             f"--techo-minimo {args.techo_minimo}: hace falta otra grabacion")
         g["clips"] = clips
         g["texto"] = "".join(t if t.endswith("\n") else t + "\n"
                              for t in g["textos"])
@@ -395,6 +410,13 @@ def main():
         salida = Path(g["salida"])
         salida.parent.mkdir(parents=True, exist_ok=True)
         torch.save(prefijo, salida)
+        # La ficha al lado del .pt: el techo y de donde salio la voz. El .pt
+        # no se toca (voz_stream.py lo carga tal cual); quien quiera saber
+        # cuanto puede dar esta voz lo lee aqui, no lo vuelve a medir.
+        salida.with_suffix(".json").write_text(json.dumps({
+            "techo": g["techo"], "segundos": round(g["total"], 1),
+            "muestras": len(clips), "fuentes": [str(a) for a in g["audios"]],
+            "posiciones": n + M}, ensure_ascii=False, indent=1))
         print(f"\n{g['total']:.1f} s de referencia en {len(clips)} muestra(s) -> "
               f"{n} latentes + {M} tokens de texto = {n+M} posiciones")
         print(f"prefijo escrito en {salida} ({salida.stat().st_size/2**20:.1f} MB)")

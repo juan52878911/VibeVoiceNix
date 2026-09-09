@@ -22,6 +22,7 @@ avisos de calidad (recorte, silencio, 16 kHz reescalado) y la homogeneidad
 entre clips son los de clonar_voz.py, que ya se validaron con numeros.
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -50,6 +51,8 @@ def main():
     ap.add_argument("--modelo", default=os.environ.get("QWEN3TTS_MODELO"))
     ap.add_argument("--sin-motor-c", action="store_true",
                     help="solo wav + txt (no hay motor C a mano)")
+    ap.add_argument("--techo-minimo", type=float, default=0.0,
+                    help="no fabricar la voz si su techo ECAPA queda por debajo; 0 = solo avisar")
     args = ap.parse_args()
 
     clips = []
@@ -64,11 +67,23 @@ def main():
     ref = np.concatenate([c for par in zip(clips, [hueco] * len(clips)) for c in par])
     ref = ref[: int(args.max * RITMO)]
 
+    # El techo se mide sobre lo que de verdad se va a codificar (recortado a
+    # --max), no sobre las grabaciones enteras: es el limite de ESTA voz.
+    from techo import techo_de_clips, informar as informar_techo
+    techo = techo_de_clips([ref])
+    informar_techo(techo, segundos=len(ref) / RITMO)
+    if args.techo_minimo and (techo or 0) < args.techo_minimo:
+        raise SystemExit(f"techo {techo} por debajo de --techo-minimo {args.techo_minimo}: "
+                         "hace falta otra grabacion")
+
     salida = Path(args.salida)
     salida.mkdir(parents=True, exist_ok=True)
     wav = salida / f"{args.nombre}.wav"
     escribir_wav(wav, ref)
     (salida / f"{args.nombre}.txt").write_text(args.transcripcion.strip() + "\n")
+    (salida / f"{args.nombre}.json").write_text(json.dumps({
+        "techo": techo, "segundos": round(len(ref) / RITMO, 1), "muestras": len(clips),
+        "fuentes": [str(a) for a in args.audio]}, ensure_ascii=False, indent=1))
     print(f"referencia: {wav} ({len(ref) / RITMO:.1f} s) + {args.nombre}.txt")
 
     if args.sin_motor_c:
