@@ -705,44 +705,86 @@ python scripts/banco_semillas.py --audio ref.wav --transcripcion "..." \
 
 Medido el 9 de septiembre sobre las dos voces del banco de `dobla` (referencias
 del vídeo de 4 voces, 5 semillas de clonado × 4 frases × 2 semillas de
-síntesis, cfg 3, 6 pasos, MPS):
+síntesis, cfg 3, 6 pasos, MPS). El tono es la mediana por semilla con el
+detector acotado a la banda de la voz (ver el aviso de abajo):
 
-| voz | semilla | puntuación | ECAPA | mín | es | en | tono | car/s | WER |
-|---|---|---|---|---|---|---|---|---|---|
-| Laura (techo 0,814, f0 247 Hz) | **1** | 0,625 | 0,648 | 0,496 | 0,695 | 0,507 | **−1,9 st** | 19,9 | **4,7 %** |
-| | 5 | 0,613 | **0,655** | 0,428 | 0,715 | 0,476 | −3,3 st | 19,9 | 8,6 % |
-| | 2 | 0,572 | 0,639 | 0,421 | 0,705 | 0,443 | −5,9 st | 19,6 | 8,0 % |
-| | 3 | 0,561 | 0,635 | 0,426 | 0,701 | 0,440 | −6,2 st | 19,5 | 11,3 % |
-| | 4 | 0,557 | 0,626 | 0,363 | 0,691 | 0,430 | −5,8 st | 19,7 | 10,6 % |
-| Juan Pablo (techo 0,51, f0 171 Hz) | **4** | 0,452 | 0,499 | 0,397 | 0,529 | 0,407 | −3,5 st | 21,3 | 11,3 % |
-| | 5 | 0,410 | 0,459 | 0,245 | 0,505 | 0,322 | −2,9 st | 21,3 | 19,8 % |
-| | 2 | 0,404 | 0,465 | 0,372 | 0,495 | 0,372 | −4,3 st | 21,5 | 17,9 % |
-| | 3 | 0,396 | 0,451 | 0,360 | 0,479 | 0,367 | −3,9 st | 21,2 | 16,0 % |
-| | 1 | 0,387 | 0,458 | 0,350 | 0,476 | 0,405 | −4,9 st | 21,9 | 21,7 % |
+| voz | semilla | puntuación | ECAPA | mín | es | en | tono | WER |
+|---|---|---|---|---|---|---|---|---|
+| Laura (techo 0,814, f0 247 Hz) | **5** | 0,646 | **0,655** | 0,428 | 0,715 | 0,476 | +0,05 st | 8,6 % |
+| | 1 | 0,636 | 0,648 | 0,496 | 0,695 | 0,507 | +0,77 st | **4,7 %** |
+| | 2 | 0,627 | 0,639 | 0,421 | 0,705 | 0,443 | +0,41 st | 8,0 % |
+| | 3 | 0,622 | 0,635 | 0,426 | 0,701 | 0,440 | +0,22 st | 11,3 % |
+| | 4 | 0,613 | 0,626 | 0,363 | 0,691 | 0,430 | +0,23 st | 10,6 % |
+| Juan Pablo (techo 0,51, f0 171 Hz) | **4** | 0,471 | **0,499** | 0,397 | 0,529 | 0,407 | −1,65 st | **11,3 %** |
+| | 2 | 0,436 | 0,465 | 0,372 | 0,495 | 0,372 | −1,13 st | 17,9 % |
+| | 5 | 0,425 | 0,459 | 0,245 | 0,505 | 0,322 | −1,42 st | 19,8 % |
+| | 1 | 0,419 | 0,458 | 0,350 | 0,476 | 0,405 | −1,71 st | 21,7 % |
+| | 3 | 0,416 | 0,451 | 0,360 | 0,479 | 0,367 | −1,93 st | 16,0 % |
 
 Lo que dice la tabla:
 
-- **La semilla mueve el tono hasta 4 semitonos.** Con la misma referencia,
-  Laura sale entre −1,9 y −6,2 st de su tono real. Eso no es un matiz: −6 st
-  es otra voz. Y la identidad ECAPA apenas lo nota (0,626-0,655): el juez de
-  timbre es casi ciego al tono, que es justo lo que oye una persona.
-- **Por eso la elección no es solo por identidad.** La puntuación es
-  `ECAPA − 0,01·|tono en st| − 0,1·WER` (0,01 de ECAPA equivale a 1 st o a
-  10 % de WER). Ordenando solo por ECAPA salía la semilla 5 (−3,3 st, WER
-  8,6 %); con la compuesta, la 1 (−1,9 st, WER 4,7 %, el mejor mínimo y el
-  mejor inglés) por 0,007 de identidad menos.
-- **En la voz difícil la semilla vale más que en la buena.** Juan Pablo va de
-  0,451 a 0,499 de identidad y de 11 % a 22 % de WER según la semilla: la
-  mejor le saca un 10 % de identidad a la peor. Con techo 0,51 sigue siendo
-  una voz inclonable, pero el sorteo decidía si quedaba en 0,45 o en 0,50.
-- **Todas las semillas salen graves.** Las diez filas tienen tono negativo:
-  el sesgo de tono del clonado con este codificador va hacia abajo en estas
-  dos voces (en §7.8 iba hacia arriba en voces graves). Es sistemático, no de
-  la semilla, y sigue pendiente de corregir a la salida.
+- **La semilla mueve poco la identidad de una voz buena y bastante la de
+  una mala.** Laura: 0,626-0,655 (0,03 de rango). Juan Pablo: 0,451-0,499, y
+  el WER del 11 % al 22 %: la mejor semilla le saca un 10 % de identidad y la
+  mitad de errores a la peor. Con techo 0,51 sigue siendo una voz inclonable,
+  pero el sorteo decidía si quedaba en 0,45 o en 0,50.
+- **El tono no depende de la semilla.** Laura sale entre +0,05 y +0,77 st de
+  su f0 real con cualquier semilla; Juan Pablo entre −1,1 y −1,9. El sesgo
+  es de la voz (grave, hacia abajo; §7.8 medía +2,5 st hacia arriba en otras
+  voces graves con otra referencia), no del sorteo.
+- **La puntuación es compuesta**: `ECAPA − 0,01·|tono en st| − 0,1·WER`
+  (0,01 de ECAPA equivale a 1 st o a 10 % de WER). En Laura decide entre la
+  5 (más identidad) y la 1 (mejor WER y mejor mínimo); en Juan Pablo la 4
+  gana en todo.
+
+> **Aviso sobre medir el tono.** La primera versión de esta tabla decía que
+> la semilla movía el tono hasta 4 semitonos (Laura de −1,9 a −6,2 st). Era el
+> detector: la autocorrelación con la banda entera (60-400 Hz) caía en el
+> subarmónico en algunos clips y daba −12 st, una octava, y la media
+> arrastraba. Acotando la búsqueda a [f0/1,5, f0·1,5] de la voz (un error de
+> octava necesita un factor 2) el sesgo real es el de arriba. `prosodia.
+> contorno` admite ahora `f_min`/`f_max`, y `tono.sesgo_st` los usa.
 
 El banco escribe `voces/<id>/semilla.json` para el banco de identidades de
 `dobla`, y el doblaje la usa (`--semilla-clon` es el valor por defecto para
 las voces sin ficha).
+
+### 7.12 Corregir el tono a la salida: medido, y no compensa
+
+Con el sesgo de tono medido por voz (§7.11), lo natural era corregirlo a la
+salida: desplazar el clon los semitonos que le faltan, sin tocar la
+duración. `scripts/tono.py` lo hace de dos maneras, solo con numpy, y
+`scripts/banco_tono.py` mide antes y después con el mismo juez sobre los
+clips de la semilla elegida (8 por voz):
+
+| voz | versión | ECAPA | mín | tono medio | WER |
+|---|---|---|---|---|---|
+| Laura | sin corregir | **0,648** | 0,496 | +0,54 st | **4,5 %** |
+| | remuestreo + WSOLA, por voz | 0,331 | 0,129 | (mal medido) | 5,5 % |
+| | PSOLA, por voz (−0,77 st) | 0,545 | 0,310 | +0,70 st | 5,2 % |
+| Juan Pablo | sin corregir | **0,499** | 0,397 | −1,49 st | **11,3 %** |
+| | remuestreo + WSOLA, por voz | 0,150 | 0,105 | (mal medido) | 16,1 % |
+| | PSOLA, por voz (+1,65 st) | 0,406 | 0,212 | −0,39 st | 20,7 % |
+| | PSOLA, por clip (el tope) | 0,410 | 0,219 | −0,37 st | 17,6 % |
+
+- **Remuestreo + WSOLA** (el mismo WSOLA de `estirar.py`) mueve el tono y las
+  formantes con él: el juez de identidad lo ve como otra persona (0,648 →
+  0,331). Descartado.
+- **TD-PSOLA** (marcas de periodo alineadas al pico, ventana de dos periodos,
+  reubicadas a T/r) conserva las formantes y clava el tono (Juan Pablo de
+  −1,5 a −0,4 st), pero cuesta **0,10 de identidad y sube el WER** (11 → 21 %
+  en Juan Pablo). Incluso corrigiendo cada clip con su sesgo exacto (el tope
+  teórico) el resultado es peor que sin tocar.
+- **Y el sesgo real es pequeño**: +0,5 st en Laura, −1,5 en Juan Pablo. La
+  cifra de 2,5 st de §7.8 sigue siendo cierta para aquella referencia, pero no
+  es general.
+
+Decisión: **no se corrige el tono a la salida.** `tono.py` queda como
+herramienta (`--st`, `--referencia`) y `banco_tono.py` como el banco que hay
+que superar si alguien vuelve a intentarlo: una corrección que no baje la
+identidad ni suba el WER sobre esos mismos clips. La palanca del tono, si
+hace falta, está en la referencia (grabar a la persona en su registro) y en
+la semilla, no en el posprocesado.
 
 ---
 
