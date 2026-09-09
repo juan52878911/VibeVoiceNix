@@ -173,6 +173,15 @@ Dos voces del vídeo `PXL_20260829_002857474` de `dobla`, cortadas de la
 | Laura | 30,0 s | **0,946** |
 | Juan Pablo | 19,3 s | **0,598** |
 
+Ojo con de donde sale ese techo: aqui se mide sobre el **audio anotado en
+crudo**, que es la referencia que se le da a los dos motores. El manifiesto del
+doblaje trae otro `techo` por hablante, medido sobre el **material real del
+clon** (banco + video, ya recortado de silencios y con el paso alto), y da
+numeros distintos para las mismas personas: 0,841 y 0,542 en el doblaje del 9 de
+septiembre. Los dos son correctos y miden cosas distintas -- el primero acota lo
+que el motor puede sacar de esa grabacion, el segundo lo que puede sacar del
+material que de verdad se le paso. No se comparan entre si.
+
 Elegirlas por el techo es lo que aporta esta medida. La de §2 usó una voz de
 techo 0,764, o sea el caso cómodo. Juan Pablo es el caso que rompe los
 doblajes: su propio audio, comparado consigo mismo, **no llega al umbral de
