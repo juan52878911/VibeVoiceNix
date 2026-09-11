@@ -536,6 +536,15 @@ Está documentado en el propio módulo. **Si algún día el motor cambia, ese aj
 - **El prefijo de voz se muta en `generate()`**: recargar y `deepcopy` en cada medición, o la segunda
   salida no se parece a la primera.
 - **Unificar formato antes de comparar texto** — ver la trampa de whisper con los números, arriba.
+- **Y unificar también las grafías que no se pueden oír.** En castellano la **h es muda** y **b y v
+  son el mismo fonema**: «hecho»/«echo» y «borrada»/«vorrada» suenan igual, así que cuál de las dos
+  escribe whisper lo decide su modelo de lenguaje y no la voz. Con una frase larga acierta por
+  contexto; con un relleno de media palabra, no. Medido en el banco de rellenos del asistente (450
+  clips de 1,1 s): «Hecho.» sale como *«¡Echo!»* con 5 de 18 semillas y «Borrada.» como
+  *«¡Vorrada!»* con 6 de 18 — 11 clips contados como error sin serlo, y una semilla que parecía
+  24/25 era en realidad **25/25**. Lo arregla `comparable()` en `scripts/fidelidad.py`, que protege
+  la «ch» antes de quitar las haches porque «echo» y «eco» sí suenan distinto. **En frases largas no
+  cambia ni un número** (comprobado sobre los tres bancos de pasos y el de 18 semillas).
 
 **Y una advertencia sobre el entorno:** una medida anterior de «~0,5 s de hueco en cada frontera de frase»
 estaba **contaminada por otros procesos saturando la máquina**. En reposo no había huecos ni con búfer 0.

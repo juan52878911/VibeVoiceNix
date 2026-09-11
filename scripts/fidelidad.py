@@ -18,8 +18,10 @@ sale bien y otra mal, el problema no es la frase sino la ESTABILIDAD.
 
 QUE SE MIDE
 
-  coincidencia exacta  tras normalizar (minusculas, sin puntuacion). Es la
-                       vara mas dura y la que de verdad importa.
+  coincidencia exacta  tras normalizar (minusculas, sin puntuacion, y las
+                       grafias que en castellano no se pueden oir: h muda y
+                       b/v -- ver comparable()). Es la vara mas dura y la que
+                       de verdad importa.
   WER                  proporcion de palabras mal, por distancia de edicion.
                        Es el estandar en reconocimiento de voz.
   estabilidad          si las N repeticiones de una misma frase coinciden
@@ -85,6 +87,34 @@ def normalizar(t: str) -> str:
     return " ".join(t.split())
 
 
+def comparable(t: str) -> str:
+    """normalizar() mas las dos grafias que en castellano NO se pueden oir.
+
+    LA MISMA TRAMPA QUE LA DE LAS CIFRAS, PERO EN ORTOGRAFIA. La 'h' no suena
+    y 'b' y 'v' son el MISMO fonema, asi que hay pares que el sintetizador no
+    puede pronunciar distinto por mucho que se le pida: "hecho"/"echo" y
+    "borrada"/"vorrada" suenan igual. Cual de las dos grafias escribe whisper
+    lo decide su modelo de lenguaje, y sobre una palabra suelta de medio
+    segundo no tiene contexto con el que decidirlo.
+
+    MEDIDO en el banco de rellenos del asistente (450 clips, 1,1 s de media):
+    "Hecho." sale como "¡Echo!" con 5 de 18 semillas y "Borrada." como
+    "¡Vorrada!" con 6 de 18. Son 11 clips de 450 contados como error sin
+    serlo: WER 28,1 % frente al 25,5 % real, y 300 exactos frente a 311.
+
+    En frases largas no cambia NADA -- los tres bancos de pasos (36 clips cada
+    uno) y el de 18 semillas (72) dan exactamente el mismo WER y los mismos
+    exactos con esta funcion y sin ella --, porque ahi whisper tiene contexto
+    de sobra para elegir la grafia. Solo aparece en los rellenos de una
+    palabra, que es justo donde se usa para decidir.
+
+    LA 'CH' SE PROTEGE antes de quitar las haches. Sin eso "echo" y "eco" se
+    fundirian en la misma cadena, y esos dos SI suenan distinto.
+    """
+    t = normalizar(t).replace("ch", "\x01").replace("h", "").replace("\x01", "ch")
+    return t.replace("v", "b")
+
+
 def distancia(a: list, b: list) -> int:
     """Levenshtein sobre palabras."""
     if not a:
@@ -100,18 +130,24 @@ def distancia(a: list, b: list) -> int:
 
 
 def wer(referencia: str, hipotesis: str) -> float:
-    r = normalizar(referencia).split()
-    h = normalizar(hipotesis).split()
+    r = comparable(referencia).split()
+    h = comparable(hipotesis).split()
     return distancia(r, h) / len(r) if r else (0.0 if not h else 1.0)
 
 
 def diferencias(referencia: str, hipotesis: str) -> str:
-    """Resume que cambio, en lenguaje llano."""
-    r, h = normalizar(referencia).split(), normalizar(hipotesis).split()
+    """Resume que cambio, en lenguaje llano.
+
+    Se decide con comparable() -- si no, se listarian como diferencia las
+    grafias que suenan igual -- pero se ENSEÑA la palabra tal cual se escribio,
+    que es lo que el que lee espera ver.
+    """
+    r_vis, h_vis = normalizar(referencia).split(), normalizar(hipotesis).split()
+    r, h = comparable(referencia).split(), comparable(hipotesis).split()
     if r == h:
         return ""
-    faltan = [p for p in r if p not in h]
-    sobran = [p for p in h if p not in r]
+    faltan = [v for p, v in zip(r, r_vis) if p not in h]
+    sobran = [v for p, v in zip(h, h_vis) if p not in r]
     partes = []
     if faltan:
         partes.append("se comió: " + ", ".join(faltan[:5]))
@@ -275,7 +311,7 @@ def main():
                 print(f"    {etiqueta}: FALLO {type(e).__name__}: {e}")
                 continue
             e_wer = wer(f, oido)
-            exacto = normalizar(f) == normalizar(oido)
+            exacto = comparable(f) == comparable(oido)
             pases.append({"oido": oido, "wer": e_wer, "exacto": exacto,
                           "dur": dur, "gen": gen})
             filas.append({"fichero": fichero, "frase": i, "texto": f,
@@ -294,7 +330,7 @@ def main():
                 if d:
                     print(f"              {d}")
         if pases:
-            distintos = len({normalizar(p["oido"]) for p in pases})
+            distintos = len({comparable(p["oido"]) for p in pases})
             resultados.append({"texto": f, "pases": pases, "variantes": distintos})
             if distintos > 1:
                 print(f"    >>> INESTABLE: {distintos} transcripciones distintas de {len(pases)}")
