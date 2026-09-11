@@ -189,6 +189,24 @@ pasos.** La primera tanda de 6 pasos dio RTF 1,267 por correr recién reiniciado
 del modelo en swap); repetida dio 1,057 con los mismos 36 md5. El RTF de la primera tanda tras un
 despliegue no vale.
 
+### G · La imagen Docker, construida y probada en el CT docker-sandbox
+
+La primera construcción (`docker compose --profile pesado build voz-stream`, contexto remoto, 6
+núcleos, CT ampliado a 52 GB de disco y 8 GB de RAM mientras duró) **arrancó y murió en la primera
+línea**: `ModuleNotFoundError: No module named 'estirar'`, en bucle de reinicio. El Dockerfile
+copiaba `voz_stream.py` y `prueba.html` pero no `estirar.py`, que `voz_stream.py` importa desde que
+existe la velocidad sin mover el tono; la derivación de Nix sí lo copiaba y por eso en la VM nunca
+se vio. **La imagen llevaba rota desde ese commit.** Arreglado en `docker/Dockerfile.voz-stream`.
+
+Con el arreglo: huella `ec7239c1c29a` en los logs (la misma que la VM y el fichero local),
+`/health` con `motor: torch-int8`, `semilla_defecto: null`, 1847 MB residentes tras cargar, 2,2 GB
+en `docker stats`. La suite de `ws_fidelidad.py` (fidelidad, concurrencia, pausa, pausa-stream,
+corte, errores; voz `sp-Spk1_man`, la imagen solo trae las oficiales) sale «todo correcto»: el
+arreglo del estado por sesión vale también en el motor torch. Seis clips con semilla 11 y 6 pasos,
+transcritos en el Mac con faster-whisper small: WER medio 7,4 %, 4/6 exactos, frente a 6,1 % y 4/6
+de la misma semilla en la VM (motores distintos, así que el md5 no se compara). RTF en el CT: 1,7 a
+2,0, en línea con los 2,19 históricos del camino torch.
+
 ### La semilla pesa más que los pasos
 
 WER medio / frases exactas por semilla (6 frases cada celda), en los tres bancos:
