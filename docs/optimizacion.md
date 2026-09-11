@@ -581,6 +581,22 @@ un log.
 ## Qué queda sobre la mesa
 
 <details>
+<summary><b>La semilla por defecto: 40 puntos de WER entre la mejor y la peor</b></summary>
+
+<br>
+
+Medido el 10 de septiembre de 2026 en la VM con 18 semillas × las 6 frases del banco
+(`sp-Spk1_man`, cfg 3,0, 6 pasos; tabla completa en
+[plan-determinismo-calidad.md](plan-determinismo-calidad.md)): las semillas 101 y 17 aciertan las
+6 frases; la 42 falla 5 de 6 (40,7 % de WER) y la 37 tiene 29,6 %. Entre 6 y 10 pasos, en cambio,
+la diferencia es de un punto. Hoy cada petición sortea, así que una de cada seis cae en una semilla
+mala. `services.voz-stream.semilla` (y `VIBEVOICE_SEMILLA`) permiten fijarla; el defecto sigue
+siendo `null` porque fijarla hace que el mismo texto suene siempre igual, y esa decisión —y con qué
+frases y qué voz ampliar el banco antes— es del que opera el servicio.
+
+</details>
+
+<details>
 <summary><b>La mejor inversión pendiente: 20 € de RAM</b></summary>
 
 <br>

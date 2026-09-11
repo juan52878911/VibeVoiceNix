@@ -217,8 +217,48 @@ WER medio / frases exactas por semilla (6 frases cada celda), en los tres bancos
 | 8 | 11 % / 3 | 0 % / 6 | 0 % / 6 | 43 % / 4 | 13 % / 2 | **0 % / 6** |
 | 10 | 13 % / 3 | 2 % / 5 | 4 % / 4 | 9 % / 4 | **36 % / 1** | **0 % / 6** |
 
-UTMOS medio por semilla: s101 3,67 · s11 3,65 · s3 3,59 · s7 3,53 · s23 3,48 · s42 3,41. La 101
-acierta las 6 frases con cualquier número de pasos y es la que mejor suena; la 42 falla en todas
-las tandas. El WER medio del banco (11,8 %) frente al 3,6 % histórico se explica por eso: aquí las
-semillas están fijas y dos de las seis son malas. Es la palanca que `VIBEVOICE_SEMILLA` deja
-mover; el banco de 12 semillas más está en la sección siguiente.
+La 101 acierta las 6 frases con cualquier número de pasos y es de las que mejor suenan; la 42
+falla en todas las tandas. El WER medio del banco de pasos (11,8 %) frente al 3,6 % histórico se
+explica por eso: aquí las semillas están fijas y dos de las seis son malas.
+
+**18 semillas a 6 pasos** (las 6 de arriba más 12: 1, 2, 5, 13, 17, 19, 29, 31, 37, 57, 77, 99;
+mismas 6 frases, `sp-Spk1_man`, cfg 3,0, VM; 108 clips, WER medio global 8,2 %), ordenadas por WER
+y, a igualdad, por UTMOS:
+
+| semilla | WER medio | WER peor | exactos | UTMOS medio | UTMOS mín |
+|---|---|---|---|---|---|
+| **101** | **0,0 %** | 0 % | **6/6** | **3,689** | 3,384 |
+| **17** | **0,0 %** | 0 % | **6/6** | 3,628 | 3,195 |
+| 2 | 2,4 % | 14 % | 5/6 | 3,715 | 3,226 |
+| 19 | 2,4 % | 14 % | 5/6 | 3,615 | 3,212 |
+| 7 | 2,4 % | 14 % | 5/6 | 3,465 | 2,651 |
+| 57 | 2,4 % | 14 % | 5/6 | 3,177 | 2,794 |
+| 31 | 4,2 % | 14 % | 4/6 | 3,357 | 2,520 |
+| 29 | 4,8 % | 29 % | 5/6 | 3,473 | 3,230 |
+| 1 | 5,2 % | 17 % | 4/6 | 3,516 | 2,840 |
+| 11 | 6,1 % | 22 % | 4/6 | 3,706 | 3,249 |
+| 13 | 6,1 % | 22 % | 4/6 | 3,664 | 3,172 |
+| 77 | 6,1 % | 22 % | 4/6 | 3,536 | 3,251 |
+| 5 | 6,5 % | 17 % | 3/6 | 3,455 | 3,153 |
+| 99 | 6,6 % | 29 % | 4/6 | 3,397 | 3,151 |
+| 23 | 8,3 % | 22 % | 3/6 | 3,566 | 3,109 |
+| 3 | 13,0 % | 67 % | 4/6 | 3,398 | 2,830 |
+| 37 | 29,6 % | 78 % | 3/6 | 3,528 | 3,163 |
+| 42 | 40,7 % | 83 % | 1/6 | 3,457 | 3,126 |
+
+Entre la mejor y la peor semilla hay 40 puntos de WER **con el mismo modelo, la misma voz y los
+mismos pasos**; entre 6 y 10 pasos, uno. Con el sorteo por petición (lo de hoy), una de cada seis
+peticiones cae en una semilla como la 3, la 37 o la 42. Fijar `services.voz-stream.semilla = 101`
+para `sp-Spk1_man` quitaría esa lotería a cambio de que el mismo texto suene siempre igual; el 11
+que usan `perfiles.py` y los bancos históricos está a mitad de tabla (6,1 %). Seis frases son pocas
+para elegir entre 101 y 17, y una semilla buena para una voz no tiene por qué serlo para otra: la
+decisión de fijarla, y con qué frases ampliar el banco antes, es de Juan. **No se ha cambiado el
+defecto** (`null`, sorteo), como decía el plan.
+
+### Qué queda
+
+- Decidir la semilla por defecto (arriba). Si se fija, repetir el banco de 18 semillas con las
+  frases de la voz que se use en producción y con la voz clonada, si la hay.
+- El WER de la frase «El uso de memoria bajó un veinticuatro por ciento» (17 % de media) y de «No
+  hay incidencias que reportar en las últimas horas» (29 %) es del modelo en esas frases, no del
+  ruido: son las dos que fallan con casi cualquier semilla.
