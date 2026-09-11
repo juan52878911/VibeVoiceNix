@@ -224,13 +224,17 @@ Y en paralelo, **sin coste en tiempo**:
 | Guía CFG de 1,5 → 3,0 | WER 13,6 %, peor 85,7 % | **3,6 %**, peor 14,3 % |
 | Soltar pesos muertos | 3718 MB | **2832 MB** |
 
-### El hallazgo que ordena todo
+### El hallazgo que ordenó todo, y cómo caducó
 
-**El cuello es el ancho de banda de memoria, no el cómputo.** Medido: la CPU alcanza **17,2 GB/s de los
-21,3 teóricos = 80,7 %**, el techo práctico de la DDR4.
+**Con la RAM en canal único, el cuello era el ancho de banda de memoria, no el cómputo.** Medido
+entonces: la CPU alcanzaba **17,2 GB/s de los 21,3 teóricos = 80,7 %**, el techo práctico de la DDR4.
+El corolario —lo que paga es **reducir bytes de peso**, no reducir operaciones— explica el viaje
+entero: por eso int8 ganó un 96 % y `torch.compile` dio exactamente 1,00×.
 
-**Corolario:** lo que paga es **reducir bytes de peso** (cuantización), no reducir operaciones. Por eso
-int8 ganó un 96 % y `torch.compile` dio exactamente 1,00×.
+**Con el segundo módulo puesto ya no se cumple:** tres pruebas lo descartan (una pasada de dos tokens
+cuesta 1,77× la de uno, agrupar latentes en el decodificador no gana, y bajar de int8 a int4 da un 7 %
+en vez del 38 % que darían los bytes). Hoy manda el cómputo. Es el ejemplo más caro del proyecto de que
+**un hallazgo se ata al hardware con el que se midió**.
 
 ### La optimización más rentable salió del perfilador
 
@@ -742,8 +746,9 @@ pico paso a paso, no leyendo el estado de salida.
 - [x] Streaming, túnel WireGuard, imágenes Docker y colección Bruno
 - [ ] Despliegue de punta a punta contra Proxmox
 
-**Pendiente con mejor retorno:** 20 € de RAM. La máquina está en *single channel* y el ancho de banda es el
-cuello medido; un segundo módulo lo duplica. Ver [docs/optimizacion.md](docs/optimizacion.md).
+Los 20 € de RAM que fueron mucho tiempo el pendiente con mejor retorno **ya están puestos**: el host va
+en *dual channel* y con eso el cuello dejó de ser la memoria. Ver
+[docs/optimizacion.md](docs/optimizacion.md).
 
 ## Documentación
 

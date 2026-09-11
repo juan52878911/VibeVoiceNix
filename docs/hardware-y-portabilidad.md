@@ -62,49 +62,61 @@ Pero entonces la conversación es "un equipo con ranura PCIe de verdad", no
 
 ---
 
-## 2. RAM: lo que de verdad hace falta
+## 2. RAM: hecho, y qué cambió
 
-Es la mejora con mejor retorno del proyecto, y aparece por dos motivos
-independientes.
+**Era la mejora con mejor retorno del proyecto y ya está puesta**: el host
+lleva 16 GB en dual channel, dos módulos de 8 GB, uno por canal
+(`dmidecode` en el M920q):
 
-### Motivo A: el techo de memoria bloquea trabajo real
+```
+Locator: ChannelA-DIMM0   Size: 8 GB   Speed: 2667 MT/s   Configured: 2400 MT/s
+Locator: ChannelB-DIMM0   Size: 8 GB   Speed: 2400 MT/s   Configured: 2400 MT/s
+```
 
-Hoy ha aparecido **cuatro veces**:
+Esta sección decía que **el segundo módulo tenía que ser idéntico** o el dual
+channel podía no activarse. **No fue así**: los dos tienen frecuencia nominal
+distinta, el dual channel se activó igual y ambos corren a 2400, que es lo que
+impone el más lento.
 
-| Dónde | Qué pasó |
+### Motivo A: el techo de memoria bloqueaba trabajo real
+
+Apareció **cuatro veces**, y con 16 GB han desaparecido las cuatro:
+
+| Dónde | Qué pasaba |
 |---|---|
 | Banco de cuantización | OOM: fp32 + copia int8 pasaban de 4,7 GB |
 | Servidor de streaming | Murió **3 veces** al coincidir con las conversiones |
 | Grafos de OpenVINO | No caben en un sandbox de Nix (piden 4,6 GB) |
 | Host de construcción | Sin margen mientras la VM tiene 5 GB reservados |
 
-Ese tercer punto es el más caro: obliga a que los IR se generen fuera del
-store, y es el **único artefacto derivado** de todo el proyecto que no es una
-derivación de Nix.
+El tercero era el más caro y es el único con cola: los IR **siguen**
+generándose fuera del store porque el contenedor constructor tenía 2560 MB.
+Con la memoria de hoy puede que ya quepan, y entonces dejarían de ser el único
+artefacto derivado del proyecto que no es una derivación de Nix. Está sin
+comprobar.
 
-### Motivo B: duplica el recurso que limita
+### Motivo B: duplicaba el recurso que limitaba... y por eso dejó de limitar
 
-Medido en el host: **17,2 GB/s de un máximo teórico de 21,3 = 80,7 %**. Ese es
-el techo práctico de la DDR4, o sea que la CPU sola ya exprime el bus.
+Con un solo módulo se midió **17,2 GB/s de un máximo teórico de 21,3 = 80,7 %**:
+la CPU sola exprimía el bus, y de ahí el corolario que ordenaba todo el
+proyecto (lo que paga es mover menos bytes, no hacer menos operaciones).
 
-**Está en single channel** — un módulo de 8 GB y el segundo zócalo **vacío**
-(máximo 32 GB, confirmado por `dmidecode`).
+**Con los dos módulos ese corolario ya no se cumple.** Tres pruebas en la VM lo
+descartan: una pasada de backbone de dos tokens cuesta 1,77× la de uno cuando
+debería costar ~1,0×; agrupar seis latentes en una llamada del decodificador no
+gana nada; y bajar el decodificador de int8 a int4 da un 7 % en vez del 38 % que
+darían los bytes. Ahora manda el **cómputo**: seis núcleos a 2,4 GHz con AVX2 y
+sin VNNI. El detalle está en
+[optimizacion.md](optimizacion.md#qué-queda-sobre-la-mesa).
 
-Un segundo módulo idéntico da **dual channel**: ~34 GB/s reales, el doble de
-lo que hoy limita cada inferencia.
+No se ha vuelto a medir el ancho de banda en sí; la cifra de 17,2 GB/s que
+aparece arriba es la de canal único.
 
-### Qué comprar
+### Si algún día hacen falta 32 GB
 
 | Opción | Coste | Resultado |
 |---|---|---|
-| **+1× 8 GB DDR4-2667 SODIMM** | **~20 €** | 16 GB, dual channel |
-| 2× 16 GB | ~60 € | 32 GB (el máximo), dual channel |
-
-Con 16 GB desaparecen los cuatro bloqueos y los IR pueden pasar al store.
-
-**Importante: el segundo módulo debe ser idéntico** (misma frecuencia y
-preferiblemente mismo fabricante), o el dual channel puede no activarse y te
-quedas solo con la capacidad.
+| 2× 16 GB | ~60 € | 32 GB (el máximo del equipo), dual channel |
 
 ---
 
@@ -133,10 +145,14 @@ Los tres motores corren nativos en Apple Silicon:
 | **whisper.cpp** | **Metal nativo**, mucho más rápido que los 0,853 del i7 |
 | **VibeVoice** | CPU o MPS |
 
-Y hay un detalle que juega a tu favor: **la memoria unificada de Apple Silicon
-tiene entre 6 y 23 veces más ancho de banda** que tu DDR4 single channel. Como
-demostramos que el cuello **es** el ancho de banda, VibeVoice iría bastante más
-rápido en el Mac incluso sin tocar la GPU.
+Y hay un detalle que jugaba a tu favor: **la memoria unificada de Apple Silicon
+tenía entre 6 y 23 veces más ancho de banda** que la DDR4 del Tiny en canal
+único. Ese argumento **se ha quedado a medias**: por un lado el host ya va en
+dual channel, y por otro dejó de ser cierto que el cuello sea la memoria (ver
+el apartado 2). Lo que sí se midió después, y es lo que importa: VibeVoice en
+el Mac por MPS en fp16 da **RTF 1,39** (`docker/README.md`), frente al **1,09**
+del OpenVINO int8 de la VM. La ventaja del Mac está en el ancho de banda, pero
+la de la VM está en los grafos compilados y el int8, y gana la VM.
 
 ### La advertencia sobre MPS
 

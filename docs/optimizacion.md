@@ -486,8 +486,12 @@ con 10. Y la primera pasada del banco a 6 pasos salió a RTF 1,267 por correr re
 servicio con las páginas del modelo aún en swap; se repitió (mismos 36 md5, bit a bit) y dio 1,057.
 El RTF de la primera tanda tras un despliegue no vale.
 
-**El corolario que ordena todo:** como el cuello es **leer pesos desde RAM**, lo que paga es **reducir
-bytes de peso**, no reducir operaciones. Por eso int8 ganó y `torch.compile` no.
+**El corolario que ordenaba todo, y que ya no vale tal cual:** cuando la RAM iba en **canal único**, el
+cuello era **leer pesos**, así que lo que pagaba era **reducir bytes**, no reducir operaciones. Eso
+explica por qué int8 ganó y `torch.compile` no, y por qué fallan las ideas de la tabla de arriba. Con
+el segundo módulo puesto **manda el cómputo** — las tres pruebas están en [Qué queda sobre la
+mesa](#qué-queda-sobre-la-mesa) —, así que una idea nueva no se puede descartar citando este corolario:
+hay que medirla.
 
 **Y el matiz que llegó después.** Ese corolario explica por qué fallan las ideas
 de la tabla, pero **no dice que la máquina esté llena**. Lo prueba el
@@ -600,26 +604,46 @@ ese banco con las frases reales del asistente y con las voces clonadas.
 </details>
 
 <details>
-<summary><b>La mejor inversión pendiente: 20 € de RAM</b></summary>
+<summary><b>✅ Los 20 € de RAM ya están puestos — y con ellos cambió el corolario</b></summary>
 
 <br>
 
-La máquina está en **single channel**: un módulo de 8 GB y el segundo zócalo **vacío**. Medido: **17,2 GB/s
-de 21,3 teóricos (80,7 %)** — la CPU sola ya exprime el bus.
+Era «la mejor inversión pendiente» de este documento durante meses. **Ya está hecha.** El host tiene
+hoy dos módulos de 8 GB, uno por canal, confirmado con `dmidecode` en el M920q:
 
-Un segundo módulo idéntico da **dual channel**: ~34 GB/s reales, **el doble del recurso que limita cada
-inferencia**.
+```
+Locator: ChannelA-DIMM0   Size: 8 GB   Speed: 2667 MT/s   Configured: 2400 MT/s
+Locator: ChannelB-DIMM0   Size: 8 GB   Speed: 2400 MT/s   Configured: 2400 MT/s
+```
 
-Y el techo de memoria ya bloqueó trabajo real cuatro veces: el banco de cuantización se quedó sin memoria,
-el servidor de streaming murió tres veces, los grafos de OpenVINO no caben en el sandbox de Nix (piden
-4,6 GB, y por eso los IR viven fuera del store), y el host de construcción va sin margen.
+Un detalle que contradice lo que decía este mismo apartado: **no hicieron falta módulos idénticos**.
+Tienen frecuencia nominal distinta (2667 y 2400) y el dual channel se activó igual; los dos corren a
+2400, que es lo que manda el más lento.
 
-| Opción | Coste | Resultado |
+**Lo que cambió no es la velocidad, es el diagnóstico.** El corolario que ordenaba todo el documento
+—«el cuello es leer pesos desde RAM, así que lo que paga es reducir bytes»— era cierto **en canal
+único**. Con los dos módulos, las tres pruebas que lo confirmarían salen que no (medidas en la VM y
+documentadas en [`pkgs/vibevoice-ov/motor.py`](../pkgs/vibevoice-ov/motor.py)):
+
+| Prueba | Si mandara la memoria | Lo medido |
 |---|---|---|
-| **+1× 8 GB DDR4-2667 SODIMM** | **~20 €** | 16 GB, dual channel |
-| 2× 16 GB | ~60 € | 32 GB (el máximo), dual channel |
+| Pasada de backbone de 2 tokens frente a 1 | ~1,0× (mismos 156 MB de pesos) | **1,77×** |
+| Decodificador con 6 latentes por llamada frente a 1 | gana (344 MB leídos una vez, no seis) | **no gana** |
+| Decodificador de int8 (344 MB) a int4 (212 MB) | −38 % por los bytes | **−7 %** |
 
-**El segundo módulo debe ser idéntico** o el dual channel puede no activarse.
+**Manda el cómputo**, en seis núcleos a 2,4 GHz con AVX2 y sin VNNI. Lo que queda por ganar está en
+hacer menos trabajo, no en mover menos bytes.
+
+**Y desaparecieron los cuatro bloqueos** que la falta de memoria causaba: el banco de cuantización se
+quedaba sin memoria, el servidor de streaming murió tres veces, el host de construcción iba sin margen
+y los grafos de OpenVINO no cabían. Queda **una** consecuencia por revisar: los IR siguen generándose
+fuera del store por aquel límite de 2560 MB del contenedor constructor, y con 16 GB puede que ya
+quepan. Sería el único artefacto derivado del proyecto que dejaría de estar fuera de Nix.
+
+Lo que **no** se ha vuelto a medir es el ancho de banda en sí: los 17,2 GB/s de 21,3 que aparecen más
+arriba son la cifra de canal único, y sigue sin repetirse la prueba con los dos módulos. No cambia
+ninguna decisión —el diagnóstico ya lo dan las tres pruebas de arriba— pero la cifra que se cita en
+este documento es la vieja.
 
 **La GPU, en cambio, ya no hace falta:** el objetivo era tiempo real y se alcanzó en CPU. El detalle de por
 qué una eGPU no compensa está en [hardware-y-portabilidad.md](hardware-y-portabilidad.md).
