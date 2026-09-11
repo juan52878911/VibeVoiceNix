@@ -216,7 +216,7 @@ Módulo: [`nix/modules/voz-stream.nix`](../nix/modules/voz-stream.nix).
 | `vocesPropias` | `nullOr path` | `null` | Directorio de la máquina con prefijos `.pt` propios. Fuera del store. |
 | `solaparDecodificador` | `bool` | `true` | Corre el decodificador acústico **a la vez** que el bucle: −21 % de RTF. |
 | `hilosDecodificador` | `int` | `0` | Hilos para el decodificador solapado. 0 = la mitad de `hilos`. |
-| `semilla` | `nullOr int` | `null` | Semilla del ruido cuando el cliente no manda ninguna. `null` = sorteo por petición (lo de siempre); un número hace el servicio determinista por defecto. `/health` la anuncia como `semilla_defecto`. |
+| `semilla` | `nullOr int` | `null` | Semilla del ruido cuando el cliente no manda ninguna. `null` = sorteo por petición; un número hace el servicio determinista por defecto. `/health` la anuncia como `semilla_defecto`. **La VM `voz` lleva `101`**, la que ganó el banco de 18 semillas (0 % de WER frente al 40,7 % de la peor; tabla en [plan-determinismo-calidad.md](plan-determinismo-calidad.md)). |
 | `motor` | `enum` | `"vibevoice"` | Qué modelo hay detrás de :8082: `vibevoice` (lo medido) o `qwen3tts` (Qwen3-TTS-0.6B-Base con el motor C). Mismo contrato HTTP. |
 | `qwen3tts.cuantizacion` | `enum` | `"int8"` | `int8` o `int4` en el motor C. |
 | `qwen3tts.hilos` | `int` | `0` | Hilos del motor C. 0 = todos. |

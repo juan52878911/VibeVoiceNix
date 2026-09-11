@@ -152,6 +152,19 @@
     # aporta seguridad -- voz-api (8080) ya esta abierto igual. Sigue pidiendo
     # bearer token, y a internet no se expone nada.
     abrirCortafuegos = true;
+    # Semilla FIJA del ruido de la difusion: el servicio es determinista por
+    # defecto (mismo texto, misma voz -> mismo audio, byte a byte) y un
+    # cliente que quiera variedad manda "semilla": null.
+    #
+    # 101 y no el sorteo, MEDIDO el 10-09-2026 en esta VM: 18 semillas x las
+    # 6 frases del banco de fidelidad, sp-Spk1_man, cfg 3,0, 6 pasos. La 101
+    # (y la 17) aciertan las 6 frases con 0 % de WER y con 6, 8 y 10 pasos;
+    # la 42 falla 5 de 6 (40,7 %) y la 37 tiene 29,6 %. Sorteando, una de
+    # cada seis peticiones caia en una de esas. Entre la mejor y la peor
+    # semilla hay 40 puntos de WER; entre 6 y 10 pasos, uno. La tabla entera
+    # esta en docs/plan-determinismo-calidad.md. Si cambia la voz por defecto
+    # hay que repetir el banco: la semilla buena es de la voz.
+    semilla = 101;
   };
 
   # El token no puede vivir en el store (es legible por todo el sistema). Se

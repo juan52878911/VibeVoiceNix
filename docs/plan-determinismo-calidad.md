@@ -251,14 +251,17 @@ mismos pasos**; entre 6 y 10 pasos, uno. Con el sorteo por petición (lo de hoy)
 peticiones cae en una semilla como la 3, la 37 o la 42. Fijar `services.voz-stream.semilla = 101`
 para `sp-Spk1_man` quitaría esa lotería a cambio de que el mismo texto suene siempre igual; el 11
 que usan `perfiles.py` y los bancos históricos está a mitad de tabla (6,1 %). Seis frases son pocas
-para elegir entre 101 y 17, y una semilla buena para una voz no tiene por qué serlo para otra: la
-decisión de fijarla, y con qué frases ampliar el banco antes, es de Juan. **No se ha cambiado el
-defecto** (`null`, sorteo), como decía el plan.
+para elegir entre 101 y 17, y una semilla buena para una voz no tiene por qué serlo para otra.
+
+**Decisión (Juan, el mismo día): se fija la 101.** `services.voz-stream.semilla = 101` en
+`nix/configuration.nix` y `VIBEVOICE_SEMILLA=101` en `docker/compose.yaml`; el defecto del módulo
+sigue en `null` para que quien cambie la voz tenga que decidirlo midiendo. Un cliente que quiera
+variedad manda `"semilla": null`.
 
 ### Qué queda
 
-- Decidir la semilla por defecto (arriba). Si se fija, repetir el banco de 18 semillas con las
-  frases de la voz que se use en producción y con la voz clonada, si la hay.
+- Repetir el banco de semillas con las frases reales del asistente y con las voces clonadas, si
+  se usan: la semilla buena es de la voz.
 - El WER de la frase «El uso de memoria bajó un veinticuatro por ciento» (17 % de media) y de «No
   hay incidencias que reportar en las últimas horas» (29 %) es del modelo en esas frases, no del
   ruido: son las dos que fallan con casi cualquier semilla.

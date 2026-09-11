@@ -95,10 +95,12 @@ services:
       # cuesta un 26%.
       VIBEVOICE_PASOS: "6"
       VIBEVOICE_VOZ: "sp-Spk1_man"
-      # Semilla del ruido cuando el cliente no manda ninguna. Vacia = sorteo
-      # por peticion (cada llamada suena distinta). Con un numero el servicio
-      # es determinista por defecto; "semilla": null en la peticion sortea.
-      VIBEVOICE_SEMILLA: "${VIBEVOICE_SEMILLA:-}"
+      # Semilla del ruido cuando el cliente no manda ninguna. 101 es la que
+      # gano el banco de 18 semillas con sp-Spk1_man (0 % de WER en las 6
+      # frases; la peor, la 42, 40,7 %): el servicio es determinista por
+      # defecto y "semilla": null en la peticion vuelve a sortear. Vacia =
+      # sorteo por peticion. Con otra voz, repetir el banco.
+      VIBEVOICE_SEMILLA: "${VIBEVOICE_SEMILLA:-101}"
       # Si el contenedor muere DESPUES de cargar el modelo, mientras genera
       # el audio de calentamiento, es que no le llega la memoria: a los
       # ~2,5 GB del modelo se le suman las activaciones de una sintesis

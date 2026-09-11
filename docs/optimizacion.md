@@ -589,10 +589,13 @@ Medido el 10 de septiembre de 2026 en la VM con 18 semillas × las 6 frases del 
 (`sp-Spk1_man`, cfg 3,0, 6 pasos; tabla completa en
 [plan-determinismo-calidad.md](plan-determinismo-calidad.md)): las semillas 101 y 17 aciertan las
 6 frases; la 42 falla 5 de 6 (40,7 % de WER) y la 37 tiene 29,6 %. Entre 6 y 10 pasos, en cambio,
-la diferencia es de un punto. Hoy cada petición sortea, así que una de cada seis cae en una semilla
-mala. `services.voz-stream.semilla` (y `VIBEVOICE_SEMILLA`) permiten fijarla; el defecto sigue
-siendo `null` porque fijarla hace que el mismo texto suene siempre igual, y esa decisión —y con qué
-frases y qué voz ampliar el banco antes— es del que opera el servicio.
+la diferencia es de un punto. Sorteando, una de cada seis peticiones caía en una semilla mala.
+**Decidido el mismo día: la VM `voz` lleva `services.voz-stream.semilla = 101`** y el compose
+`VIBEVOICE_SEMILLA=101`. El mismo texto con la misma voz da ahora el mismo audio byte a byte, y un
+cliente que quiera variedad manda `"semilla": null`. El defecto del módulo sigue en `null` porque la
+semilla buena es de la voz: quien cambie `vozDefecto` tiene que repetir el banco
+(`fidelidad.py --semillas … ` y `naturalidad.py`) antes de fijar otra. Lo que queda sobre la mesa es
+ese banco con las frases reales del asistente y con las voces clonadas.
 
 </details>
 
