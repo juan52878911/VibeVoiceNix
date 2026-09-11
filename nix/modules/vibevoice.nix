@@ -173,12 +173,23 @@ in
 
     cfgScale = lib.mkOption {
       type = lib.types.float;
-      default = 1.5;
+      default = 3.0;
       description = ''
         Escala del classifier-free guidance. Afecta a la CALIDAD, no a la
         velocidad: medido en un i7-8700T da RTF 3,92 (1.5), 4,02 (1.3) y 4,20
         (1.0), y a 1.0 el modelo ademas divaga (17 s de audio para un texto de
-        11 s). Dejalo en 1.5.
+        11 s).
+
+        3.0 y no 1.5, que fue el defecto hasta septiembre de 2026: es lo que
+        ya usaba voz-stream, es el defecto del propio upstream, y esta medido
+        con el banco de fidelidad (texto -> voz -> whisper -> texto, 6 frases
+        x 3 repeticiones; scripts/fidelidad.py):
+
+          cfg 1,5   WER medio 13,6 %   peor caso 85,7 %   3/6 frases inestables
+          cfg 3,0   WER medio  3,6 %   peor caso 14,3 %   1/6
+
+        Y sale gratis en tiempo: la difusion evalua las dos ramas en un lote
+        de 2 pase lo que pase. VIBEVOICE_CFG lo pisa en una ejecucion.
 
         El motivo de que no acelere es que sample_speech_tokens concatena
         siempre condicional e incondicional en un mismo batch, sin rama que se

@@ -98,6 +98,14 @@ MODELO_DIR = os.environ["VIBEVOICE_MODELO"]
 VOCES_DIR = Path(os.environ["VIBEVOICE_VOCES"])
 PASOS = int(os.environ.get("VIBEVOICE_PASOS", "6"))
 VOZ_DEFECTO = os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man")
+# Semilla del ruido de la difusion cuando el cliente no manda ninguna. Vacia
+# (el defecto) = sorteo por peticion, como siempre: cada llamada con el mismo
+# texto da un audio distinto. Con un numero, el servicio es determinista por
+# defecto -- mismas entradas, mismo md5 -- y un cliente que QUIERA variedad
+# manda "semilla": null. Se anuncia en /health como semilla_defecto. Cual poner,
+# si alguna, lo decide el banco, no este fichero.
+_semilla_env = os.environ.get("VIBEVOICE_SEMILLA", "").strip()
+SEMILLA_DEFECTO: Optional[int] = int(_semilla_env) if _semilla_env else None
 TOKEN = os.environ.get("VOZ_TOKEN", "").strip()
 if not TOKEN:
     # Legitimo en una maquina aislada, pero tiene que VERSE: un .env mal
@@ -274,11 +282,15 @@ _candado = asyncio.Lock()
 # No era corrupcion -- el audio sonaba bien --, pero dejaba de cumplirse "misma
 # semilla = mismo audio", que es justo lo que promete el campo `semilla`.
 #
-# EL ARREGLO: CADA SESION SE LLEVA SU RNG PUESTO
-# SesionViva._pausar/_reanudar fotografian el RNG global antes de soltar el
+# EL ARREGLO: CADA SESION SE LLEVA SU ESTADO PUESTO
+# SesionViva._pausar/_reanudar fotografian el estado global antes de soltar el
 # candado y lo reponen despues de recuperarlo, de modo que cada sesion tiene su
 # PROPIO hilo de ruido aunque el generador sea un objeto compartido. Alli esta
-# el detalle de por que asi y no pasando un torch.Generator al modelo.
+# el detalle de por que asi y no pasando un torch.Generator al modelo. El RNG
+# fue lo primero que se vio; despues se midio que la intrusa pisa tambien los
+# pasos de difusion, neg_cada, el contador de la rampa de arranque y el remate,
+# y la foto se amplio a todo eso (foto_generacion/reponer_generacion, junto a
+# _REMATE, con la medida).
 #
 # El noise_scheduler, en cambio, no necesita nada: sample_speech_tokens() lo
 # reinicia con set_timesteps() al empezar cada latente y no suelta el candado en
@@ -868,6 +880,15 @@ def frenar_guia(modelo, freno: float = None) -> None:
 # (la guia no anade pasadas; ver PeticionTTS.cfg_scale).
 CFG_ARRANQUE = float(os.environ.get("VIBEVOICE_CFG_ARRANQUE", "4.5"))
 CFG_ARRANQUE_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_CFG_ARRANQUE_FOTOGRAMAS", "6"))
+# En que fotograma de SU arranque va la generate() que tiene el candado. Es un
+# dict de modulo y no una variable local de reforzar_guia_arranque a proposito:
+# una sesion que se para a esperar texto suelta el candado, y la generate() que
+# entra mientras tanto lo pone a cero (generate_reiniciado). Si el contador
+# viviera en la closure, la sesion reanudaria con el de la otra -- y si esa
+# habia hecho menos de CFG_ARRANQUE_FOTOGRAMAS, con la rampa de 4.5 en mitad
+# de una frase. Al estar aqui, foto_generacion/reponer_generacion se lo llevan
+# y lo traen con el resto del estado de la sesion.
+_ARRANQUE = {"frame": 0}
 
 
 def reforzar_guia_arranque(modelo) -> None:
@@ -875,23 +896,25 @@ def reforzar_guia_arranque(modelo) -> None:
     fotogramas de CADA generate(). Se aplica DESPUES de frenar_guia y
     funciona igual con el freno apagado: envuelve lo que haya.
 
-    El contador se reinicia envolviendo generate(): cada peticion suelta es
-    un arranque, y en una sesion larga lo son la primera generate() y las
-    que encadena el tope de caché -- que arrancan igual de frias desde el
-    prefijo pristino, asi que tambien lo necesitan."""
+    El contador (_ARRANQUE) se reinicia envolviendo generate(): cada peticion
+    suelta es un arranque, y en una sesion larga lo son la primera generate()
+    y las que encadena el tope de caché -- que arrancan igual de frias desde
+    el prefijo pristino, asi que tambien lo necesitan. Una sesion que se para
+    a mitad lo fotografia antes de soltar el candado y lo repone al volver
+    (SesionViva._pausar/_reanudar), asi que la generate() que se cuele en la
+    pausa no le cambia en que punto de su arranque iba."""
     if CFG_ARRANQUE <= 0 or CFG_ARRANQUE_FOTOGRAMAS <= 0:
         return
-    contador = {"frame": 0}
     muestrear = modelo.sample_speech_tokens
     generar = modelo.generate
 
     def generate_reiniciado(*a, **kw):
-        contador["frame"] = 0
+        _ARRANQUE["frame"] = 0
         return generar(*a, **kw)
 
     def muestrear_reforzado(condition, neg_condition, cfg_scale=3.0):
-        k = contador["frame"]
-        contador["frame"] = k + 1
+        k = _ARRANQUE["frame"]
+        _ARRANQUE["frame"] = k + 1
         if k < CFG_ARRANQUE_FOTOGRAMAS and CFG_ARRANQUE > cfg_scale:
             # Rampa lineal: fotograma 0 con CFG_ARRANQUE, y de vuelta al
             # pedido al agotar la ventana. Sin escalon: el freno de guia ya
@@ -2169,6 +2192,49 @@ _REMATE = {"pico": 0.0, "fotogramas": 0, "aplazados": 0, "armado": False}
 def remate_cero() -> None:
     _REMATE.update(pico=0.0, fotogramas=0, aplazados=0, armado=False)
 
+
+# EL ESTADO QUE UNA generate() ARRASTRA Y QUE OTRA LE PUEDE PISAR
+#
+# Una sesion suelta _candado_modelo mientras espera texto, y la generate() que
+# entra en ese hueco -- otra sesion, o /tts/stream -- toca estado que es del
+# PROCESO y no de la llamada. Esta es la lista entera, y vive en un solo sitio
+# para que anadir un estado nuevo obligue a decidir si va aqui:
+#
+#   - el RNG global de torch: el ruido de la difusion (el unico sorteo)
+#   - _ARRANQUE: en que fotograma de su arranque va la rampa de cfg
+#   - _REMATE: pico del ultimo fotograma y cuenta de fotogramas del bloque
+#   - los pasos de difusion: set_ddpm_inference_steps es del modelo, y
+#     sample_speech_tokens lo lee en CADA latente
+#   - neg_cada: atributo del backbone (solo con motor openvino)
+#
+# Los dos ultimos no se fotografian: los conoce la sesion (son sus ajustes) y
+# se vuelven a fijar, que es mas barato y no depende de que estuvieran bien
+# puestos al pausar.
+#
+# MEDIDO ANTES DEL ARREGLO (scripts/ws_fidelidad.py, prueba `pausa`): la
+# sesion A abre con una frase corta y se queda parada ANTES de su primer
+# fotograma, esperando la ventana de adelanto; la sesion B entra con pasos+4
+# y otra semilla y habla entera; A reanuda. Sin esto, A salia con los pasos de
+# B y sin su rampa de arranque, y B remataba con los pasos de A: ninguna de
+# las dos daba el md5 de la misma sesion a solas. El RNG ya se llevaba y traia
+# (era el primer estado que se descubrio, ver el bloque de _candado_modelo);
+# esto generaliza aquello a todo lo demas.
+def foto_generacion() -> dict:
+    """Lo que hay que llevarse al soltar el candado. ANTES de soltarlo."""
+    return {"rng": torch.get_rng_state(),
+            "arranque": _ARRANQUE["frame"],
+            "remate": dict(_REMATE)}
+
+
+def reponer_generacion(foto: dict, pasos, neg_cada) -> None:
+    """Deja el proceso como lo dejo la sesion. DESPUES de recuperar el candado."""
+    torch.set_rng_state(foto["rng"])
+    _ajustar_pasos(pasos)
+    _ajustar_neg_cada(neg_cada)
+    _ARRANQUE["frame"] = foto["arranque"]
+    _REMATE.update(foto["remate"])
+
+
 _SESIONES: dict = {}
 _FIN = object()   # centinela: se acabo el audio de la sesion
 
@@ -2690,12 +2756,17 @@ class SesionViva:
     """Una generate() viva en su hilo, con una cola de texto por delante."""
 
     def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo,
-                 respiro=True, cola_final=None):
+                 respiro=True, cola_final=None, neg_cada=None):
         self.nombre = nombre
         self.voz = voz
         self.cfg_scale = cfg_scale
         self.semilla = semilla
         self.pasos = pasos
+        # Agrupado de la rama incondicional (ver NEG_CADA). None = el del
+        # servicio. Se fija al arrancar CADA generate() y se vuelve a fijar
+        # al reanudar tras una pausa: antes las sesiones no lo tocaban nunca
+        # y heredaban el que hubiera dejado el ultimo /tts/stream.
+        self.neg_cada = neg_cada
         # El respiro (pausa de verdad en cada punto; ver el bloque RESPIRO) es
         # por sesion Y por servicio: el campo `respiro` de la peticion manda,
         # pero VIBEVOICE_RESPIRO=0 lo apaga globalmente.
@@ -2721,7 +2792,7 @@ class SesionViva:
         self._audio = None        # el ColaAudioSesion de la generate() en curso
         self._arrancado = False
         self._entre_locuciones = False   # parado, pero no dentro de generate()
-        self._rng = None          # foto del RNG global mientras esta parada
+        self._foto = None         # foto_generacion() mientras esta parada
         self._cond = threading.Condition()
         self._hilo = threading.Thread(target=self._correr, daemon=True,
                                       name=f"sesion-{nombre}")
@@ -2964,22 +3035,29 @@ class SesionViva:
             self.lazo.call_soon_threadsafe(self.cola.put_nowait, _FIN)
             devolver_memoria()
 
-    # ---- el ruido de ESTA sesion, y de ninguna otra ----
+    # ---- el estado de ESTA sesion, y de ninguna otra ----
     # Lo que se le pasa a TextoEnCurso como al_pausar/al_reanudar. Ademas de
-    # soltar y recuperar el candado del modelo, se llevan y traen el RNG.
+    # soltar y recuperar el candado del modelo, se llevan y traen TODO lo que
+    # una generate() arrastra fuera de si misma: el RNG, el contador de la
+    # rampa de arranque, el remate, los pasos y neg_cada. La lista, y por que
+    # cada cosa, esta en foto_generacion/reponer_generacion.
     #
     # POR QUE HACE FALTA
-    # El RNG de torch es GLOBAL y el candado se suelta en cada pausa, asi que la
-    # sesion que se cuela en medio -- que hace su torch.manual_seed() y consume
-    # ruido -- dejaba a la primera reanudando con un ruido que no era el suyo.
-    # Ver el bloque de _candado_modelo, con la medida.
+    # Ese estado es del PROCESO y el candado se suelta en cada pausa, asi que la
+    # generate() que se cuela en medio -- que hace su torch.manual_seed(), pone
+    # el contador de arranque a cero, fija SUS pasos -- dejaba a la primera
+    # reanudando con un ruido, una guia y un solver que no eran los suyos. Ver
+    # el bloque de _candado_modelo, con la medida del RNG, y el de
+    # foto_generacion con la del resto.
     #
     # POR QUE ASI Y NO CON UN torch.Generator PROPIO
     # Un generador por sesion habria que METERLO donde se sortea, y ahi solo se
     # llega parcheando a Microsoft: sample_speech_tokens() llama a torch.randn()
     # sin admitir `generator`. Fotografiar y reponer el estado global consigue lo
     # mismo -- un hilo de ruido por sesion -- sin tocar upstream, y ademas cubre
-    # CUALQUIER punto que sortee, no solo el unico que hoy se conoce.
+    # CUALQUIER punto que sortee, no solo el unico que hoy se conoce. Lo mismo
+    # vale para los pasos: son un atributo del modelo que sample_speech_tokens
+    # lee en cada latente, no un parametro de la llamada.
     #
     # EL ORDEN IMPORTA EN LOS DOS SENTIDOS
     # La foto ANTES de soltar (si no, otra sesion podria avanzar el RNG antes de
@@ -2994,16 +3072,17 @@ class SesionViva:
     # NO el de MPS. Si algun dia upstream crea el ruido ya en el dispositivo,
     # aqui hay que guardar tambien torch.mps/cuda.get_rng_state().
     #
-    # Cuesta 1,5 us por pausa (5056 bytes de estado), y las pausas son una por
-    # frase: al lado de los segundos que dura una locucion, nada.
+    # Cuesta 1,5 us por pausa (5056 bytes de estado del RNG; el resto son
+    # cuatro escalares), y las pausas son una por frase: al lado de los
+    # segundos que dura una locucion, nada.
     def _pausar(self) -> None:
-        self._rng = torch.get_rng_state()
+        self._foto = foto_generacion()
         _candado_modelo.release()
 
     def _reanudar(self) -> None:
         _candado_modelo.acquire()
-        if self._rng is not None:
-            torch.set_rng_state(self._rng)
+        if self._foto is not None:
+            reponer_generacion(self._foto, self.pasos, self.neg_cada)
 
     def _generar(self, al: TextoEnCurso):
         procesador = _estado["procesador"]
@@ -3026,6 +3105,7 @@ class SesionViva:
         _candado_modelo.acquire()
         try:
             _ajustar_pasos(self.pasos)
+            _ajustar_neg_cada(self.neg_cada)
             if self.semilla is not None:
                 # Aqui EMPIEZA el hilo de ruido de esta locucion; de conservarlo
                 # a traves de las pausas se encargan _pausar/_reanudar. Se
@@ -3156,7 +3236,11 @@ class PeticionTTS(BaseModel):
     # para todo el proceso, y se colaba de una peticion a la siguiente: misma
     # semilla y md5 distinto. Lo arregla AcusticoOV en pkgs/vibevoice-ov/motor.py
     # haciendo que el estado siga al objeto cache de cada generate().
-    semilla: Optional[int] = Field(None, ge=0, lt=2**31,
+    #
+    # El defecto es el del servicio (VIBEVOICE_SEMILLA; None si no esta puesta,
+    # que es el sorteo de siempre). Un "semilla": null EXPLICITO en la peticion
+    # sigue sorteando: pydantic conserva el None que manda el cliente.
+    semilla: Optional[int] = Field(SEMILLA_DEFECTO, ge=0, lt=2**31,
                                    description="fija el ruido de la difusion; "
                                                "misma semilla = mismo audio")
 
@@ -3199,7 +3283,7 @@ class PeticionSesion(BaseModel):
     # "cambio de voz a mitad de sesion". Solo se comprueba si viene puesta.
     voz: Optional[str] = None
     cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
-    semilla: Optional[int] = Field(None, ge=0, lt=2**31)
+    semilla: Optional[int] = Field(SEMILLA_DEFECTO, ge=0, lt=2**31)
     pasos: Optional[int] = Field(None, ge=4, le=20)
     # Aire en cada final de frase (ver el bloque RESPIRO). Solo se mira al
     # CREAR la sesion, como la voz. respiro=False da el audio pelado del
@@ -3208,6 +3292,8 @@ class PeticionSesion(BaseModel):
     # Cola de la ultima palabra; ver el bloque COLA FINAL. Como la voz, solo se
     # mira al CREAR la sesion.
     cola_final: Optional[int] = Field(None, ge=0, le=6)
+    # Agrupado de la rama incondicional, como en PeticionTTS. Solo al CREAR.
+    neg_cada: Optional[int] = Field(None, ge=1, le=6)
     # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
     fin: bool = False
 
@@ -3233,6 +3319,9 @@ def health() -> dict:
         "motor": _estado.get("motor", MOTOR),
         "dispositivo": DISPOSITIVO,
         "pasos": PASOS,
+        # None = cada peticion sortea su ruido; un numero = el servicio es
+        # determinista salvo que el cliente mande "semilla": null.
+        "semilla_defecto": SEMILLA_DEFECTO,
         "voz_defecto": VOZ_DEFECTO,
         "rtf_esperado": RTF_MEDIDO,
         "ocupado": _candado.locked() or _candado_modelo.locked(),
@@ -3434,7 +3523,8 @@ async def sesion_texto(nombre: str, pet: PeticionSesion,
     if nueva:
         s = SesionViva(nombre, pet.voz or VOZ_DEFECTO, pet.cfg_scale,
                        pet.semilla, pet.pasos, asyncio.get_running_loop(),
-                       respiro=pet.respiro, cola_final=pet.cola_final)
+                       respiro=pet.respiro, cola_final=pet.cola_final,
+                       neg_cada=pet.neg_cada)
         _SESIONES[nombre] = s
     elif pet.voz is not None and pet.voz != s.voz:
         raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
@@ -3595,7 +3685,7 @@ class AbrirSesionWS(BaseModel):
     sesion: Optional[str] = Field(None, min_length=1, max_length=64)
     voz: str = VOZ_DEFECTO
     cfg_scale: float = Field(3.0, gt=0.5, lt=5.0)
-    semilla: Optional[int] = Field(None, ge=0, lt=2**31)
+    semilla: Optional[int] = Field(SEMILLA_DEFECTO, ge=0, lt=2**31)
     pasos: Optional[int] = Field(None, ge=4, le=20)
     # Pausa de verdad en cada punto (ver el bloque RESPIRO). False = la
     # locucion de antes, bit a bit.
@@ -3603,6 +3693,8 @@ class AbrirSesionWS(BaseModel):
     # Cola de la ultima palabra; ver el bloque COLA FINAL. 0 vuelve al corte en
     # seco de antes, que es contra lo que se midio.
     cola_final: Optional[int] = Field(None, ge=0, le=6)
+    # Agrupado de la rama incondicional, como en PeticionTTS.
+    neg_cada: Optional[int] = Field(None, ge=1, le=6)
     # Aceptado solo para poder dar un error claro; ver el bloque VELOCIDAD.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
@@ -3827,7 +3919,8 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
             nombre = None
             return
         s = SesionViva(nombre, cfg.voz, cfg.cfg_scale, cfg.semilla, cfg.pasos,
-                       lazo, respiro=cfg.respiro, cola_final=cfg.cola_final)
+                       lazo, respiro=cfg.respiro, cola_final=cfg.cola_final,
+                       neg_cada=cfg.neg_cada)
         # El audio ya sale por aqui: que GET /tts/sesion/{id}/audio no lo robe.
         s.escuchando = True
         _SESIONES[nombre] = s

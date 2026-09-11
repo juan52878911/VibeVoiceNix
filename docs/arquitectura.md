@@ -446,7 +446,7 @@ Un resumen de todo lo anterior, con el porqué en una línea.
 | Un solo intérprete, `python312` | es el solape de los `requires-python` de ambos workspaces |
 | VibeVoice aparte de `voz-api` | carga ~2,8 GB frente a ~100 MB; una síntesis pesada bloquearía las notas de voz |
 | Ansible no configura el sistema, solo encadena | dos fuentes de verdad romperían la reproducibilidad |
-| `cfgScale` se queda en 1.5 | bajarlo no acelera —está medido— y además el modelo divaga |
+| `cfgScale` en 3.0, no en 1.5 | no cuesta tiempo —está medido— y baja el WER medio de 13,6 % a 3,6 %; bajarlo no acelera y a 1.0 el modelo divaga |
 | Sin LVM ni cifrado en el disco | la VM se reconstruye desde el flake, no se repara |
 | Swapfile de 4 GB | red de seguridad para el pico de VibeVoice; una aserción lo exige si el laboratorio está activo |
 | `options.nix` en su propio fichero | un módulo con `options` no puede llevar además atributos de `config` sueltos en la raíz |

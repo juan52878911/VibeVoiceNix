@@ -37,6 +37,18 @@ Cuatro cosas, y las cuatro con numeros:
      que desaparecer: GET /tts/sesion/{id} da 404 y el candado del modelo queda
      libre para la peticion siguiente.
 
+  6. PAUSA. La concurrencia de arriba prueba dos sesiones IGUALES. Esta
+     prueba mete una sesion DISTINTA -- otros pasos, otra semilla -- en la
+     pausa de la primera, y ademas en la pausa peor: la sesion A abre con una
+     frase corta y se queda parada ANTES de generar su primer fotograma,
+     esperando la ventana de adelanto. Cuando A reanuda, el proceso esta como
+     lo dejo la intrusa: sus pasos de difusion, su contador de la rampa de
+     arranque, su remate. Si la sesion no se lleva y trae TODO su estado
+     (foto_generacion/reponer_generacion en voz_stream.py), A sale con los
+     pasos de B y sin su rampa, y B remata con los pasos de A. Los dos md5
+     tienen que ser los de cada sesion a solas. La variante pausa-stream usa
+     /tts/stream de intrusa (pasos+4, neg_cada 2).
+
   5. RESPIRO. Con respiro (el defecto de las sesiones) el audio tiene que
      respetar el contrato de la pausa: ninguna racha de fotogramas de 133 ms
      por debajo del umbral puede pasar de fotogramas+alarga+2 (los dos de
@@ -84,11 +96,13 @@ def pedir(url, token, cuerpo=None, metodo=None, tiempo=600):
     return urllib.request.urlopen(pet, timeout=tiempo)
 
 
-def http_stream(url, token, texto, voz, cfg, semilla, pasos):
+def http_stream(url, token, texto, voz, cfg, semilla, pasos, neg_cada=None):
     """/tts/stream de una vez. Se le quitan los 44 bytes de cabecera WAV."""
     cuerpo = {"texto": texto, "voz": voz, "cfg_scale": cfg, "semilla": semilla}
     if pasos is not None:
         cuerpo["pasos"] = pasos
+    if neg_cada is not None:
+        cuerpo["neg_cada"] = neg_cada
     return pedir(f"{url}/tts/stream", token, cuerpo).read()[44:]
 
 
@@ -158,13 +172,18 @@ def desmarcar(buf, salida_pcm, eventos):
 
 async def ws_sesion(url, token, frases, voz, cfg, semilla, pasos,
                     por_cabecera=True, cortar_en=None, traza=None,
-                    antes_de_cortar=None, respiro=False):
+                    antes_de_cortar=None, respiro=False,
+                    antes_de_seguir=None, al_primer_audio=None):
     """Habla por el websocket y devuelve (pcm, eventos, nombre).
 
     cortar_en: si viene, se cierra el socket a lo bruto en cuanto hayan bajado
     esos bytes de PCM -- el caso "el cliente se fue a mitad".
     antes_de_cortar: se llama con el nombre de la sesion justo antes de cortar,
     que es el unico momento en que se la puede ver viva desde fuera.
+    antes_de_seguir: corrutina que se espera ANTES de mandar cada frase
+    posterior a la primera, o sea con el modelo parado sin texto por delante.
+    Es el hueco en el que otra generate() se puede colar (prueba `pausa`).
+    al_primer_audio: se llama una vez, con el primer PCM que baja.
     """
     ws_url = url.replace("http://", "ws://").replace("https://", "wss://")
     destino = f"{ws_url}/tts/sesion/ws"
@@ -212,7 +231,10 @@ async def ws_sesion(url, token, frases, voz, cfg, semilla, pasos,
             if isinstance(msg, str):
                 raise AssertionError(f"llego texto y se esperaba binario: {msg[:80]}")
             antes = len(eventos)
+            habia_pcm = len(pcm)
             buf = desmarcar(buf + msg, pcm, eventos)
+            if al_primer_audio is not None and not habia_pcm and pcm:
+                al_primer_audio()
             for ev in eventos[antes:]:
                 if traza is not None:
                     traza.append((round(time.perf_counter() - t0, 2), ev))
@@ -222,6 +244,8 @@ async def ws_sesion(url, token, frases, voz, cfg, semilla, pasos,
                     raise AssertionError(f"error del servidor: {ev['texto']}")
                 if ev["tipo"] == "esperando" and ev["esperando"]:
                     if pendientes:
+                        if antes_de_seguir is not None:
+                            await antes_de_seguir()
                         await bombear_texto()
                     else:
                         await ws.send(json.dumps({"accion": "fin"}))
@@ -377,8 +401,8 @@ def main():
     ap.add_argument("--semilla", type=int, default=11)
     ap.add_argument("--pasos", type=int, default=6)
     ap.add_argument("--pruebas",
-                    default="fidelidad,eventos,concurrencia,respiro,corte,"
-                            "errores,auth")
+                    default="fidelidad,eventos,concurrencia,pausa,pausa-stream,"
+                            "respiro,corte,errores,auth")
     a = ap.parse_args()
     pruebas = a.pruebas.split(",")
     fallos = []
@@ -509,6 +533,120 @@ def main():
                 fallos.append(f"concurrencia: la {etiqueta} != sesion a solas")
                 print(f"  FALLO la {etiqueta} != sesion a solas: {len(pcm)} vs "
                       f"{len(pcm_sola)} bytes, primer byte distinto en {iguales}")
+
+    # ------------------------------ 3a) una sesion DISTINTA en la pausa --
+    # La concurrencia de arriba mete dos sesiones IGUALES: si la intrusa deja
+    # el proceso con los mismos pasos y el mismo neg_cada, esos dos estados no
+    # se notan aunque nadie los reponga. Aqui la intrusa es DISTINTA (pasos+4,
+    # otra semilla) y entra en la pausa peor: A abre con una frase corta --
+    # menos de una ventana de 5 tokens -- y se queda parada ANTES de generar
+    # su primer fotograma, esperando la ventana de adelanto. Al reanudar, sin
+    # foto_generacion/reponer_generacion, A sale con los pasos de B y sin su
+    # rampa de arranque (B ya la consumio), y B remata con los pasos de A.
+    #
+    # El orden lo fija el cliente: A avisa de que esta parada (antes_de_seguir),
+    # entonces arranca B, y A no manda su segunda frase hasta que B ha SONADO.
+    # A solo recupera el candado cuando B lo suelta en su propia pausa, asi que
+    # para entonces B lleva decenas de fotogramas hechos.
+    if "pausa" in pruebas or "pausa-stream" in pruebas:
+        print("\n[una sesion distinta en la pausa]")
+        FRASES_PAUSA = ["Sí, claro."] + FRASES
+        pasos_b, semilla_b = a.pasos + 4, a.semilla + 1
+
+        t = time.time()
+        pcm_sola_a, _, _ = asyncio.run(ws_sesion(
+            a.url, a.token, FRASES_PAUSA, a.voz, a.cfg, a.semilla, a.pasos))
+        print(f"  A sola {dur(pcm_sola_a):5.2f} s · md5 {md5(pcm_sola_a)} · "
+              f"pasos {a.pasos}, semilla {a.semilla} · en {time.time()-t:.1f} s")
+
+        def comparar(etiqueta, pcm, ref):
+            if md5(pcm) == md5(ref):
+                print(f"  OK  {etiqueta} == a solas: identica bit a bit")
+                return
+            n = min(len(pcm), len(ref))
+            i = next((k for k in range(n) if pcm[k] != ref[k]), n)
+            fallos.append(f"pausa: {etiqueta} != a solas")
+            print(f"  FALLO {etiqueta} != a solas: {len(pcm)} vs {len(ref)} "
+                  f"bytes, primer byte distinto en {i}")
+
+    if "pausa" in pruebas:
+        t = time.time()
+        pcm_sola_b, _, _ = asyncio.run(ws_sesion(
+            a.url, a.token, [" ".join(FRASES)], a.voz, a.cfg, semilla_b, pasos_b))
+        print(f"  B sola {dur(pcm_sola_b):5.2f} s · md5 {md5(pcm_sola_b)} · "
+              f"pasos {pasos_b}, semilla {semilla_b} · en {time.time()-t:.1f} s")
+
+        async def con_intrusa():
+            a_parada, b_sono = asyncio.Event(), asyncio.Event()
+            veces = [0]
+
+            async def antes_de_seguir():
+                # Solo la primera pausa espera a B; las siguientes siguen el
+                # camino normal (B ya esta dentro o ha terminado).
+                veces[0] += 1
+                if veces[0] == 1:
+                    a_parada.set()
+                    await asyncio.wait_for(b_sono.wait(), 60)
+
+            async def B():
+                await asyncio.wait_for(a_parada.wait(), 60)
+                return await ws_sesion(a.url, a.token, [" ".join(FRASES)],
+                                       a.voz, a.cfg, semilla_b, pasos_b,
+                                       al_primer_audio=b_sono.set)
+
+            return await asyncio.gather(
+                ws_sesion(a.url, a.token, FRASES_PAUSA, a.voz, a.cfg,
+                          a.semilla, a.pasos, antes_de_seguir=antes_de_seguir),
+                B())
+
+        t = time.time()
+        (pcm_a, _, n_a), (pcm_b, _, n_b) = asyncio.run(con_intrusa())
+        print(f"  con intrusa: A {dur(pcm_a):5.2f} s md5 {md5(pcm_a)} ({n_a}) · "
+              f"B {dur(pcm_b):5.2f} s md5 {md5(pcm_b)} ({n_b}) · "
+              f"en {time.time()-t:.1f} s")
+        comparar("A (pausada antes de su primer fotograma)", pcm_a, pcm_sola_a)
+        comparar("B (la intrusa, pasos+4)", pcm_b, pcm_sola_b)
+
+    # La misma pausa, pero la intrusa es /tts/stream con otros pasos y con
+    # neg_cada 2: _sintetizar fija los dos en el modelo y no los devuelve, asi
+    # que sin reposicion A reanudaria con ellos. neg_cada solo existe en el
+    # motor openvino; en torch la peticion lo acepta y no cambia nada, y la
+    # prueba sigue valiendo por los pasos.
+    if "pausa-stream" in pruebas:
+        async def con_stream():
+            veces = [0]
+
+            async def antes_de_seguir():
+                veces[0] += 1
+                if veces[0] != 1:
+                    return
+                tarea = asyncio.create_task(asyncio.to_thread(
+                    http_stream, a.url, a.token, " ".join(FRASES), a.voz,
+                    a.cfg, semilla_b, pasos_b, 2))
+                # Esperar a que la intrusa TENGA el modelo: A ha soltado el
+                # candado, asi que "ocupado" solo puede ser ella.
+                limite = time.time() + 60
+                while time.time() < limite:
+                    salud = json.load(pedir(f"{a.url}/health", a.token))
+                    if salud["ocupado"]:
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError("/tts/stream nunca llego a ocupar el modelo")
+                antes_de_seguir.tarea = tarea
+
+            res = await ws_sesion(a.url, a.token, FRASES_PAUSA, a.voz, a.cfg,
+                                  a.semilla, a.pasos,
+                                  antes_de_seguir=antes_de_seguir)
+            intrusa = await getattr(antes_de_seguir, "tarea")
+            return res, intrusa
+
+        t = time.time()
+        (pcm_a2, _, n_a2), pcm_intrusa = asyncio.run(con_stream())
+        print(f"  con /tts/stream de intrusa (pasos {pasos_b}, neg_cada 2, "
+              f"{dur(pcm_intrusa):.2f} s): A {dur(pcm_a2):5.2f} s md5 "
+              f"{md5(pcm_a2)} ({n_a2}) · en {time.time()-t:.1f} s")
+        comparar("A (con /tts/stream en su pausa)", pcm_a2, pcm_sola_a)
 
     # ------------------------------------------------------- 3b) respiro --
     # Con respiro (el defecto real de las sesiones) el audio no puede coincidir

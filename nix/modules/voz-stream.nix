@@ -273,6 +273,25 @@ in
         el proceso y este numero solo sirve de documentacion.
       '';
     };
+
+    semilla = lib.mkOption {
+      type = lib.types.nullOr lib.types.int;
+      default = null;
+      description = ''
+        Semilla del ruido de la difusion cuando el cliente no manda ninguna.
+
+        null (el defecto) = sorteo por peticion, que es lo de siempre: el
+        mismo texto da un audio distinto cada vez (correlacion 0,019 entre
+        pasadas, medido). Con un numero el servicio es DETERMINISTA por
+        defecto -- mismas entradas, mismo md5 -- y un cliente que quiera
+        variedad manda "semilla": null en la peticion. /health la anuncia
+        como semilla_defecto.
+
+        Se deja en null a proposito: fijarla en produccion es una decision
+        que tiene que salir del banco (que semilla, para que voz), no de la
+        opcion existir.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -330,6 +349,11 @@ in
       # fisicos. Ponerla vacia NO vale: OpenMP mira si existe, no su valor.
       // lib.optionalAttrs (vv.hilos != 0) {
         OMP_NUM_THREADS = toString vv.hilos;
+      }
+      # Igual que arriba: vacia significa "sortea", asi que solo se pone si
+      # hay un numero.
+      // lib.optionalAttrs (cfg.semilla != null) {
+        VIBEVOICE_SEMILLA = toString cfg.semilla;
       }
       // lib.optionalAttrs ov.enable {
         VIBEVOICE_OV_CODIGO = "${pkgs.vibevoiceOvCodigo}";

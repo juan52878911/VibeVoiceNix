@@ -120,10 +120,17 @@ def diferencias(referencia: str, hipotesis: str) -> str:
     return " · ".join(partes) or "mismo vocabulario, distinto orden"
 
 
-def sintetizar_wav(texto, url, token, voz, ruta, cfg=3.0):
+def sintetizar_wav(texto, url, token, voz, ruta, cfg=3.0, semilla=None, pasos=None):
+    """Un clip por /tts/stream. semilla y pasos solo viajan si vienen: sin
+    ellos el servicio hace lo de siempre (sortea; sus pasos por defecto)."""
+    cuerpo = {"texto": texto, "voz": voz, "cfg_scale": cfg}
+    if semilla is not None:
+        cuerpo["semilla"] = semilla
+    if pasos is not None:
+        cuerpo["pasos"] = pasos
     pet = urllib.request.Request(
         f"{url}/tts/stream", method="POST",
-        data=json.dumps({"texto": texto, "voz": voz, "cfg_scale": cfg}).encode(),
+        data=json.dumps(cuerpo).encode(),
         headers={"content-type": "application/json",
                  **({"authorization": f"Bearer {token}"} if token else {})})
     t0 = time.time()
@@ -134,6 +141,19 @@ def sintetizar_wav(texto, url, token, voz, ruta, cfg=3.0):
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000)
         w.writeframes(pcm)
     return len(pcm) / 2 / 24000, time.time() - t0
+
+
+def leer_crono(url, token):
+    """GET /crono del servicio: reparto del tiempo desde la ultima lectura, y
+    lo pone a cero. Se lee ANTES del banco (para descartar lo anterior) y
+    DESPUES (para quedarse solo con lo del banco). None si no responde."""
+    try:
+        pet = urllib.request.Request(
+            f"{url}/crono", headers={**({"authorization": f"Bearer {token}"}
+                                        if token else {})})
+        return json.load(urllib.request.urlopen(pet, timeout=30))
+    except Exception:
+        return None
 
 
 def transcribir(ruta, url, token):
@@ -181,6 +201,23 @@ def main():
                     help="guia CFG: cuanto se ciñe la difusion a la condicion")
     ap.add_argument("--informe", help="escribir un informe markdown")
     ap.add_argument("--audios", default="/tmp/fidelidad", help="donde dejar los WAV")
+    # EL A/B EMPAREJADO. Sin semilla cada repeticion parte de otro ruido, y eso
+    # es lo que mide la estabilidad; pero para comparar DOS variantes del
+    # servicio (pasos, freno, cfg) hace falta que las dos partan del MISMO
+    # ruido, o la diferencia que se mide es la del sorteo y no la del cambio.
+    # Con --semillas, cada frase se genera una vez por semilla (y no
+    # --repeticiones veces), y el fichero lleva la semilla en el nombre para
+    # que naturalidad.py empareje clips entre carpetas.
+    ap.add_argument("--semillas", default="",
+                    help="lista separada por comas; una generacion por semilla "
+                         "en vez de --repeticiones (ej. 11,7,3,23,42,101)")
+    ap.add_argument("--pasos", type=int, default=None,
+                    help="pasos de difusion por peticion; sin el, los del servicio")
+    ap.add_argument("--csv", default=None,
+                    help="una fila por clip (por defecto {audios}/clips.csv)")
+    ap.add_argument("--crono", action="store_true",
+                    help="leer GET /crono del servicio antes y despues, y "
+                         "guardar el reparto del banco en {audios}/crono.json")
     a = ap.parse_args()
 
     frases = frases_del_llm(6, a.modelo, a.ollama) if a.llm else FRASES
@@ -188,27 +225,61 @@ def main():
         print("no consegui frases del LLM; uso las de prueba", file=sys.stderr)
         frases = FRASES
     os.makedirs(a.audios, exist_ok=True)
+    semillas = [int(s) for s in a.semillas.split(",") if s.strip()]
+    # (etiqueta del fichero, semilla): con semillas una por semilla; sin ellas,
+    # las repeticiones de siempre, sin semilla (sortea el servicio).
+    variantes = ([(f"s{s}", s) for s in semillas] if semillas
+                 else [(f"r{r}", None) for r in range(a.repeticiones)])
+    ruta_csv = a.csv or os.path.join(a.audios, "clips.csv")
+    if a.crono:
+        leer_crono(a.voz_url, a.token)      # a cero: lo anterior no cuenta
 
-    print(f"{len(frases)} frases x {a.repeticiones} repeticiones = "
-          f"{len(frases)*a.repeticiones} generaciones\n")
+    print(f"{len(frases)} frases x {len(variantes)} "
+          f"{'semillas' if semillas else 'repeticiones'} = "
+          f"{len(frases)*len(variantes)} generaciones"
+          + (f" · pasos {a.pasos}" if a.pasos is not None else "") + "\n")
     resultados = []
+    filas = []
+    campos = ["fichero", "frase", "texto", "semilla", "pasos", "cfg", "dur_s",
+              "gen_s", "rtf", "wer", "exacto", "oido"]
+
+    def volcar_csv():
+        # Se reescribe tras cada frase: si el banco muere a medias, lo hecho
+        # hasta ahi queda en disco y no hay que repetirlo.
+        import csv
+        with open(ruta_csv, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=campos)
+            w.writeheader()
+            w.writerows(filas)
+
     for i, f in enumerate(frases):
         print(f"[{i+1}/{len(frases)}] {f}")
         pases = []
-        for r in range(a.repeticiones):
-            ruta = os.path.join(a.audios, f"f{i}_r{r}.wav")
+        for etiqueta, semilla in variantes:
+            fichero = f"f{i}_{etiqueta}.wav"
+            ruta = os.path.join(a.audios, fichero)
             try:
-                dur, gen = sintetizar_wav(f, a.voz_url, a.token, a.voz, ruta, a.cfg)
+                dur, gen = sintetizar_wav(f, a.voz_url, a.token, a.voz, ruta,
+                                          a.cfg, semilla, a.pasos)
                 oido = transcribir(ruta, a.api_url, a.token)
             except Exception as e:
-                print(f"    r{r}: FALLO {type(e).__name__}: {e}")
+                print(f"    {etiqueta}: FALLO {type(e).__name__}: {e}")
                 continue
             e_wer = wer(f, oido)
             exacto = normalizar(f) == normalizar(oido)
             pases.append({"oido": oido, "wer": e_wer, "exacto": exacto,
                           "dur": dur, "gen": gen})
+            filas.append({"fichero": fichero, "frase": i, "texto": f,
+                          "semilla": "" if semilla is None else semilla,
+                          "pasos": "" if a.pasos is None else a.pasos,
+                          "cfg": a.cfg, "dur_s": round(dur, 3),
+                          "gen_s": round(gen, 3),
+                          "rtf": round(gen / dur, 3) if dur else "",
+                          "wer": round(e_wer, 4), "exacto": int(exacto),
+                          "oido": oido})
             marca = "OK " if exacto else f"WER {e_wer:.0%}"
-            print(f"    r{r}: {marca:9s} {oido!r}")
+            print(f"    {etiqueta}: {marca:9s} {oido!r}  (rtf {gen/dur:.2f})"
+                  if dur else f"    {etiqueta}: {marca:9s} {oido!r}")
             if not exacto:
                 d = diferencias(f, oido)
                 if d:
@@ -218,7 +289,21 @@ def main():
             resultados.append({"texto": f, "pases": pases, "variantes": distintos})
             if distintos > 1:
                 print(f"    >>> INESTABLE: {distintos} transcripciones distintas de {len(pases)}")
+        volcar_csv()
         print()
+
+    if a.crono:
+        reparto = leer_crono(a.voz_url, a.token)
+        if reparto is not None:
+            with open(os.path.join(a.audios, "crono.json"), "w") as fh:
+                json.dump(reparto, fh, indent=1)
+            r = reparto.get("reparto_ms_por_fotograma") or {}
+            if r:
+                print(f"crono: {r.get('fotogramas')} fotogramas · generate "
+                      f"{r.get('generate', 0):.1f} ms/fot · cabeza "
+                      f"{r.get('cabeza', 0):.1f} · tts_lm {r.get('tts_lm', 0):.1f}"
+                      f" · acustico {r.get('acustico', 0):.1f}\n")
+    print(f"clips en {ruta_csv}")
 
     # ---- resumen ----
     todos = [p for r in resultados for p in r["pases"]]
@@ -237,7 +322,9 @@ def main():
     if a.informe:
         with open(a.informe, "w", encoding="utf-8") as w:
             w.write(f"# Fidelidad del circuito voz\n\n")
-            w.write(f"{len(resultados)} frases x {a.repeticiones} repeticiones. "
+            w.write(f"{len(resultados)} frases x {len(variantes)} "
+                    f"{'semillas (' + a.semillas + ')' if semillas else 'repeticiones'}"
+                    f"{' · ' + str(a.pasos) + ' pasos' if a.pasos is not None else ''}. "
                     f"Texto -> VibeVoice -> whisper -> texto.\n\n")
             w.write(f"| medida | valor |\n|---|---|\n")
             w.write(f"| coincidencia exacta | {exactos}/{len(todos)} ({exactos/len(todos):.0%}) |\n")

@@ -194,7 +194,7 @@ def main():
     ap.add_argument("--token", default=os.environ.get("VOZ_TOKEN", ""))
     ap.add_argument("--token-voz", default=os.environ.get("VOZ_STREAM_TOKEN", ""))
     ap.add_argument("--voz", default="sp-Spk3_man")
-    ap.add_argument("--cfg", type=float, default=1.5)
+    ap.add_argument("--cfg", type=float, default=3.0)
     ap.add_argument("--semillas", default="11,7,3,23")
     ap.add_argument("--audios", default="/tmp/sesiones")
     ap.add_argument("--modos", default="sueltas,junta,sesion-golpe,sesion")

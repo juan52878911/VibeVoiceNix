@@ -95,6 +95,10 @@ services:
       # cuesta un 26%.
       VIBEVOICE_PASOS: "6"
       VIBEVOICE_VOZ: "sp-Spk1_man"
+      # Semilla del ruido cuando el cliente no manda ninguna. Vacia = sorteo
+      # por peticion (cada llamada suena distinta). Con un numero el servicio
+      # es determinista por defecto; "semilla": null en la peticion sortea.
+      VIBEVOICE_SEMILLA: "${VIBEVOICE_SEMILLA:-}"
       # Si el contenedor muere DESPUES de cargar el modelo, mientras genera
       # el audio de calentamiento, es que no le llega la memoria: a los
       # ~2,5 GB del modelo se le suman las activaciones de una sintesis

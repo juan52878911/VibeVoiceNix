@@ -132,7 +132,7 @@ Módulo: [`nix/modules/vibevoice.nix`](../nix/modules/vibevoice.nix).
 | `cuantizar` | `bool` | `true` | int8 dinámico: casi 2× más rápido. |
 | `pasosDifusion` | `int` | `6` | Pasos del *scheduler*. 4 solo mejora un 3 %. |
 | `vozDefecto` | `str` | `"sp-Spk1_man"` | Hablante. Las españolas son `sp-Spk1_man` y `sp-Spk0_woman`. |
-| `cfgScale` | `float` | `1.5` | Escala del *classifier-free guidance*. **Calidad, no velocidad.** |
+| `cfgScale` | `float` | `3.0` | Escala del *classifier-free guidance*. **Calidad, no velocidad.** Era 1.5; 3.0 baja el WER medio de 13,6 % a 3,6 % (medido, ver abajo). |
 
 **`hilos` y `anclarNucleos` son la pareja delicada.** Medido: 2 hilos RTF 4,19 · 6 anclados **4,04** ·
 8 hilos 4,31 · 12 hilos **5,18 (24 % peor)**. Y el anclaje **acelera PyTorch un 3 % pero ralentiza
@@ -143,7 +143,10 @@ invertirlo.
 2,18. El viaje completo está en [optimizacion.md](optimizacion.md).
 
 **`cfgScale` no acelera nada, y está medido.** Parecía la palanca obvia —con CFG cada paso de difusión
-hace una pasada condicional y otra incondicional— pero bajarlo sale peor por los dos lados:
+hace una pasada condicional y otra incondicional— pero bajarlo sale peor por los dos lados. Lo que sí
+hace es **bajar el error**: con el banco de fidelidad (`scripts/fidelidad.py`, texto → voz → whisper →
+texto) 1.5 da WER medio 13,6 % y peor caso 85,7 %; 3.0 da 3,6 % y 14,3 %. Por eso el defecto pasó a
+3.0 en septiembre de 2026, el mismo que ya usaba `voz-stream` y el del propio upstream:
 
 | `cfg_scale` | RTF | Audio generado |
 |---|---|---|
@@ -213,6 +216,7 @@ Módulo: [`nix/modules/voz-stream.nix`](../nix/modules/voz-stream.nix).
 | `vocesPropias` | `nullOr path` | `null` | Directorio de la máquina con prefijos `.pt` propios. Fuera del store. |
 | `solaparDecodificador` | `bool` | `true` | Corre el decodificador acústico **a la vez** que el bucle: −21 % de RTF. |
 | `hilosDecodificador` | `int` | `0` | Hilos para el decodificador solapado. 0 = la mitad de `hilos`. |
+| `semilla` | `nullOr int` | `null` | Semilla del ruido cuando el cliente no manda ninguna. `null` = sorteo por petición (lo de siempre); un número hace el servicio determinista por defecto. `/health` la anuncia como `semilla_defecto`. |
 | `motor` | `enum` | `"vibevoice"` | Qué modelo hay detrás de :8082: `vibevoice` (lo medido) o `qwen3tts` (Qwen3-TTS-0.6B-Base con el motor C). Mismo contrato HTTP. |
 | `qwen3tts.cuantizacion` | `enum` | `"int8"` | `int8` o `int4` en el motor C. |
 | `qwen3tts.hilos` | `int` | `0` | Hilos del motor C. 0 = todos. |
@@ -410,6 +414,7 @@ para depurar.
 | `OMP_NUM_THREADS` | pisa la detección de núcleos. Sin ella, se detectan los físicos |
 | `VIBEVOICE_SOLAPAR_DECODER` | `0` desactiva el solapamiento del decodificador. Es el A/B de una línea |
 | `VIBEVOICE_HILOS_DECODER` | hilos del decodificador solapado; `0` = la mitad |
+| `VIBEVOICE_SEMILLA` | semilla por defecto del ruido; vacía = sorteo por petición. Es `services.voz-stream.semilla` |
 
 ```bash
 # El A/B del solapamiento: misma semilla, y el md5 tiene que salir igual
