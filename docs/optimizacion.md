@@ -533,3 +533,4 @@ qué una eGPU no compensa está en [hardware-y-portabilidad.md](hardware-y-porta
 | [rendimiento.md](rendimiento.md) | las mediciones de Piper y whisper, y la comparativa entre motores |
 | [hardware-y-portabilidad.md](hardware-y-portabilidad.md) | GPU por passthrough, RAM y llevar el stack al Mac |
 | [arquitectura.md](arquitectura.md) | dónde vive cada una de estas piezas en el flake |
+| [plan-determinismo-calidad.md](plan-determinismo-calidad.md) | el plan del 10-09-2026: estado por sesión, semilla por defecto, banco emparejado con UTMOS y 6/8/10 pasos, con los umbrales fijados antes de medir |
