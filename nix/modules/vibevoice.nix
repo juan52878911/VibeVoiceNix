@@ -156,6 +156,25 @@ in
         tambien descarrila TRES clips con 6 pasos: es la semilla, no los
         pasos.
 
+        Y HACIA ARRIBA TAMPOCO COMPENSA (medido el 10-09-2026 en la VM, banco
+        pareado de 6 frases x 6 semillas con la misma semilla en cada
+        variante, cfg 3,0, sp-Spk1_man, WER con whisper y naturalidad con
+        UTMOS22):
+
+          pasos   WER medio   UTMOS medio   dUTMOS   mejora en   RTF
+            6       11,8 %       3,547         -          -      1,057
+            8       11,2 %       3,592      +0,046      22/36    1,081
+           10       10,7 %       3,523      -0,024      19/36    1,137
+
+        El umbral se fijo ANTES de medir (dUTMOS >= +0,10 en >= 24/36 clips):
+        8 no llega y ademas produjo la peor alucinacion del banco; 10 baja la
+        naturalidad. Cada paso cuesta 2,5-2,6 ms de cabeza por fotograma.
+
+        LO QUE SI MUEVE LA CALIDAD ES LA SEMILLA, y por mucho: con 18 semillas
+        sobre las mismas frases, la mejor da 0 % de WER y la peor 40,7 %. Entre
+        6 y 10 pasos hay un punto. Ver services.voz-stream.semilla y
+        docs/plan-determinismo-calidad.md.
+
         El defecto se queda en 6 porque bajarlo cambia la locucion (otro
         audio, otra duracion) y esa decision es del que despliega, no de la
         biblioteca. Ponlo en 4 si el objetivo es RTF < 0,9.

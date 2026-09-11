@@ -130,7 +130,7 @@ Módulo: [`nix/modules/vibevoice.nix`](../nix/modules/vibevoice.nix).
 | `hilos` | `int` | `0` | **0 = detectar** núcleos físicos. **Más no es mejor**: 12 hilos van un 24 % peor. |
 | `anclarNucleos` | `bool` | `true` | `OMP_PLACES=cores`. ⚠️ **Invertir si el motor pasa a OpenVINO.** |
 | `cuantizar` | `bool` | `true` | int8 dinámico: casi 2× más rápido. |
-| `pasosDifusion` | `int` | `6` | Pasos del *scheduler*. 4 solo mejora un 3 %. |
+| `pasosDifusion` | `int` | `6` | Pasos del *scheduler*. Con OpenVINO, 4 gana un 5,4 %; 8 y 10 se midieron y **no compensan** (ver abajo). |
 | `vozDefecto` | `str` | `"sp-Spk1_man"` | Hablante. Las españolas son `sp-Spk1_man` y `sp-Spk0_woman`. |
 | `cfgScale` | `float` | `3.0` | Escala del *classifier-free guidance*. **Calidad, no velocidad.** Era 1.5; 3.0 baja el WER medio de 13,6 % a 3,6 % (medido, ver abajo). |
 
