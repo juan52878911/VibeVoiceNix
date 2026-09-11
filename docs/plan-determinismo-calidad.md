@@ -258,10 +258,43 @@ para elegir entre 101 y 17, y una semilla buena para una voz no tiene por qué s
 sigue en `null` para que quien cambie la voz tenga que decidirlo midiendo. Un cliente que quiera
 variedad manda `"semilla": null`.
 
+### El banco con las frases reales del asistente: una semilla por perfil
+
+Repetido con lo que el asistente dice de verdad: los **rellenos** de
+[`perfiles_asistente.json`](../perfiles_asistente.json) —las coletillas que suelta mientras piensa,
+«Vale.», «Hecho.», «Un segundo, que lo consulto.»— cada uno con su voz y su cfg 3,5. 62 rellenos ×
+18 semillas = **1116 clips**, de 1,1 s de media. Ganadora por perfil: la que más rellenos dice
+exactos; empate por WER y luego por naturalidad.
+
+| perfil | voz | semilla de antes | exactos | **semilla nueva** | exactos | UTMOS |
+|---|---|---|---|---|---|---|
+| general | `sp-Spk1_man` | 11 | 17/25 | **17** | **25/25** | 3,445 |
+| servidor | `sp-Spk3_man` | 7 | 14/18 | **1** | **16/18** | 3,059 |
+| agenda | `sp-Spk5_man` | 23 | 18/19 | **17** | **19/19** | 3,605 |
+
+Tres cosas que se ven en la tabla y no en el banco de frases largas:
+
+- **La ganadora es de la voz y del texto, no del modelo.** La 17 borda dos perfiles y en el tercero
+  es la cuarta por la cola (9/18). La 101, que ganaba con las frases largas de `sp-Spk1_man`, aquí
+  queda 21/25, 15/18 y 16/19. No hay una semilla buena; hay una semilla buena **para este corpus con
+  esta voz**.
+- **En frases de una palabra la lotería es brutal.** En `servidor` la peor semilla dice 3 de 18
+  rellenos bien y la mejor 16. Son medio segundo de audio sin contexto donde agarrarse.
+- **Dos perfiles quedan sin un solo fallo** y el tercero a dos: «Sigo consultando.» sale *«Seguro
+  consultando.»* y «El servicio no contesta.» sale *«Pero, ¿voules ser festas?»* — esa segunda es un
+  clip roto de verdad, no una discusión de ortografía.
+
+Como la caché de rellenos va **por frase** (`huella()` en `scripts/perfiles.py` mezcla texto, voz,
+semilla, cfg y pasos), el techo sería 25/25, 18/18 y 19/19 eligiendo la mejor semilla **para cada
+relleno**. Se gana un solo clip en `servidor` y cuesta un cambio de formato del fichero de perfiles,
+así que no se ha hecho: queda apuntado por si algún perfil futuro se atasca.
+
 ### Qué queda
 
-- Repetir el banco de semillas con las frases reales del asistente y con las voces clonadas, si
-  se usan: la semilla buena es de la voz.
+- Si se cambia la voz de un perfil, **repetir su banco**: la semilla no se hereda entre voces.
+- Elegir semilla por relleno en vez de por perfil, si algún día compensa (arriba).
+- Comprobar en uso real, no en banco, que el arreglo del estado por sesión aguanta un rato largo de
+  asistente con peticiones sueltas de por medio.
 - El WER de la frase «El uso de memoria bajó un veinticuatro por ciento» (17 % de media) y de «No
   hay incidencias que reportar en las últimas horas» (29 %) es del modelo en esas frases, no del
   ruido: son las dos que fallan con casi cualquier semilla.

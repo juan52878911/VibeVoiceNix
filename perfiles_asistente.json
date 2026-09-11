@@ -9,7 +9,7 @@
    "_nota": "El de arranque y el que hay que usar para probar la experiencia entera. Copia este bloque y cambia voz, sistema, rellenos y dominios para tener otro.",
    "voz": {
     "voz": "sp-Spk1_man",
-    "semilla": 11,
+    "semilla": 17,
     "cfg_scale": 3.5,
     "pasos": 6
    },
@@ -76,7 +76,7 @@
    "_nota": "Segundo perfil, y esta aqui para demostrar que lo que cambia entre perfiles es TODO: otra voz, otra semilla, otro registro, otras coletillas y OTRO JUEGO DE HERRAMIENTAS. Este no puede mandar correos ni tocar la agenda, y no por prudencia: es que ese no es su trabajo. Las coletillas hablan de lo que este perfil hace de verdad ('mirando el estado'), que es justo lo que no se puede compartir entre asistentes distintos.",
    "voz": {
     "voz": "sp-Spk3_man",
-    "semilla": 7,
+    "semilla": 1,
     "cfg_scale": 3.5,
     "pasos": 6
    },
@@ -144,7 +144,7 @@
    "_nota": "Tercer perfil, y esta para enseñar LA REGLA DE SEGURIDAD. Es el unico que concentra las cuatro acciones de escritura (crear evento, mandar correo, apuntar recordatorio) sin ninguna herramienta de lectura tecnica que distraiga, asi que probando con este se ve el ciclo entero -- pides algo, te lo repite, dices que si, lo hace -- sin nada mas de por medio. Voz distinta (sp-Spk5_man) para que se note el cambio de perfil sin mirar la pantalla.",
    "voz": {
     "voz": "sp-Spk5_man",
-    "semilla": 23,
+    "semilla": 17,
     "cfg_scale": 3.5,
     "pasos": 6
    },

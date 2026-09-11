@@ -135,9 +135,13 @@ PERFIL_BASE = {
             "descripcion": "El asistente de casa, sin especialidad.",
             "_nota": "Perfil de arranque. Copia este bloque y cambia voz, "
                      "sistema y rellenos para tener otro.",
+            # La semilla NO es decorativa: con las mismas 25 coletillas y la
+            # misma voz, la 17 las dice todas bien y la 11 (que era el defecto
+            # hasta el 11-09-2026) falla 8 de 25. Se eligio midiendo, ver
+            # docs/plan-determinismo-calidad.md.
             "voz": {
                 "voz": "sp-Spk1_man",
-                "semilla": 11,
+                "semilla": 17,
                 "cfg_scale": 3.5,
                 "pasos": 6,
             },
