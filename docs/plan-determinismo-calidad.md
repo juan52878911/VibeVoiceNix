@@ -143,4 +143,64 @@ la imagen anterior.
 
 ## Resultados
 
-*Pendiente: se rellena al terminar cada fase, con las cifras.*
+Todo medido en la VM `voz` (openvino, 6 hilos) el 10 de septiembre de 2026, salvo la puntuación
+UTMOS, que corre en el Mac sobre los WAV bajados de la VM.
+
+### A · El bug, antes y después
+
+Prueba `pausa` de `ws_fidelidad.py` (`sp-Spk3_man`, cfg 4,5):
+
+| | audio | md5 |
+|---|---|---|
+| A a solas (6 pasos, semilla 11) | 6,93 s | `e3721afb…` |
+| A con B (10 pasos, semilla 12) en su pausa, código `898a33c7` (**antes**) | 7,20 s | `d37167ad…` — distinta desde el byte 560, el primer fotograma |
+| A con `/tts/stream` (10 pasos, `neg_cada` 2) en su pausa (**antes**) | 7,20 s | `871bdfae…` |
+| las dos, código `ec7239c1` (**después**) | 6,93 s | `e3721afb…` = a solas |
+
+La suite entera de `ws_fidelidad.py` (fidelidad, eventos, concurrencia, pausa, pausa-stream,
+respiro, corte, errores, auth) sale «todo correcto» con el código nuevo. Huella en la VM
+`ec7239c1c29a` (4024 líneas), igual que el fichero local.
+
+### B, C · Semilla por defecto y cfg 3,0
+
+`/health` anuncia `semilla_defecto: null` (sorteo, como siempre). El CLI y los docs ya dicen 3,0.
+
+### D · El banco es determinista
+
+`fidelidad.py --semillas 11 --pasos 6` repetido: 6/6 md5 iguales. Y el banco entero de 6 pasos
+repetido de principio a fin: **36/36 md5 iguales**. Las diferencias que siguen son del cambio, no
+del sorteo.
+
+### F · 6, 8 y 10 pasos: se queda 6
+
+Las 6 frases × semillas 11, 7, 3, 23, 42, 101; cfg 3,0; `sp-Spk1_man`. Umbral fijado antes de
+medir: 8 si ΔUTMOS ≥ +0,10 con mejora en ≥ 24/36, WER medio sin empeorar > 1 punto, RTF₈ ≤ 1,10 ×
+RTF₆.
+
+| pasos | WER medio | WER peor | exactos | UTMOS medio | UTMOS p10 | ΔUTMOS | mejora en | RTF | ms/fot |
+|---|---|---|---|---|---|---|---|---|---|
+| **6** | 11,8 % | 83,3 % | 23/36 | 3,547 | 3,126 | — | — | **1,057** | 125,1 |
+| 8 | 11,2 % | 211,1 % | 27/36 | 3,592 | 3,205 | +0,046 | 22/36 | 1,081 | 128,8 |
+| 10 | 10,7 % | 122,2 % | 23/36 | 3,523 | 3,116 | −0,024 | 19/36 | 1,137 | 134,2 |
+
+8 no llega al umbral (+0,046 y 22/36) y además produce la peor alucinación del banco (211 %); 10
+baja el UTMOS. El coste por paso es el previsto: 2,5-2,6 ms de cabeza por fotograma. **Decisión: 6
+pasos.** La primera tanda de 6 pasos dio RTF 1,267 por correr recién reiniciado el servicio (páginas
+del modelo en swap); repetida dio 1,057 con los mismos 36 md5. El RTF de la primera tanda tras un
+despliegue no vale.
+
+### La semilla pesa más que los pasos
+
+WER medio / frases exactas por semilla (6 frases cada celda), en los tres bancos:
+
+| pasos | s3 | s7 | s11 | s23 | s42 | s101 |
+|---|---|---|---|---|---|---|
+| 6 | 13 % / 4 | 2 % / 5 | 6 % / 4 | 8 % / 3 | **41 % / 1** | **0 % / 6** |
+| 8 | 11 % / 3 | 0 % / 6 | 0 % / 6 | 43 % / 4 | 13 % / 2 | **0 % / 6** |
+| 10 | 13 % / 3 | 2 % / 5 | 4 % / 4 | 9 % / 4 | **36 % / 1** | **0 % / 6** |
+
+UTMOS medio por semilla: s101 3,67 · s11 3,65 · s3 3,59 · s7 3,53 · s23 3,48 · s42 3,41. La 101
+acierta las 6 frases con cualquier número de pasos y es la que mejor suena; la 42 falla en todas
+las tandas. El WER medio del banco (11,8 %) frente al 3,6 % histórico se explica por eso: aquí las
+semillas están fijas y dos de las seis son malas. Es la palanca que `VIBEVOICE_SEMILLA` deja
+mover; el banco de 12 semillas más está en la sección siguiente.

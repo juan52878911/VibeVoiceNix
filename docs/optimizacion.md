@@ -388,6 +388,55 @@ permite, por orden: **fin de frase** → **fin de cláusula** → **último espa
 
 </details>
 
+<details>
+<summary><b>10 · La pausa de una sesión se lleva TODO su estado, no solo el RNG</b> — «misma semilla = mismo audio» también con una intrusa distinta</summary>
+
+<br>
+
+**La hipótesis.** Una sesión suelta el candado del modelo mientras espera texto, y la generate() que
+entra en ese hueco —otra sesión, o `/tts/stream`— toca estado que es del **proceso** y no de la
+llamada. El RNG ya se llevaba y traía (`SesionViva._pausar/_reanudar`), y la prueba de concurrencia
+de `ws_fidelidad.py` pasaba. Pero esa prueba mete dos sesiones **iguales**: si la intrusa deja los
+mismos pasos y el mismo `neg_cada`, que nadie los reponga no se nota. Leyendo el código quedaban
+cuatro estados sin reponer: los pasos de difusión (`set_ddpm_inference_steps`, que
+`sample_speech_tokens` lee en **cada** latente), `neg_cada` (que las sesiones además nunca fijaban:
+heredaban el del último `/tts/stream`), el contador de la rampa de cfg del arranque (una variable
+local que **cualquier** generate() ponía a cero) y `_REMATE`.
+
+**El escepticismo honesto.** Podía ser un fallo de papel: quizá ninguna sesión pausa antes de
+consumir su rampa de arranque, y los pasos distintos entre clientes son raros. Así que primero se
+escribió la prueba y se lanzó contra el código de producción, **antes** de tocar nada.
+
+**El resultado.** Falla, y de forma determinista. La prueba `pausa` abre la sesión A con una frase
+corta («Sí, claro.», menos de una ventana de 5 tokens), así que A se para **antes de su primer
+fotograma** esperando la ventana de adelanto; la intrusa B entra con `pasos + 4` y otra semilla y
+habla entera; A sigue. Medido en la VM (openvino, `sp-Spk3_man`, cfg 4,5, código `898a33c7`):
+
+| | audio | md5 |
+|---|---|---|
+| A a solas (6 pasos, semilla 11) | 6,93 s | `e3721afb…` |
+| **A con B en su pausa** (antes) | **7,20 s** | **`d37167ad…`** — primer byte distinto en el 560, o sea desde el primer fotograma |
+| A con `/tts/stream` de intrusa (10 pasos, `neg_cada` 2) (antes) | 7,20 s | `871bdfae…` |
+| A con B en su pausa (después, `ec7239c1`) | 6,93 s | `e3721afb…` = a solas |
+| A con `/tts/stream` de intrusa (después) | 6,93 s | `e3721afb…` = a solas |
+
+A reanudaba con los 10 pasos de B y sin su rampa de arranque (B ya la había consumido). El arreglo
+es una lista única de lo que una generate() arrastra fuera de sí misma —`foto_generacion()` /
+`reponer_generacion()`, junto a `_REMATE`— que la sesión fotografía antes de soltar el candado y
+repone al recuperarlo. Pasos y `neg_cada` no se fotografían: la sesión los conoce y los vuelve a
+fijar. Cuesta lo mismo que antes (5 KB de estado del RNG y cuatro escalares por pausa) y el resto
+de la suite sale bit a bit igual.
+
+En ese orden de entrada (A → B → A → B) la intrusa **no** se ve afectada: nadie le cambia los pasos
+entre sus pausas. La prueba lo comprueba igualmente por si el orden cambia.
+
+```bash
+# En la VM, con el token del servicio en el entorno:
+python scripts/ws_fidelidad.py --url http://127.0.0.1:8082 --pruebas pausa,pausa-stream
+```
+
+</details>
+
 ---
 
 ## Lo que NO funcionó
@@ -411,6 +460,31 @@ perdido.
 | **Atajo para `cfg=1`** | saltarse media difusión | sin efecto (ver arriba) |
 | **Decoder de OpenVINO en híbrido** | lo mejor de cada uno | rápido pero **ininteligible** |
 | **int4 en la cabeza de difusión** | menos bytes aún | **sesga el fin de frase** (95 tokens frente a 84) y empata en RTF |
+| **Cabeza de difusión en fp32** (hoy int8) | quitar el residuo de deriva que deja el int8 en OpenVINO | son 42 M parámetros × 6 pasadas × lote 2 **por fotograma**, y va limitada por memoria: 168 MB frente a 42 MB por pasada, ~+45 ms sobre un fotograma de 133. Descartado por cuenta, sin medir |
+| **Sigmas de Karras en el solver** | mejor reparto de los pocos pasos | con el schedule **coseno** del modelo los timesteps salen degenerados: `999, 999, 998, 993, 837, 0`. `trailing` da lo mismo que `linspace`. Medido en el planificador |
+| **Acelerar el WSOLA de `estirar.py`** | es un bucle en Python puro | cuesta **0,01 s por segundo de audio**. No es cuello |
+| **Redondear en vez de truncar al pasar a PCM16** | 0,5 LSB de error frente a 0,25 | sin sesgo DC y a −96 dBFS: inaudible |
+| **8 o 10 pasos de difusión en vez de 6** | con 6 la última evaluación de la red cae en t=166 y el solver salta a cero; con 8 es t=125 y con 10 t=100, y el coste es pequeño | **medido con umbral fijado de antemano y no lo pasa**: ver la tabla de abajo. 8 sube el UTMOS +0,046 de media (se pedía +0,10) en 22 de 36 clips (se pedían 24) y mete una alucinación (WER 211 %); 10 lo baja. Se queda en 6 |
+
+**8 y 10 pasos, la tabla.** Banco emparejado en la VM (openvino, `sp-Spk1_man`, cfg 3,0, las 6 frases
+de `fidelidad.py` × las semillas 11, 7, 3, 23, 42 y 101, mismas semillas en los tres bancos; whisper
+de la VM; UTMOS22 como juez de naturalidad, comparado solo por diferencia clip a clip). El umbral se
+escribió **antes** de ver un número: 8 se adoptaba si ΔUTMOS medio ≥ +0,10 con mejora en ≥ 24/36
+clips, el WER medio no empeoraba más de 1 punto y RTF₈ ≤ 1,10 × RTF₆.
+
+| pasos | WER medio | WER peor | exactos | UTMOS medio | UTMOS p10 | ΔUTMOS clip a clip | mejora en | RTF | ms/fotograma | cabeza |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **6** | 11,8 % | 83,3 % | 23/36 | 3,547 | 3,126 | — | — | **1,057** | 125,1 | 6 × 2,60 = 15,6 ms |
+| 8 | 11,2 % | **211,1 %** | 27/36 | 3,592 | 3,205 | **+0,046** | **22/36** | 1,081 | 128,8 | 8 × 2,56 = 20,5 ms |
+| 10 | 10,7 % | 122,2 % | 23/36 | 3,523 | 3,116 | −0,024 | 19/36 | 1,137 | 134,2 | 10 × 2,54 = 25,4 ms |
+
+Lo que sí deja claro la tabla es **dónde no está la calidad**: la diferencia entre 6 y 10 pasos es
+de centésimas de UTMOS, mientras que entre semillas la misma frase va de 0 % a 41 % de WER (ver la
+tabla de semillas en [plan-determinismo-calidad.md](plan-determinismo-calidad.md)). El coste sí es
+el previsto: cada paso son 2,5-2,6 ms de cabeza por fotograma, o sea +2,3 % de RTF con 8 y +7,6 %
+con 10. Y la primera pasada del banco a 6 pasos salió a RTF 1,267 por correr recién reiniciado el
+servicio con las páginas del modelo aún en swap; se repitió (mismos 36 md5, bit a bit) y dio 1,057.
+El RTF de la primera tanda tras un despliegue no vale.
 
 **El corolario que ordena todo:** como el cuello es **leer pesos desde RAM**, lo que paga es **reducir
 bytes de peso**, no reducir operaciones. Por eso int8 ganó y `torch.compile` no.
@@ -485,6 +559,15 @@ curl -s -X POST http://voz:8080/stt -H "Authorization: Bearer $TOKEN" -F "archiv
 
 # Fidelidad: el circuito completo texto -> voz -> whisper -> texto
 python scripts/fidelidad.py
+
+# El A/B EMPAREJADO: mismas frases y mismas semillas en las dos variantes, para
+# que la diferencia sea la del cambio y no la del sorteo. Deja un WAV por
+# (frase, semilla) y clips.csv con una fila por clip.
+python scripts/fidelidad.py --semillas 11,7,3,23,42,101 --pasos 8 --crono --audios banco/pasos8
+
+# Y la naturalidad, que whisper no ve: UTMOS por clip y tabla emparejada entre bancos
+python scripts/naturalidad.py puntuar --dir banco/pasos8
+python scripts/naturalidad.py comparar --base banco/pasos6 --contra banco/pasos8 banco/pasos10
 ```
 
 Y la **consola en el navegador** (`http://voz:8080/`) muestra el pipeline por estados y colores —gris
