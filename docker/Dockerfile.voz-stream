@@ -74,7 +74,12 @@ RUN git clone --filter=blob:none --sparse https://github.com/microsoft/VibeVoice
  && rm -rf /tmp/vv
 
 # --------------------------------------------------------------- codigo --
-COPY pkgs/vibevoice-cli/voz_stream.py pkgs/vibevoice-cli/prueba.html ./
+# estirar.py tambien: voz_stream.py lo importa (la velocidad sin mover el
+# tono). Sin el, la imagen arrancaba y moria en la primera linea con
+# ModuleNotFoundError y restart en bucle; la derivacion de Nix ya lo copiaba
+# (nix/pkgs/vibevoice-weights.nix) y por eso en la VM no se vio.
+COPY pkgs/vibevoice-cli/voz_stream.py pkgs/vibevoice-cli/estirar.py \
+     pkgs/vibevoice-cli/prueba.html ./
 
 # Deja la ruta del modelo fija: snapshot_download la esconde tras un hash.
 RUN MODELO=$(find /modelo -name "model.safetensors" -exec dirname {} \; | head -1) \

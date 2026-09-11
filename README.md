@@ -598,6 +598,11 @@ curl -s -X POST http://voz:8080/tts -H "Authorization: Bearer $TOKEN" -H 'Conten
 
 ```bash
 python scripts/fidelidad.py      # banco: texto -> voz -> whisper -> texto, mide WER
+python scripts/fidelidad.py --semillas 11,7,3,23,42,101 --pasos 8 --audios banco/pasos8
+                                 # el mismo banco EMPAREJADO (mismo ruido en cada variante) y con CSV por clip
+python scripts/naturalidad.py puntuar --dir banco/pasos8      # UTMOS por clip: lo que whisper no oye
+python scripts/naturalidad.py comparar --base banco/pasos6 --contra banco/pasos8
+python scripts/ws_fidelidad.py   # md5 del websocket contra HTTP, concurrencia, pausa, respiro, corte
 python scripts/narrador.py       # pone voz a un LLM según escribe
 python scripts/asistente.py      # Ollama -> voz, en la terminal
 
