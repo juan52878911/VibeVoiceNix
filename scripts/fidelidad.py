@@ -195,6 +195,11 @@ def main():
     ap.add_argument("--voz", default=os.environ.get("VIBEVOICE_VOZ", "sp-Spk1_man"))
     ap.add_argument("--repeticiones", type=int, default=3)
     ap.add_argument("--llm", action="store_true", help="que las frases las escriba un LLM")
+    ap.add_argument("--frases", default=None,
+                    help="fichero con una frase por linea (las lineas vacias y las que "
+                         "empiezan por # se saltan); sustituye a las de prueba. Sirve "
+                         "para medir con las frases REALES de un uso -- los rellenos "
+                         "de un perfil del asistente, por ejemplo")
     ap.add_argument("--modelo", default="qwen3:1.7b")
     ap.add_argument("--ollama", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
     ap.add_argument("--cfg", type=float, default=3.0,
@@ -220,7 +225,11 @@ def main():
                          "guardar el reparto del banco en {audios}/crono.json")
     a = ap.parse_args()
 
-    frases = frases_del_llm(6, a.modelo, a.ollama) if a.llm else FRASES
+    if a.frases:
+        with open(a.frases, encoding="utf-8") as fh:
+            frases = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+    else:
+        frases = frases_del_llm(6, a.modelo, a.ollama) if a.llm else FRASES
     if not frases:
         print("no consegui frases del LLM; uso las de prueba", file=sys.stderr)
         frases = FRASES
