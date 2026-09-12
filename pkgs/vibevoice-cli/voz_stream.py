@@ -1517,6 +1517,82 @@ class RemateEOS:
         return True
 
 
+# EL AIRE DE ANTES DE LA PRIMERA PALABRA: 0,33 s EN UN RELLENO DE 1,2 s
+#
+# El modelo no empieza a hablar en el primer fotograma: genera unos cuantos de
+# suelo de sala antes del primer sonido, y hasta ahora se emitian tal cual.
+# MEDIDO el 11-09-2026 en la VM (openvino), pico >= RESPIRO_PICO como umbral:
+#
+#   ruta                                    duracion   silencio delante
+#   rellenos del asistente (/tts/stream)     1,22 s     0,33 s (max 0,58)
+#   frases largas (/tts/stream)              2,84 s     0,19 s (max 0,44)
+#   parrafo de 6 frases (sesion)            20,50 s     0,70 s
+#
+# En un relleno de una palabra eso es UN CUARTO del clip, y los rellenos existen
+# precisamente para tapar la espera: el asistente los suelta para que no haya
+# silencio, y llegaban con un tercio de segundo de silencio dentro. En la sesion
+# son 0,70 s que se suman a la latencia hasta la primera palabra, que es la que
+# se nota (el streaming entero se monto para bajarla de 23,21 s a 0,20).
+#
+# SE TIRAN FOTOGRAMAS ENTEROS, NO SE CORTA DENTRO DE UNO, y no es pereza:
+#   - El fotograma que trae el ataque se emite COMPLETO. Cortar dentro exigiria
+#     el mismo cuidado que ya costo dos intentos en el respiro (el ataque de la
+#     palabra empieza 20-30 ms antes de la primera muestra fuerte), y aqui no
+#     hace falta: ese fotograma dura 133 ms y el ataque va dentro.
+#   - La rejilla de fotogramas se conserva. El audio que sale es EXACTAMENTE el
+#     de antes menos N fotogramas de cabeza, asi que sigue valiendo la
+#     reimplementacion del respiro con la que ws_fidelidad.py comprueba que el
+#     servidor hace lo que dice (aplicar_respiro parte el flujo en fotogramas de
+#     3200 muestras; un corte a mitad se la habria descuadrado).
+#
+# El umbral es el mismo RESPIRO_PICO ya medido, que separa "suelo de sala"
+# (pico <= 0,0185) de "aqui dentro hay voz" (pico >= 0,0406) sin zona gris.
+#
+# VIBEVOICE_RECORTE_ENTRADA=0 lo apaga y devuelve el audio de antes, fotograma
+# a fotograma.
+RECORTE_ENTRADA = os.environ.get("VIBEVOICE_RECORTE_ENTRADA", "1") not in ("0", "no")
+
+
+class RecorteEntrada:
+    """Se come los fotogramas callados de ANTES de la primera palabra.
+
+    Es la pareja de RemateEOS: uno cuida el principio de la locucion y el otro
+    el final. Los dos van por composicion en los dos streamers, porque el
+    problema y el arreglo son los mismos por las dos vias.
+
+    `rescate()` es la red de seguridad: si la locucion entera resulto ser
+    silencio -- un texto que no produce habla --, hay que devolver algo o el
+    cliente se queda con un WAV vacio y sin saber por que.
+    """
+
+    __slots__ = ("activo", "arrancado", "tirados", "_ultimo")
+
+    def __init__(self, activo: bool = None):
+        # Con RESPIRO_PICO desactivado no hay umbral con el que decidir, asi
+        # que no se recorta nada: mejor el aire de antes que comerse una
+        # palabra.
+        self.activo = ((RECORTE_ENTRADA if activo is None else bool(activo))
+                       and RESPIRO_PICO > 0)
+        self.arrancado = False
+        self.tirados = 0
+        self._ultimo = None
+
+    def deja_pasar(self, trozo) -> bool:
+        """False si este fotograma es aire de antes de empezar a hablar."""
+        if self.arrancado or not self.activo:
+            return True
+        if float(trozo.detach().abs().max()) >= RESPIRO_PICO:
+            self.arrancado = True
+            return True
+        self._ultimo = trozo
+        self.tirados += 1
+        return False
+
+    def rescate(self):
+        """El ultimo fotograma tirado, si NADA llego a sonar. None si sono."""
+        return None if self.arrancado else self._ultimo
+
+
 class StreamerCancelable:
     """Envuelve AsyncAudioStreamer anadiendo cancelacion cooperativa.
 
@@ -1527,7 +1603,7 @@ class StreamerCancelable:
     cliente que se va dejaria la CPU 20 s generando audio para nadie.
     """
 
-    def __init__(self, cola_final: int = None):
+    def __init__(self, cola_final: int = None, recorte_entrada: bool = None):
         from vibevoice.modular import AsyncAudioStreamer
         self.interno = AsyncAudioStreamer(batch_size=1, stop_signal=None)
         self.cancelado = False
@@ -1538,6 +1614,8 @@ class StreamerCancelable:
         # `terminado` se pone unos fotogramas MAS TARDE que el EOS, que es
         # justo de lo que se trata.
         self.remate = RemateEOS(cola_final)
+        # Y el aire de antes de la primera palabra, que no se emite.
+        self.entrada = RecorteEntrada(recorte_entrada)
 
     def put(self, trozos, indices):
         # Solo aborta si el que se fue es el CLIENTE.
@@ -1558,6 +1636,8 @@ class StreamerCancelable:
         # batch_size 1: un solo trozo por llamada, y su indice es siempre 0.
         if not self.remate.deja_pasar(trozos[0]):
             return
+        if not self.entrada.deja_pasar(trozos[0]):
+            return
         self.interno.put(trozos, indices)
 
     def end(self, indices=None):
@@ -1568,6 +1648,11 @@ class StreamerCancelable:
         if self.remate.retener_cierre(indices):
             return
         self.terminado = True
+        # Si NADA sono, el recorte se lo habria comido todo: se devuelve un
+        # fotograma para no cerrar con un WAV vacio.
+        rescate = self.entrada.rescate()
+        if rescate is not None:
+            self.interno.put([rescate], [0])
         self.interno.end(indices)
 
     def flujo(self):
@@ -2595,7 +2680,8 @@ class ColaAudioSesion:
     cuenta: solo expone el EOS, que es justo lo que falla en un descarrile.
     """
 
-    def __init__(self, lazo, cola, texto=None, respiro=False, cola_final=None):
+    def __init__(self, lazo, cola, texto=None, respiro=False, cola_final=None,
+                 recorte_entrada=None):
         self.lazo, self.cola = lazo, cola
         # El TextoEnCurso de ESTA generate(): la fuente de la senal de
         # prorroga. Sin el (None) no se retiene nunca, put() como siempre.
@@ -2624,6 +2710,10 @@ class ColaAudioSesion:
         # arreglo del "final en seco": el EOS del clasificador ya no cierra la
         # cola, la cierra el end() sin indices del final de generate().
         self.remate = RemateEOS(cola_final)
+        # Y su pareja al principio: los fotogramas callados de antes de la
+        # primera palabra no se emiten (0,70 s medidos en un parrafo de 6
+        # frases). Ver RecorteEntrada.
+        self.entrada = RecorteEntrada(recorte_entrada)
 
     def put(self, trozos, indices):
         # Tras el cierre de verdad lo que llegue sobra. OJO: el cierre ya NO es
@@ -2643,6 +2733,8 @@ class ColaAudioSesion:
             if int(idx) != 0:
                 continue
             if not self.remate.deja_pasar(trozos[i]):
+                continue
+            if not self.entrada.deja_pasar(trozos[i]):
                 continue
             trozo = trozos[i].detach().float().cpu()
             if not self.respiro:
@@ -2737,6 +2829,11 @@ class ColaAudioSesion:
         # cierra el end() sin indices con el que generate() sale del bucle.
         if self.remate.retener_cierre(indices):
             return
+        # Si NADA sono en toda la generate(), el recorte de entrada se lo comio
+        # todo: se devuelve un fotograma para no cerrar en vacio.
+        rescate = self.entrada.rescate()
+        if rescate is not None:
+            self._emitir(rescate.detach().float().cpu())
         self.cerrado = True
         if self.retenidos:
             # Que quede en el log: un EOS que llego DESPUES del umbral de
@@ -2756,7 +2853,8 @@ class SesionViva:
     """Una generate() viva en su hilo, con una cola de texto por delante."""
 
     def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo,
-                 respiro=True, cola_final=None, neg_cada=None):
+                 respiro=True, cola_final=None, neg_cada=None,
+                 recorte_entrada=None):
         self.nombre = nombre
         self.voz = voz
         self.cfg_scale = cfg_scale
@@ -2767,6 +2865,8 @@ class SesionViva:
         # al reanudar tras una pausa: antes las sesiones no lo tocaban nunca
         # y heredaban el que hubiera dejado el ultimo /tts/stream.
         self.neg_cada = neg_cada
+        # Aire de entrada: como la voz y el respiro, solo se mira al crearla.
+        self.recorte_entrada = recorte_entrada
         # El respiro (pausa de verdad en cada punto; ver el bloque RESPIRO) es
         # por sesion Y por servicio: el campo `respiro` de la peticion manda,
         # pero VIBEVOICE_RESPIRO=0 lo apaga globalmente.
@@ -3091,7 +3191,8 @@ class SesionViva:
         # locucion entra en prorroga y hay que retener (ver ColaAudioSesion).
         audio = ColaAudioSesion(self.lazo, self.cola, texto=al,
                                 respiro=self.respiro,
-                                cola_final=self.cola_final)
+                                cola_final=self.cola_final,
+                                recorte_entrada=self.recorte_entrada)
         with self._cond:
             # Bajo el candado y comprobando abortada: si el cliente se fue entre
             # que se armo la cola y que se registra, abortar() no la habria
@@ -3272,6 +3373,12 @@ class PeticionTTS(BaseModel):
     # poder medir el antes y el despues con el MISMO binario.
     cola_final: Optional[int] = Field(None, ge=0, le=6)
 
+    # Tirar o no los fotogramas callados de ANTES de la primera palabra (ver
+    # RecorteEntrada). None = lo que diga VIBEVOICE_RECORTE_ENTRADA. Va por
+    # peticion por lo mismo que cola_final: para medir el antes y el despues
+    # con el mismo binario, que es como se midio.
+    recorte_entrada: Optional[bool] = None
+
 
 class PeticionSesion(BaseModel):
     """Texto que se le mete a una sesion viva. La voz y los ajustes solo se
@@ -3294,6 +3401,8 @@ class PeticionSesion(BaseModel):
     cola_final: Optional[int] = Field(None, ge=0, le=6)
     # Agrupado de la rama incondicional, como en PeticionTTS. Solo al CREAR.
     neg_cada: Optional[int] = Field(None, ge=1, le=6)
+    # Recorte del aire de entrada, como en PeticionTTS. Solo al CREAR.
+    recorte_entrada: Optional[bool] = None
     # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
     fin: bool = False
 
@@ -3339,6 +3448,9 @@ def health() -> dict:
         # igual.
         "cola_final": {"fotogramas": COLA_FINAL, "umbral_pico": COLA_FINAL_PICO,
                        "insistir": COLA_INSISTIR and not SOLAPAR_DECODER},
+        # El aire de ANTES de la primera palabra, que tampoco se emite. Igual
+        # que cola_final, va por las dos vias.
+        "recorte_entrada": RECORTE_ENTRADA,
         "sesiones": {"activas": SESIONES_ACTIVAS,
                      "abiertas": sorted(_SESIONES),
                      "espera_texto_s": ESPERA_TEXTO,
@@ -3428,7 +3540,7 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
         # El candado se toma DENTRO del generador: si hay otra sintesis en
         # curso, esta espera su turno sin bloquear el bucle de eventos.
         async with _candado:
-            streamer = StreamerCancelable(pet.cola_final)
+            streamer = StreamerCancelable(pet.cola_final, pet.recorte_entrada)
             lazo = asyncio.get_running_loop()
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
@@ -3524,7 +3636,8 @@ async def sesion_texto(nombre: str, pet: PeticionSesion,
         s = SesionViva(nombre, pet.voz or VOZ_DEFECTO, pet.cfg_scale,
                        pet.semilla, pet.pasos, asyncio.get_running_loop(),
                        respiro=pet.respiro, cola_final=pet.cola_final,
-                       neg_cada=pet.neg_cada)
+                       neg_cada=pet.neg_cada,
+                       recorte_entrada=pet.recorte_entrada)
         _SESIONES[nombre] = s
     elif pet.voz is not None and pet.voz != s.voz:
         raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
@@ -3695,6 +3808,8 @@ class AbrirSesionWS(BaseModel):
     cola_final: Optional[int] = Field(None, ge=0, le=6)
     # Agrupado de la rama incondicional, como en PeticionTTS.
     neg_cada: Optional[int] = Field(None, ge=1, le=6)
+    # Recorte del aire de entrada, como en PeticionTTS.
+    recorte_entrada: Optional[bool] = None
     # Aceptado solo para poder dar un error claro; ver el bloque VELOCIDAD.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
@@ -3920,7 +4035,8 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
             return
         s = SesionViva(nombre, cfg.voz, cfg.cfg_scale, cfg.semilla, cfg.pasos,
                        lazo, respiro=cfg.respiro, cola_final=cfg.cola_final,
-                       neg_cada=cfg.neg_cada)
+                       neg_cada=cfg.neg_cada,
+                       recorte_entrada=cfg.recorte_entrada)
         # El audio ya sale por aqui: que GET /tts/sesion/{id}/audio no lo robe.
         s.escuchando = True
         _SESIONES[nombre] = s
