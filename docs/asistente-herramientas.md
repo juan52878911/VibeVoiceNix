@@ -259,6 +259,32 @@ modelo empezó a decirlo en voz alta: «el sistema está a punto de crear un
 recordatorio, ¿lo dejo?», sin llamar a nada. Ahora la instrucción solo dice qué
 hacer.
 
+**Y con un modelo LOCAL no funcionaba nada de esto, hasta el 12-09-2026.** La
+conversación se construye entera en la forma de Anthropic —`content` como lista
+de bloques `text` / `tool_use` / `tool_result`—, que es la que necesita
+MiniMax. Ollama quiere otra: `content` en texto, las llamadas en `tool_calls` y
+cada resultado en su mensaje con role `tool`. Estaba traducido **a medias**, y
+el resultado era que Ollama contestaba
+
+```
+400 json: cannot unmarshal array into Go struct field ChatRequest.messages.content of type string
+```
+
+y el ciclo moría sin decir una palabra. Se veía como «el modelo no llama a la
+herramienta», que es lo que más despista, y como el defecto es MiniMax nadie lo
+había pisado. Eran tres sitios: los esquemas (`input_schema` frente a
+`type/function/parameters`), el apunte del asistente con sus `tool_use`, y el
+historial que vuelve a contar las llamadas de turnos anteriores. **Ese tercero
+es el que explica el síntoma raro**: la primera pregunta salía perfecta y a
+partir de la segunda el asistente enmudecía, porque hasta que no hay una
+llamada en el historial no hay ninguna lista que mandar.
+
+La traducción se hace en `_una_vuelta_ollama` (`_a_forma_ollama`), o sea en la
+frontera y no en cada sitio donde se construye un mensaje: así queda **un solo
+formato interno** y quien escriba un mensaje nuevo mañana no tiene que
+acordarse de los dos proveedores. Medido con `qwen3:4b` y
+`herramientas_extremo.py`: **11 de 28 comprobaciones antes, 30 de 30 después**.
+
 ---
 
 ## Latencias medidas
@@ -272,6 +298,21 @@ del cliente:
 | sin herramienta | 1,22 s (1,22-1,22, n=4) | 1,44-2,77 s |
 | con herramienta, las seis áreas | 1,13 s de media (0,94-1,22, n=9) | 1,53-4,00 s con la VM libre |
 | remate confirmado («Apuntado.») | **0,004 s** (0,003-0,013, n=5) | no hay: es un WAV pregrabado |
+
+Y con un modelo **local pequeño** en el Mac (`qwen3:4b` por Ollama, la misma
+prueba, 12-09-2026), para dimensionar lo que cuesta no tener el modelo grande:
+
+| | primer sonido | primer PCM |
+|---|---|---|
+| sin herramienta | 1,21 s | 75,0 s |
+| con herramienta, las seis áreas | 1,22 s de media (1,20-1,24, n=6) | 35,8-67,1 s |
+| remate confirmado | **0,00 s** | no hay: pregrabado |
+
+El primer sonido **no se mueve** —1,2 s, el relleno— mientras el primer PCM se
+va de 2 s a 40-75. Es exactamente para lo que están los rellenos: con un modelo
+que tarda un minuto en pensar, lo único que evita el silencio es la coletilla
+pregrabada, y ahí el catálogo en caché vale más que cualquier optimización del
+sintetizador.
 
 En pasadas seguidas contra la VM, el **primer PCM** llega a irse a 8-37 s en
 algún caso suelto: es la cola del sintetizador, que tiene un solo modelo con un
