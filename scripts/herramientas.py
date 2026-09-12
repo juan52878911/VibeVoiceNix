@@ -1162,11 +1162,62 @@ def _una_vuelta_minimax(mensajes, sistema, modelo, esquemas, maximo=1024):
     yield ("fin", bloques, motivo)
 
 
+def _a_forma_ollama(mensajes):
+    """Traduce los mensajes de la forma de Anthropic a la de Ollama.
+
+    POR QUE HACE FALTA UNA TRADUCCION Y NO BASTA CON ESCRIBIRLOS BIEN. Dentro
+    de este fichero la conversacion se construye SIEMPRE en la forma de
+    Anthropic -- `content` es una lista de bloques (text, tool_use,
+    tool_result) --, que es la que necesita _una_vuelta_minimax. Ollama quiere
+    otra cosa: `content` en texto plano, las llamadas en `tool_calls` y cada
+    resultado en su propio mensaje con role "tool". Mandarle una lista da:
+
+        400 json: cannot unmarshal array into Go struct field
+            ChatRequest.messages.content of type string
+
+    Y no salta a la primera: solo cuando la conversacion YA lleva una llamada a
+    herramienta dentro (el propio turno, o el historial que _mensajes vuelve a
+    contar). Por eso con Ollama la primera pregunta iba bien y la segunda se
+    quedaba muda -- medido el 12-09-2026 con qwen3:4b, 15 de 28 comprobaciones
+    de herramientas_extremo.py falladas, todas por esto.
+
+    Se traduce AQUI, en la frontera, y no en cada sitio donde se construye un
+    mensaje: asi hay un solo formato interno y quien escriba un mensaje nuevo
+    manana no tiene que acordarse de los dos proveedores.
+    """
+    fuera = []
+    for m in mensajes:
+        cont = m.get("content")
+        if not isinstance(cont, list):
+            fuera.append(m)
+            continue
+        texto = "".join(b.get("text", "") for b in cont
+                        if b.get("type") == "text")
+        llamadas = [{"function": {"name": b.get("name"),
+                                  "arguments": b.get("input") or {}}}
+                    for b in cont if b.get("type") == "tool_use"]
+        resultados = [b for b in cont if b.get("type") == "tool_result"]
+        if resultados:
+            # Un mensaje por resultado, que es como los quiere Ollama. El role
+            # del original es "user" (asi los pide Anthropic) y aqui es "tool".
+            fuera += [{"role": "tool", "content": str(b.get("content", ""))}
+                      for b in resultados]
+            if texto:
+                fuera.append({"role": m.get("role", "user"), "content": texto})
+            continue
+        nuevo = {"role": m.get("role", "user"), "content": texto}
+        if llamadas:
+            nuevo["tool_calls"] = llamadas
+        fuera.append(nuevo)
+    return fuera
+
+
 def _una_vuelta_ollama(mensajes, sistema, modelo, url, esquemas):
     """Lo mismo contra Ollama. Con `tools` el flujo deja de ser fluido en
     algunos modelos -- mandan el texto de golpe al final -- pero el contrato
     de salida es identico, asi que el resto del ciclo no se entera."""
-    ms = ([{"role": "system", "content": sistema}] if sistema else []) + mensajes
+    ms = (([{"role": "system", "content": sistema}] if sistema else [])
+          + _a_forma_ollama(mensajes))
     cuerpo = {"model": modelo, "stream": True, "messages": ms}
     if esquemas:
         cuerpo["tools"] = esquemas
@@ -1213,6 +1264,26 @@ def ciclo(pregunta, historial, modelo, sistema, hablante, esquemas, ejecutor,
     vuelta, texto y ya. Asi un perfil sin herramientas no paga nada.
     """
     es_minimax = modelo.lower().startswith("minimax")
+    # LOS DOS FORMATOS DE HERRAMIENTA NO SON INTERCAMBIABLES, Y HASTA AHORA
+    # TENIA QUE ACERTAR EL QUE LLAMA. El puente (asistente_web.py) y el CLI de
+    # aqui pasaban SIEMPRE esquemas_anthropic() -- name/description/
+    # input_schema --, pero el proveedor lo decide esta funcion por el nombre
+    # del modelo. Con cualquier modelo de Ollama la peticion salia con `tools`
+    # en el formato de Anthropic y Ollama contestaba HTTP 400, asi que el
+    # asistente se quedaba MUDO y sin llamar a nada en todos los perfiles con
+    # herramientas. Se veia como "el modelo no llama a la herramienta", que es
+    # justo lo que despista.
+    #
+    # Se traduce aqui, que es donde ya se sabe el proveedor, y asi quien llama
+    # no tiene que saberlo. Descubierto el 12-09-2026 corriendo
+    # herramientas_extremo.py contra Ollama con qwen3:4b: 17 comprobaciones
+    # falladas, todas con la misma firma (sin texto y sin llamadas).
+    if esquemas and not es_minimax and "input_schema" in (esquemas[0] or {}):
+        esquemas = [{"type": "function",
+                     "function": {"name": e["name"],
+                                  "description": e.get("description", ""),
+                                  "parameters": e["input_schema"]}}
+                    for e in esquemas]
     mensajes = _mensajes(pregunta, historial, hablante,
                          ejecutor.recordado(sesion) if ejecutor else None)
     del_turno = []      # lo llamado AHORA, para que el turno siguiente lo vea
@@ -1263,7 +1334,22 @@ def ciclo(pregunta, historial, modelo, sistema, hablante, esquemas, ejecutor,
                 b["args"] = entrada
                 contenido.append({"type": "tool_use", "id": b["id"],
                                   "name": b["nombre"], "input": entrada})
-        mensajes.append({"role": "assistant", "content": contenido})
+        if es_minimax:
+            mensajes.append({"role": "assistant", "content": contenido})
+        else:
+            # Ollama quiere el texto en `content` (una CADENA) y las llamadas
+            # aparte en `tool_calls`. Con los bloques de Anthropic contesta
+            #   400 json: cannot unmarshal array into ... content of type string
+            # Los tool_result de abajo ya se mandaban en su formato (role
+            # "tool"); faltaba este apunte, y sin el la conversacion con
+            # herramientas no pasaba de la primera vuelta.
+            mensajes.append({
+                "role": "assistant",
+                "content": "".join(b["texto"] for b in bloques
+                                   if b["tipo"] == "text"),
+                "tool_calls": [{"function": {"name": b["nombre"],
+                                             "arguments": b.get("args", {})}}
+                               for b in llamadas]})
         resultados, preparada = [], None
         for b in llamadas:
             args = b.get("args", {})
