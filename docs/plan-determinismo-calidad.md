@@ -298,7 +298,10 @@ freno de la guía hace su trabajo), **ningún chasquido inicial** (las primeras 
 
 - **0,70 s de silencio antes de la primera palabra**, y 0,33 s de media en cada relleno del
   asistente. Arreglado: ver la entrada 11 de [optimizacion.md](optimizacion.md). Los 25 rellenos
-  seguidos pasan de 54,0 a 37,8 s sin tocar una sílaba del habla.
+  seguidos pasan de 54,0 a 37,8 s sin tocar una sílaba del habla. Ojo con el porqué: **en directo
+  no adelanta nada** (la primera sílaba suena igual, 0,56 frente a 0,58 s, porque ese silencio se
+  reproducía mientras el modelo aún generaba); la ganancia está en los clips que se guardan y se
+  reproducen luego, que es justo lo que son los rellenos.
 - **Las pausas de final de frase no son uniformes**, pero el reparto no es el que parecía al primer
   vistazo: separando las comas de los finales de frase, los finales caen en 0,56-0,80 s (un
   reparto normal) y lo que falla es que **el modelo se salta algunos**: en el párrafo de 6 frases

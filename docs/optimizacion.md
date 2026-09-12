@@ -457,9 +457,23 @@ distingue suelo de sala de voz):
 | párrafo de 6 frases (sesión) | 20,50 s | **0,70 s** |
 
 En un relleno de una palabra eso es **un cuarto del clip**. Y los rellenos son justo lo que el
-asistente suelta para tapar la espera mientras piensa: llegaban con un tercio de segundo de silencio
-dentro. En la sesión son 0,70 s que se suman a la latencia hasta la primera palabra, la que se nota
-y la que justificó montar el streaming entero.
+asistente suelta para tapar la espera mientras piensa: se generan una vez, se guardan en caché y se
+reproducen mil veces, así que ese tercio de segundo de silencio **se paga entero en cada
+reproducción**. Ahí es donde está la ganancia.
+
+**Donde NO está la ganancia es en el streaming en directo, y conviene decirlo porque parecía que
+sí.** Se midió la misma narración de 35 s por sesión, con el recorte y sin él:
+
+| | primer byte | primera sílaba | audio |
+|---|---|---|---|
+| sin recortar | 0,30 s | 0,58 s | 35,5 s |
+| **con recorte** | 0,55 s | **0,56 s** | 35,2 s |
+
+La primera sílaba suena **a la misma hora** (0,56 frente a 0,58 s, ruido). Es evidente en cuanto se
+mira: el silencio de cabeza se «reproducía» mientras el modelo todavía estaba generando la primera
+palabra, así que quitarlo no adelanta nada en directo. Lo que cambia es que el primer byte llega más
+tarde —ya no se mandan trozos vacíos— y que **el byte que llega ya es voz**. En un fichero que se
+guarda para después, en cambio, el silencio es retraso puro.
 
 **El arreglo.** No emitir los fotogramas callados de antes del primer sonido, en las dos vías
 (`RecorteEntrada`, por composición en los dos streamers, igual que `RemateEOS` hace con el final).

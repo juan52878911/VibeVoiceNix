@@ -59,20 +59,48 @@ FRASES = [
 # simbolo % donde se dijo "por ciento". Eso NO es un fallo del sintetizador --
 # la voz dijo lo correcto -- asi que contarlo como error inflaba el WER un 30 %
 # en frases con cifras. Se unifican los dos lados a palabras antes de comparar.
-NUMEROS = {
-    "0": "cero", "1": "uno", "2": "dos", "3": "tres", "4": "cuatro", "5": "cinco",
-    "6": "seis", "7": "siete", "8": "ocho", "9": "nueve", "10": "diez",
-    "11": "once", "12": "doce", "13": "trece", "14": "catorce", "15": "quince",
-    "16": "dieciseis", "17": "diecisiete", "18": "dieciocho", "19": "diecinueve",
-    "20": "veinte", "21": "veintiuno", "22": "veintidos", "23": "veintitres",
-    "24": "veinticuatro", "25": "veinticinco", "30": "treinta", "40": "cuarenta",
-    "50": "cincuenta", "60": "sesenta", "100": "cien",
-}
+#
+# LA TABLA A MANO SE QUEDABA CORTA, Y SE VIO MIDIENDO. Llegaba a 25 y luego
+# saltaba de decena en decena, asi que una narracion real del asistente -- "el
+# disco va por el cuarenta y dos por ciento", "caduca en treinta y un dias" --
+# daba WER 5,7 % con el contenido PERFECTO: los unicos fallos eran 42 y 31, que
+# no estaban en la tabla. Ahora se generan, con las tildes que toca, porque
+# normalizar() no quita acentos a proposito ("dieciseis" no casaria con
+# "dieciséis").
+UNIDADES = ["cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete",
+            "ocho", "nueve", "diez", "once", "doce", "trece", "catorce",
+            "quince", "dieciséis", "diecisiete", "dieciocho", "diecinueve",
+            "veinte", "veintiuno", "veintidós", "veintitrés", "veinticuatro",
+            "veinticinco", "veintiséis", "veintisiete", "veintiocho",
+            "veintinueve"]
+DECENAS = {3: "treinta", 4: "cuarenta", 5: "cincuenta", 6: "sesenta",
+           7: "setenta", 8: "ochenta", 9: "noventa"}
+CENTENAS = {1: "ciento", 2: "doscientos", 3: "trescientos", 4: "cuatrocientos",
+            5: "quinientos", 6: "seiscientos", 7: "setecientos",
+            8: "ochocientos", 9: "novecientos"}
+
+
+def _numero_a_palabras(n: int) -> str:
+    """0-999 en castellano. Fuera de rango se deja la cifra: mejor un fallo
+    visible que una traduccion inventada."""
+    if n < 30:
+        return UNIDADES[n]
+    if n < 100:
+        d, u = divmod(n, 10)
+        return DECENAS[d] + (f" y {UNIDADES[u]}" if u else "")
+    if n == 100:
+        return "cien"
+    if n < 1000:
+        c, r = divmod(n, 100)
+        return CENTENAS[c] + (f" {_numero_a_palabras(r)}" if r else "")
+    return str(n)
 
 
 def _cifras_a_palabras(t: str) -> str:
     t = re.sub(r"%", " por ciento ", t)
-    return re.sub(r"\b\d+\b", lambda m: NUMEROS.get(m.group(), m.group()), t)
+    return re.sub(r"\b\d+\b",
+                  lambda m: _numero_a_palabras(int(m.group()))
+                  if len(m.group()) <= 3 else m.group(), t)
 
 
 def normalizar(t: str) -> str:
@@ -110,9 +138,15 @@ def comparable(t: str) -> str:
 
     LA 'CH' SE PROTEGE antes de quitar las haches. Sin eso "echo" y "eco" se
     fundirian en la misma cadena, y esos dos SI suenan distinto.
+
+    Y LA APOCOPE DEL UNO, por lo mismo que las cifras: se dice "treinta y UN
+    dias" pero el numero 31 se lee "treinta y uno" en abstracto, asi que los
+    dos lados se llevan a la misma forma. Es una diferencia de gramatica, no de
+    pronunciacion.
     """
     t = normalizar(t).replace("ch", "\x01").replace("h", "").replace("\x01", "ch")
-    return t.replace("v", "b")
+    t = t.replace("v", "b")
+    return re.sub(r"\b(beintiun|un)\b", lambda m: m.group() + "o", t)
 
 
 def distancia(a: list, b: list) -> int:
