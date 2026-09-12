@@ -281,7 +281,9 @@ cualquiera de la red**, y es el tipo de error que no se nota hasta que importa.
 
 El TTS expresivo **en streaming**, en el puerto 8082. Emite el audio según se genera: el primer sonido
 llega en **0,20 s** en vez de esperar los 23 s de la síntesis completa, y el resultado es **bit a bit
-idéntico** (mismo md5) al de la generación normal.
+idéntico** (mismo md5) al de la generación normal, quitando los fotogramas de
+silencio de la entrada, que desde el 11-09-2026 no se emiten (0,27-0,40 s menos
+de espera hasta la primera palabra).
 
 Va **aparte de `voz-api` a propósito**: carga VibeVoice (~2,3 GB) frente a los ~100 MB de las voces de
 Piper, así que juntarlos haría que una síntesis pesada bloqueara las notas de voz rápidas. Hereda de

@@ -284,7 +284,8 @@ Hereda de `services.vibevoice` el modelo, las voces y la configuración de pasos
 hay dos sitios donde ajustar lo mismo. Usa `cfg_scale = 3.0` por petición, que es el valor que midió el
 banco de fidelidad.
 
-**El audio es bit a bit idéntico** al de la generación normal (mismo md5): no es una versión degradada,
+**El audio es bit a bit idéntico** al de la generación normal (mismo md5) salvo el aire de la entrada,
+que no se emite (`recorte_entrada`): no es una versión degradada,
 es el mismo resultado entregado según se produce.
 
 ```bash
@@ -415,6 +416,7 @@ para depurar.
 | `VIBEVOICE_SOLAPAR_DECODER` | `0` desactiva el solapamiento del decodificador. Es el A/B de una línea |
 | `VIBEVOICE_HILOS_DECODER` | hilos del decodificador solapado; `0` = la mitad |
 | `VIBEVOICE_SEMILLA` | semilla por defecto del ruido; vacía = sorteo por petición. Es `services.voz-stream.semilla` |
+| `VIBEVOICE_RECORTE_ENTRADA` | `0` devuelve el aire de antes de la primera palabra (0,27-0,40 s). También por petición, con `recorte_entrada` |
 
 ```bash
 # El A/B del solapamiento: misma semilla, y el md5 tiene que salir igual

@@ -4,7 +4,11 @@
 
 El cliente empieza a oír ~0,2 s después de pedirlo, mientras el resto se
 genera. Verificado: los trozos emitidos son bit a bit identicos al audio
-completo (mismo md5 que la generacion no-streaming).
+completo (mismo md5 que la generacion no-streaming), salvo los fotogramas
+callados de la ENTRADA, que desde el 11-09-2026 no se emiten -- son 0,27-0,40 s
+de aire delante de la primera palabra, y lo que queda sigue siendo byte a byte
+la cola del original (ver RecorteEntrada; VIBEVOICE_RECORTE_ENTRADA=0 lo
+devuelve).
 
 Y para narrar algo que aun se esta escribiendo -- la salida de un LLM, por
 ejemplo -- hay ademas SESIONES, que son una sola locucion continua a la que se

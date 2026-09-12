@@ -7,7 +7,10 @@
 #
 # El audio es bit a bit identico al de la generacion normal: mismo md5. No es
 # una aproximacion ni una version degradada, es el mismo resultado entregado
-# segun se produce.
+# segun se produce. Con una excepcion medida y a proposito: los fotogramas
+# callados de ANTES de la primera palabra ya no se emiten (0,27-0,40 s de aire;
+# VIBEVOICE_RECORTE_ENTRADA=0 los devuelve). Lo que sale sigue siendo byte a
+# byte la cola del audio original.
 #
 # POR QUE UN SERVICIO APARTE Y NO DENTRO DE voz-api
 # Este carga VibeVoice (~2,3 GB residentes); voz-api solo tiene las voces de

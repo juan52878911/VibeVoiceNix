@@ -289,6 +289,26 @@ semilla, cfg y pasos), el techo sería 25/25, 18/18 y 19/19 eligiendo la mejor s
 relleno**. Se gana un solo clip en `servidor` y cuesta un cambio de formato del fichero de perfiles,
 así que no se ha hecho: queda apuntado por si algún perfil futuro se atasca.
 
+### Lo que salió de escuchar el audio de prueba
+
+Con las semillas puestas se generó un audio con una voz clonada para juzgarlo a oído. Lo medible se
+midió antes: **cero recorte** (pico 0,80), **cero deriva de volumen** (−0,2 dB en 20 s, o sea que el
+freno de la guía hace su trabajo), **ningún chasquido inicial** (las primeras muestras son 0,0000) y
+**ningún corte en seco** (los últimos 5 ms también). Lo que sí apareció:
+
+- **0,70 s de silencio antes de la primera palabra**, y 0,33 s de media en cada relleno del
+  asistente. Arreglado: ver la entrada 11 de [optimizacion.md](optimizacion.md). Los 25 rellenos
+  seguidos pasan de 54,0 a 37,8 s sin tocar una sílaba del habla.
+- **Las pausas de final de frase no son uniformes**, pero el reparto no es el que parecía al primer
+  vistazo: separando las comas de los finales de frase, los finales caen en 0,56-0,80 s (un
+  reparto normal) y lo que falla es que **el modelo se salta algunos**: en el párrafo de 6 frases
+  hay 5 fronteras y solo 3 llevan pausa larga. Eso ya está documentado como callejón sin salida en
+  el bloque RESPIRO de `voz_stream.py`: el aire solo se puede alargar donde el modelo ya pausó, y
+  se buscó un ancla independiente para saber dónde caen las fronteras sin encontrarla (el
+  clasificador de EOS es plano en las fronteras internas, y la posición de lectura del texto va por
+  delante del habla en una cantidad variable). **No se ha tocado**: no hay medida que respalde un
+  arreglo, y el respiro es la parte del fichero que más veces se ha roto al tocarla a ojo.
+
 ### Qué queda
 
 - Si se cambia la voz de un perfil, **repetir su banco**: la semilla no se hereda entre voces.

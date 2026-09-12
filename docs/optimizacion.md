@@ -268,7 +268,8 @@ VIBEVOICE_SOLAPAR_DECODER=0 python pkgs/vibevoice-cli/voz_stream.py
 **No baja el RTF. Es lo que convierte esto en conversación.** Con RTF 0,8 sin streaming esperas 8 segundos
 antes de oír nada; con streaming oyes en cientos de milisegundos aunque el RTF siga por encima de 1.
 
-**Lo importante:** el audio es **bit a bit idéntico** al de la generación normal (mismo md5). No es una
+**Lo importante:** el audio es **bit a bit idéntico** al de la generación normal (mismo md5), quitando
+los fotogramas callados de la entrada que ya no se emiten (ver más abajo). No es una
 versión degradada, es el mismo resultado entregado según se produce.
 
 **Servicio aparte de `voz-api`, a propósito.** `voz-stream` carga VibeVoice (~2,3 GB); `voz-api` solo las
@@ -433,6 +434,59 @@ entre sus pausas. La prueba lo comprueba igualmente por si el orden cambia.
 ```bash
 # En la VM, con el token del servicio en el entorno:
 python scripts/ws_fidelidad.py --url http://127.0.0.1:8082 --pruebas pausa,pausa-stream
+```
+
+</details>
+
+<details>
+<summary><b>11 · El aire de antes de la primera palabra</b> — un cuarto de cada relleno era silencio</summary>
+
+<br>
+
+**El síntoma.** Se generó un audio de prueba con una voz clonada para escucharlo, y antes de medirlo
+nada se veía: ni recorte, ni deriva de volumen, ni chasquido, ni corte en seco. Lo que sí salió al
+mirar los bordes es que **la locución tardaba en arrancar**.
+
+**Lo medido** (11-09-2026, VM con OpenVINO, umbral de pico 0,03, el mismo con el que el respiro
+distingue suelo de sala de voz):
+
+| ruta | duración media | silencio delante |
+|---|---|---|
+| rellenos del asistente (`/tts/stream`) | 1,22 s | **0,33 s** (hasta 0,58) |
+| frases largas (`/tts/stream`) | 2,84 s | 0,19 s |
+| párrafo de 6 frases (sesión) | 20,50 s | **0,70 s** |
+
+En un relleno de una palabra eso es **un cuarto del clip**. Y los rellenos son justo lo que el
+asistente suelta para tapar la espera mientras piensa: llegaban con un tercio de segundo de silencio
+dentro. En la sesión son 0,70 s que se suman a la latencia hasta la primera palabra, la que se nota
+y la que justificó montar el streaming entero.
+
+**El arreglo.** No emitir los fotogramas callados de antes del primer sonido, en las dos vías
+(`RecorteEntrada`, por composición en los dos streamers, igual que `RemateEOS` hace con el final).
+**Se tiran fotogramas enteros y no se corta dentro de uno**, por dos razones: el fotograma que trae
+el ataque se emite completo, así que no hay forma de comerse el arranque de la palabra; y la rejilla
+de 3200 muestras se conserva, que es de lo que depende la prueba con la que `ws_fidelidad.py`
+comprueba que el respiro del servidor es exactamente el post-proceso documentado.
+
+**El resultado**, A/B con el mismo binario cambiando solo el campo `recorte_entrada` de la petición:
+
+| | antes | después |
+|---|---|---|
+| «Vale.» | 0,80 s | **0,40 s** |
+| «Hecho.» | 0,80 s | **0,40 s** |
+| «El backup de anoche terminó sin errores.» | 2,80 s | 2,53 s |
+| silencio delante (media de 7 frases) | 0,35 s | **0,05 s** |
+| los 25 rellenos del perfil general, seguidos | 54,0 s | **37,8 s** (−30 %) |
+| párrafo de 6 frases por sesión | 20,5 s | 19,9 s |
+
+**Y se comprueba lo fuerte, no lo cómodo:** en las 7 frases el audio recortado es **exactamente** el
+de antes menos N fotogramas enteros de cabeza (`a[k:] == b`, con `k` múltiplo de 3200 muestras). Si
+eso se cumple, el recorte no ha tocado el habla; no hace falta creerse nada más. La suite entera de
+`ws_fidelidad.py` sigue en verde, respiro incluido.
+
+```bash
+# El A/B, sin reiniciar nada: mismo binario, un campo de la peticion
+curl -s -X POST http://voz:8082/tts/stream -d '{"texto":"Vale.","recorte_entrada":false}' ...
 ```
 
 </details>
