@@ -484,6 +484,25 @@ de antes menos N fotogramas enteros de cabeza (`a[k:] == b`, con `k` múltiplo d
 eso se cumple, el recorte no ha tocado el habla; no hace falta creerse nada más. La suite entera de
 `ws_fidelidad.py` sigue en verde, respiro incluido.
 
+**Lo que sí cambia es lo que whisper OYE, y por poco.** Transcribiendo los 62 rellenos del asistente
+con el mismo juez, en tres versiones del mismo audio:
+
+| versión | rellenos exactos de 62 |
+|---|---|
+| sin recortar | 59 |
+| recorte entero (**lo que se queda**) | 58 |
+| recortando pero dejando un fotograma de sala delante | 58 |
+
+Un clip se tuerce, otro se arregla y un tercero pierde una tilde. **La tercera fila es la que cierra
+el asunto**: si el problema fuera el arranque abrupto, dejar 133 ms de sala delante lo arreglaría, y
+no lo hace (*«Sí, claro.»* sale *«¡Ciclar!»* con recorte y *«¡Cicler!»* con margen). Es ruido del
+reconocedor sobre medio segundo de audio, no una propiedad del recorte, que ya sabemos que no toca
+una muestra del habla.
+
+> **Consecuencia para el banco:** al medir clips de una palabra conviene pedirlos con
+> `"recorte_entrada": false`. El habla es idéntica y el juez tiene su pista de aterrizaje, así que
+> las cifras salen comparables con las de antes del 12-09-2026.
+
 ```bash
 # El A/B, sin reiniciar nada: mismo binario, un campo de la peticion
 curl -s -X POST http://voz:8082/tts/stream -d '{"texto":"Vale.","recorte_entrada":false}' ...
@@ -590,6 +609,9 @@ Está documentado en el propio módulo. **Si algún día el motor cambia, ese aj
 - **El prefijo de voz se muta en `generate()`**: recargar y `deepcopy` en cada medición, o la segunda
   salida no se parece a la primera.
 - **Unificar formato antes de comparar texto** — ver la trampa de whisper con los números, arriba.
+- **Al medir clips de una palabra, pedirlos sin el recorte de entrada** (`"recorte_entrada": false`).
+  El habla es la misma con recorte y sin él —está verificado byte a byte—, pero whisper acierta menos
+  sobre medio segundo de audio que empieza de golpe, y esa diferencia es del juez, no del audio.
 - **Y unificar también las grafías que no se pueden oír.** En castellano la **h es muda** y **b y v
   son el mismo fonema**: «hecho»/«echo» y «borrada»/«vorrada» suenan igual, así que cuál de las dos
   escribe whisper lo decide su modelo de lenguaje y no la voz. Con una frase larga acierta por
