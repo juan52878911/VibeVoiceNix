@@ -1447,8 +1447,20 @@ def _cli(argv=None) -> int:
     pregunta = " ".join(a.resto) or "¿qué tengo hoy?"
     t0 = time.time()
     dicho, primero = "", None
+    # "Nada de listas ni markdown" NO es adorno, y este CLI se lo dejaba fuera
+    # mientras los perfiles de verdad (perfiles_asistente.json) si lo llevan.
+    # MEDIDO el 12-09-2026 con qwen3:4b, 3 preguntas duras x 3 repeticiones --
+    # una semana de cinco eventos, un desglose de cuatro cifras y un "resumelo
+    # todo", que es donde un modelo pequeno se pone a enumerar:
+    #
+    #   prompt del perfil (con la regla)   9/9 limpias
+    #   este de aqui      (sin la regla)   7/9, con vinetas de guion
+    #
+    # Y lo que sale por aqui se dice EN VOZ ALTA, donde un "1." se lee "uno
+    # punto". Por eso ahora se pide igual que en los perfiles.
     for x in ciclo(pregunta, [], a.modelo,
-                   "Eres un asistente de voz en castellano. Frases cortas. " +
+                   "Eres un asistente de voz en castellano. Frases cortas. "
+                   "Nada de listas ni markdown: esto se dice en voz alta. " +
                    instrucciones(ej, a.sesion),
                    None, esquemas_anthropic(), ej, a.sesion):
         if isinstance(x, dict):
