@@ -91,12 +91,43 @@ class SubidaTr(nn.Module):
         self.b = nn.Parameter(torch.empty(sal))
         self.k, self.s = k, s
 
+    def matriz(self):
+        """Los pesos [C_in, C_out, k] ya ordenados como matriz [C_out*k, C_in].
+
+        cargar() la deja hecha y contigua, para que en el grafo sea una
+        constante plana; sin ella (pesos aleatorios de las pruebas) se calcula."""
+        if getattr(self, "mm", None) is not None:
+            return self.mm
+        return self.w.permute(1, 2, 0).reshape(self.w.shape[1] * self.k, -1)
+
     def forward(self, x, est):
         full = torch.cat([est, x], dim=2)
         nuevo = full[:, :, -(self.k - 1):]
-        y = F.conv_transpose1d(full, self.w, self.b, stride=self.s)
-        y = y[:, :, : -(self.k - self.s)]          # recorte causal (todo a la dcha)
-        return y[:, :, -(x.shape[2] * self.s):], nuevo   # solo lo nuevo
+        # SIN CONVOLUCION TRASPUESTA. El original la hacia sobre la ventana
+        # entera (k-1 de estado + T nuevas) y tiraba casi todo: en subidas.0
+        # entraban 16, salian 136 y se quedaban 8. Con k = 2s cada muestra de
+        # salida suma exactamente DOS entradas -- la suya y la anterior --, asi
+        # que las T*s que se devuelven solo las tocan las ultimas T+1. Y cada
+        # entrada aporta un bloque de k muestras que es un producto de matrices
+        # (pesos [C_in, C_out, k] -> [C_out*k, C_in]); el tramo j de salida es la
+        # mitad izquierda del bloque j mas la derecha del bloque j-1.
+        #
+        # Mismas sumas con los mismos pesos: frente a conv_transpose1d, 40
+        # fotogramas encadenados dan diferencias de 1e-5 sobre salidas de
+        # magnitud 3-15 (redondeo de float32). Y en OpenVINO la traspuesta cae en
+        # jit_gemm mientras el producto va por brgemm: las seis subidas pasan de
+        # 31,8 a 10,1 ms por fotograma en el i7-8700T (subidas.0 de 23,7 a 4,9).
+        #
+        # El estado conserva sus k-1 entradas aunque solo se lea la ultima: asi
+        # las formas del IR y las fotos de estado de motor.py no cambian.
+        T = x.shape[2]
+        c_sal = self.w.shape[1]
+        h = full[:, :, -(T + 1):].transpose(1, 2)                   # [1, T+1, C_in]
+        m = self.matriz()                                           # [C_out*k, C_in]
+        z = F.linear(h, m).reshape(1, T + 1, c_sal, self.k)
+        y = z[:, 1:, :, : self.s] + z[:, :-1, :, self.s:]           # [1, T, C_out, s]
+        y = y.permute(0, 2, 1, 3).reshape(1, c_sal, T * self.s)
+        return y + self.b[None, :, None], nuevo
 
 
 class Decodificador(nn.Module):
@@ -152,6 +183,11 @@ def cargar(ruta_st):
         for i in range(6):
             m.subidas[i].w.data = t("upsample_layers.%d.0.convtr.convtr.weight" % (i + 1))
             m.subidas[i].b.data = t("upsample_layers.%d.0.convtr.convtr.bias" % (i + 1))
+            # la matriz ya ordenada, contigua: una constante plana en el grafo
+            m.subidas[i].mm = nn.Parameter(
+                m.subidas[i].w.data.permute(1, 2, 0)
+                .reshape(m.subidas[i].w.shape[1] * m.subidas[i].k, -1).contiguous(),
+                requires_grad=False)
         for i in range(7):
             for jj, blq in enumerate(m.etapas[i]):
                 b = "stages.%d.%d." % (i, jj)

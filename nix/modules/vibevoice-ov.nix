@@ -50,8 +50,21 @@ let
 
       # Cada conversion en su PROPIO proceso: cargar el fp32 pica ~4,6 GB y
       # encadenarlas en uno solo desborda los 5 GB de la VM.
-      for paso in convertir_lm_estado convertir_cabeza convertir_decoder; do
-        salida="$destino/.$paso.hecho"
+      #
+      # paso:version. Subir la version de UN paso lo regenera en el siguiente
+      # arranque sin tocar los demas: rehacer el LM son ~15 min y 4,6 GB de pico
+      # para nada. La version 1 conserva el marcador de siempre, asi que una VM
+      # que ya los tenia no repite ninguno.
+      #   convertir_decoder 2  subidas sin convolucion traspuesta
+      #                        y sin estado en el IR (decoder_mm_*; ver SubidaTr)
+      for entrada in convertir_lm_estado:1 convertir_cabeza:1 convertir_decoder:2; do
+        paso="''${entrada%%:*}"
+        version="''${entrada##*:}"
+        if [ "$version" = 1 ]; then
+          salida="$destino/.$paso.hecho"
+        else
+          salida="$destino/.$paso.v$version.hecho"
+        fi
         if [ -f "$salida" ]; then
           echo "[ov] $paso ya estaba hecho"
           continue

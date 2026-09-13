@@ -315,15 +315,41 @@ class AcusticoOV:
         from decoder_manual import formas_estado_lista
         self._ov = ov
         core = ov.Core()
-        self.comp = core.compile_model(ruta_xml, "CPU",
+        modelo = core.read_model(ruta_xml)
+        formas = formas_estado_lista()
+        # ESTADO EXPLICITO PARA LOS IR SIN ESTADO (decoder_mm_*). Las 34 colas
+        # entran y salen como tensores (lat, est.0..33 / audio, est.0..33) y
+        # las lleva esta clase en una lista de arrays; los IR con estado de
+        # OpenVINO (decoder_estado_*) siguen con sus variables internas.
+        #
+        # No es gusto: con las subidas por productos de matrices (ver SubidaTr
+        # en decoder_manual.py), el estado de OpenVINO sobre un grafo leido de
+        # fichero realimenta mal. Medido frente a torch con los pesos reales:
+        # estado aplicado en memoria 118 dB de SNR; en cuanto el grafo pasa por
+        # fichero, -2,9 dB desde el primer fotograma -- guardado con estado o
+        # puesto al releer, emparejado por nombre o por posicion, en fp16 o en
+        # float32 --; el mismo fichero con el estado explicito, 71 dB, lo mismo
+        # que el decodificador viejo. La causa no esta identificada.
+        #
+        # Lo que cuesta: copiar las colas que devuelve cada llamada (711 KB).
+        self._explicito = not any(op.get_type_name() == "ReadValue" for op in modelo.get_ops())
+        self.comp = core.compile_model(modelo, "CPU",
                                        {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1,
                                         "PERFORMANCE_HINT": "LATENCY"})
         self.pet = self.comp.create_infer_request()
-        formas = formas_estado_lista()
-        self._ceros = {}
-        for est in self.pet.query_state():
-            c, l = formas[int(re.search(r"est\.(\d+)\.", est.name).group(1))]
-            self._ceros[est.name] = np.zeros((1, c, l), dtype=np.float32)
+        if self._explicito:
+            self._nombres_est = ["est.%d.in" % i for i in range(len(formas))]
+            self._salidas_est = [self.comp.output("est.%d.out" % i) for i in range(len(formas))]
+            for i, (c, l) in enumerate(formas):
+                for puerto in (self.comp.input(self._nombres_est[i]), self._salidas_est[i]):
+                    assert list(puerto.get_shape()) == [1, c, l], (i, puerto.get_shape(), (c, l))
+            self._ceros = [np.zeros((1, c, l), dtype=np.float32) for c, l in formas]
+            self._estado = list(self._ceros)
+        else:
+            self._ceros = {}
+            for est in self.pet.query_state():
+                c, l = formas[int(re.search(r"est\.(\d+)\.", est.name).group(1))]
+                self._ceros[est.name] = np.zeros((1, c, l), dtype=np.float32)
         # weakref: el dueño es un objeto de generate(), y cuando esa generate()
         # muere su estado sobra. Con una referencia normal lo mantendriamos vivo
         # -- a el y a sus 711 KB -- hasta la sintesis siguiente.
@@ -332,22 +358,33 @@ class AcusticoOV:
 
     # ---- estado: leerlo, ponerlo, y cambiar de corriente ----
     def _foto(self):
+        if self._explicito:
+            # Los arrays de la lista no se tocan nunca en su sitio: cada
+            # llamada deja una lista NUEVA de copias. Basta con la lista.
+            return list(self._estado)
         # copy=True de verdad: .data es una VISTA de la memoria de OV, que la
         # siguiente infer() sobrescribe.
         return {est.name: np.array(est.state.data, copy=True)
                 for est in self.pet.query_state()}
 
     def _poner(self, estados):
+        if self._explicito:
+            self._estado = list(estados)
+            return
         for est in self.pet.query_state():
             # .copy() para no entregarle a OV la misma memoria que guardamos:
             # si la compartiera, la foto dejaria de ser una foto.
             est.state = self._ov.Tensor(
                 np.ascontiguousarray(estados[est.name], dtype=np.float32).copy())
 
+    def _a_cero(self):
+        if not self._explicito:
+            self.pet.reset_state()
+        self._poner(self._ceros)
+
     def nueva_sesion(self):
         """Estado a cero == cache vacia del original. Suelta al dueño actual."""
-        self.pet.reset_state()
-        self._poner(self._ceros)
+        self._a_cero()
         self._duenno = None
 
     def _cambiar_a(self, cache):
@@ -361,12 +398,23 @@ class AcusticoOV:
         # cache=None es use_cache=False del original: cada llamada, en frio.
         guardado = getattr(cache, "_estado_ov", None) if cache is not None else None
         if guardado is None:
-            self.pet.reset_state()
-            self._poner(self._ceros)
+            self._a_cero()
         else:
             self._poner(guardado)
         self._duenno = _referencia(cache)
         return guardado is None
+
+    def _inferir(self, lat):
+        """Un fotograma: devuelve el audio y deja el estado avanzado."""
+        if not self._explicito:
+            res = self.pet.infer({"lat": lat}, share_inputs=True, share_outputs=True)
+            return np.array(res[self.comp.output("audio")])
+        entradas = {"lat": lat}
+        entradas.update(zip(self._nombres_est, self._estado))
+        res = self.pet.infer(entradas, share_inputs=True, share_outputs=True)
+        # copias: share_outputs deja vistas que la siguiente infer() pisa
+        self._estado = [np.array(res[s], copy=True) for s in self._salidas_est]
+        return np.array(res[self.comp.output("audio")])
 
     def decode(self, latents, cache=None, sample_indices=None, use_cache=True, debug=False):
         ini = time.perf_counter()
@@ -377,10 +425,8 @@ class AcusticoOV:
         if self._cambiar_a(cache):
             # cebado: un fotograma de silencio para que la primera muestra real
             # no salte desde la nada. Se tira la salida.
-            self.pet.infer({"lat": np.zeros_like(lat)},
-                           share_inputs=True, share_outputs=True)
-        res = self.pet.infer({"lat": lat}, share_inputs=True, share_outputs=True)
-        salida = torch.from_numpy(np.array(res[self.comp.output("audio")]))
+            self._inferir(np.zeros_like(lat))
+        salida = torch.from_numpy(self._inferir(lat))
         CRONO["acustico"][0] += time.perf_counter() - ini
         CRONO["acustico"][1] += 1
         return salida
