@@ -70,7 +70,7 @@ let
           continue
         fi
         echo "[ov] $paso ..."
-        python ${codigo}/$paso.py
+        python "${codigo}/$paso.py"
         touch "$salida"
       done
 
