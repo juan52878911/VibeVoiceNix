@@ -39,6 +39,8 @@ QUE MIDE
 
 RESULTADOS de la pasada de referencia (2026-08-06, Mac M-series, todo local):
   compuerta qwen3:4b    24/24 aciertos · 0,70 s de media, 0,83 el peor
+  (13-09-2026, Ollama 0.32.6: qwen3:4b 24/24 · 0,64 s; qwen3:4b-instruct
+   24/24 · 0,50 s, peor 0,62. El instruct es el defecto del puente.)
   compuerta qwen3:1.7b  17/24 (7 falsos positivos) · 0,31 s. NO lo uses.
   compuerta SIN Ollama  Qwen3-4B-Instruct-2507 GGUF Q4_K_M en llama-server
                         (--ollama http://127.0.0.1:PUERTO, decidir() detecta
@@ -496,7 +498,7 @@ def main():
     ap.add_argument("--api-url", default=os.environ.get("VOZ_API_URL",
                                                         "http://127.0.0.1:8080"))
     ap.add_argument("--token-api", default=os.environ.get("VOZ_API_TOKEN", ""))
-    ap.add_argument("--modelos", default="qwen3:4b,qwen3:1.7b",
+    ap.add_argument("--modelos", default="qwen3:4b-instruct,qwen3:4b",
                     help="modelos de compuerta a comparar, separados por comas")
     ap.add_argument("--whisper-url", default=os.environ.get(
         "WHISPER_NATIVO_URL", ""),

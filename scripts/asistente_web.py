@@ -2858,10 +2858,12 @@ def main():
     ap.add_argument("--sistema", default="Responde en español, breve y natural, "
                                          "en frases cortas. Sin listas ni markdown.")
     ap.add_argument("--compuerta",
-                    default=os.environ.get("ASISTENTE_COMPUERTA", "qwen3:4b"),
+                    default=os.environ.get("ASISTENTE_COMPUERTA", "qwen3:4b-instruct"),
                     help="modelo que decide si una frase oida va dirigida al "
-                         "asistente. qwen3:4b en Ollama local por defecto: "
-                         "~0,4 s con think:false. Los MiniMax-* valen pero "
+                         "asistente. qwen3:4b-instruct en Ollama local por "
+                         "defecto: 24/24 como qwen3:4b, 0,50 s frente a 0,64, "
+                         "y es el MISMO modelo que conviene de principal, asi "
+                         "que Ollama no carga dos. Los MiniMax-* valen pero "
                          "razonan aunque se les pida que no y tardan 3-6 s "
                          "(medido); ver scripts/conversacion.py")
     ap.add_argument("--perfiles",

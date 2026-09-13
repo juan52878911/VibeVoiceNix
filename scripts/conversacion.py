@@ -41,6 +41,13 @@ fijado por hash. Con la bateria de escucha_fidelidad.py, en el mismo Mac:
     qwen3:4b via Ollama (referencia del dia)      24/24 · 0,65 s de media
     2507 via llama-server, Metal                  24/24 · 0,47 s · RSS 3,1 GB
     2507 via llama-server, solo CPU (8 hilos M4)  24/24 · 1,31 s
+Y repetido el 13-09-2026, Ollama 0.32.6, la misma bateria:
+    qwen3:4b                                      24/24 · 0,64 s · peor 0,77
+    qwen3:4b-instruct (el 2507 en Ollama)         24/24 · 0,50 s · peor 0,62
+El instruct es ahora el defecto, y no por los 0,14 s: con escucha continua la
+compuerta y la primera pasada de la respuesta salen A LA VEZ, y si son modelos
+distintos Ollama tiene los dos en memoria (~3,5 GB mas) y la primera pregunta
+de la conversacion paga 9-10 s de carga. Con el mismo modelo en las dos, cero.
 
 Menos modelo NO llega, medido con la misma bateria y el mismo esquema:
 Qwen2.5-3B 21/24 · qwen3:1.7b 17/24 · Qwen2.5-1.5B 19/24 · Qwen2.5-0.5B

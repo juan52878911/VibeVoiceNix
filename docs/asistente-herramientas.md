@@ -332,6 +332,56 @@ prueba, 12-09-2026), para dimensionar lo que cuesta no tener el modelo grande:
 | con herramienta, las seis áreas | 1,22 s de media (1,20-1,24, n=6) | 35,8-67,1 s |
 | remate confirmado | **0,00 s** | no hay: pregrabado |
 
+Y lo mismo con **`qwen3:4b-instruct`** (13-09-2026), que es el mismo tamaño y
+la misma cuantización pero **no razona antes de contestar**:
+
+| | primer sonido | primer PCM |
+|---|---|---|
+| sin herramienta | 1,21 s | 3,42 s |
+| con herramienta, las seis áreas | 1,21 s de media (1,18-1,22, n=6) | **3,68-5,29 s** (4,40 de media) |
+| remate confirmado | **0,00 s** | no hay: pregrabado |
+
+Las 30 comprobaciones de la suite en verde, las mismas que con `qwen3:4b`.
+
+### Por qué el 4b tardaba un minuto: pensaba sin que se viera
+
+Medido con las estadísticas del propio Ollama (el marco `done` de cada pasada:
+`prompt_eval_*`, `eval_*`, `load_duration` y el campo `thinking`), con el
+prompt y las diez herramientas de verdad, seis preguntas × 2:
+
+| | `qwen3:4b` | `qwen3:4b-instruct` |
+|---|---|---|
+| herramienta correcta | 12/12 | 12/12 |
+| respuesta sin razonamiento ni listas | 12/12 | 10/12 (dos con viñetas) |
+| prompt | 2128 tokens (máx 2438) | 2362 (máx 2803) |
+| prellenado | 0,43 s | 0,42 s |
+| tokens generados por pasada | **430** | **49** |
+| razonamiento oculto por pasada | **1672 caracteres** | 0 |
+| velocidad | 32,3 tok/s | 33,2 tok/s |
+| pregunta entera (dos pasadas) | **33,6 s** | **5,0 s** |
+
+La velocidad es la misma y el prellenado también: todo el minuto era
+razonamiento que no llega a la voz. El sufijo `/no_think` del puente ya no lo
+respeta, y `think: false` lo apaga de bloque pero el modelo se pone a razonar
+en inglés **dentro de la respuesta** (6 de 6 variantes probadas), que es peor.
+El instruct es el arreglo. Las dos respuestas con viñetas las deja limpias la
+guardia de `narrador.sin_marcas_de_lista`, así que en la voz no se oyen.
+
+Descartado de paso, medido:
+
+- **Recortar el prompt** (sistema, esquemas): el prellenado es 0,4 s de 5.
+- **Subir `num_ctx`**: Ollama carga aquí con 8192 y ocho turnos de historial
+  son 2967 tokens. El `prompt_eval_count` sale idéntico con 8192 y con 16384, y
+  una escritura pedida tras ocho turnos sigue llamando a `enviar_correo`.
+- **Compuerta y respuesta con modelos distintos**: salen a la vez; con
+  `qwen3:4b` de compuerta Ollama tiene los dos cargados (~3,5 GB más) y la
+  primera pregunta paga 9-10 s de carga. Con el instruct en las dos, la
+  compuerta acierta igual (24/24 en la batería de `escucha_fidelidad.py`,
+  0,50 s frente a 0,64) y no hay carga. Es el defecto de `--compuerta`.
+
+Para usarlo de principal: `ASISTENTE_MODELO=qwen3:4b-instruct` (y
+`ollama pull qwen3:4b-instruct`).
+
 El primer sonido **no se mueve** —1,2 s, el relleno— mientras el primer PCM se
 va de 2 s a 40-75. Es exactamente para lo que están los rellenos: con un modelo
 que tarda un minuto en pensar, lo único que evita el silencio es la coletilla
