@@ -25,6 +25,10 @@ channel*), salvo donde se indique otra cosa.
 | 3 | Motor OpenVINO (grafos compilados) | **1,09** | 2,00× | el decodificador acústico deja de despachar desde Python |
 | 4 | Reescribir las convoluciones *depthwise* | **0,75** | 1,45× | torch no trae kernel optimizado; se vectoriza a mano |
 | 5 | Solapar el decodificador acústico | **0,59**¹ | 1,26× | el decodificador es un sumidero: no realimenta el bucle |
+| 7 | Subidas del decodificador sin convolución traspuesta (OpenVINO, VM) | **0,98**² | 1,1-1,3× | con k = 2s son un producto de matrices; ver [el detalle](#7--las-subidas-del-decodificador-sin-convolución-traspuesta--el-mismo-cálculo-un-tercio-del-tiempo) |
+
+² Motor OpenVINO en la VM de producción, desde RTF 1,13-1,29 con el decodificador anterior. En la VM
+el solapado (5) no se usa: con OpenVINO empeora.
 
 ¹ Medido en un **Apple M4**, no en el i7 del banco: es el paso que falta por
 confirmar en la VM. Los cuatro anteriores sí son del i7. Ver
@@ -257,6 +261,72 @@ páginas del `mmap` del modelo, no coste del solapamiento.
 ```bash
 VIBEVOICE_SOLAPAR_DECODER=0 python pkgs/vibevoice-cli/voz_stream.py
 ```
+
+</details>
+
+<details>
+<summary><b>7 · Las subidas del decodificador sin convolución traspuesta</b> — el mismo cálculo, un tercio del tiempo</summary>
+
+<br>
+
+**El hallazgo, con el perfilador y no a ojo.** `PERF_COUNT` de OpenVINO sobre el IR de producción
+(i7-8700T, 6 hilos): el decodificador tarda 57 ms por llamada y **31 ms son las seis
+convoluciones traspuestas** de las subidas, en `jit_gemm_f32`; solo `subidas.0` son 16,7 ms. El LM y
+la cabeza, en cambio, ya van por `brgemm_avx2` en un 89-95 %: por ahí no queda nada.
+
+**Por qué sobraba.** `SubidaTr` hacía la traspuesta sobre la ventana entera — las k-1 entradas del
+estado más las T nuevas — y se quedaba con las T·s muestras del final: en `subidas.0` entran 16,
+salen 136 y se usan 8. Con k = 2s cada muestra de salida suma exactamente **dos** entradas, la suya y
+la anterior, así que basta con las últimas T+1. Y cada entrada aporta un bloque de k muestras que es
+un producto de matrices: pesos `[C_in, C_out, k]` → matriz `[C_out·k, C_in]`, y el tramo j de salida
+es la mitad izquierda del bloque j más la derecha del j-1.
+
+Solo recortar la ventana **no gana** en OpenVINO (31,8 → 28,0 ms): la traspuesta sigue en `jit_gemm`.
+El producto de matrices sí, porque cae en `brgemm`:
+
+| subida | traspuesta | producto de matrices |
+|---|---|---|
+| `subidas.0` 2048→1024 ×8 | 23,7 ms | **4,9 ms** |
+| las seis | 31,8 ms | **10,1 ms** |
+
+**Es el mismo cálculo.** En torch con los pesos reales, 40 fotogramas encadenados: 122,7 dB de SNR
+frente al original (diferencia máxima 7e-7). En OpenVINO, fp16 nuevo frente a fp16 viejo por el
+camino del servicio: **119,9 dB**. Y como el int8 ya comprimía las traspuestas (sus pesos iban en
+`u8`), la puerta se mide contra el fp16 y no contra el int8 viejo: los dos int8 quedan a **16,9 dB**
+del fp16, el viejo y el nuevo, con las subidas en `u8` o en fp16. Ese error lo pone la cuantización
+de las FFN y es el mismo antes y después.
+
+**La trampa, que costó cinco bisecciones.** El primer IR sonaba parecido pero mal: −2,9 dB, el mismo
+espectro (0,97) y desplazado. No era la matemática ni la conversión: **el estado de OpenVINO sobre este
+grafo, en cuanto pasa por fichero, realimenta mal.** Medido frente a torch:
+
+| camino | SNR |
+|---|---|
+| convertido y `make_stateful` en memoria | 118 dB |
+| guardado con estado (fp16 o float32) y releído | −2,9 dB |
+| guardado sin estado, `make_stateful` al releer (por nombre o por posición) | −2,9 dB |
+| guardado sin estado, estado **explícito** como entradas y salidas | **71 dB**, lo mismo que el viejo |
+
+La causa no está identificada — los nombres y el emparejamiento de los 34 estados salen idénticos al
+releer —. El IR nuevo (`decoder_mm_*`) va **sin estado** y `motor.AcusticoOV` lleva las 34 colas en
+Python: copiar 711 KB por llamada. Dos corrientes intercaladas cada 10 fotogramas salen bit a bit
+iguales que a solas. Dos pistas que no eran: precalcular la matriz de pesos fuera del grafo (sale el
+mismo IR, la constante se pliega) y emparejar el estado por posición.
+
+**De extremo a extremo, en producción** (VM voz, desplegado con Nix, 8 frases × 2 rondas, semilla
+101, `/crono` del propio servicio):
+
+| | antes | después |
+|---|---|---|
+| RTF global | 1,288 | **0,983** |
+| decodificador acústico | 76,3 ms/fotograma | **41,3 ms** |
+| LM · cabeza · resto | 43,3 · 15,6 · 11,3 | 43,1 · 15,9 · 11,1 |
+| duración de cada frase | — | **idéntica** en las 8 |
+| SNR después frente a antes | — | 37-38 dB (el ruido del int8, el mismo que dio la puerta) |
+
+Ese «antes» cayó en el extremo lento de la base: en pasadas alternadas en la misma VM la base iba de
+1,13 a 1,27 y el decodificador nuevo de 1,02 a 1,06. **Un 10-24 % menos de RTF, y por primera vez por
+debajo de tiempo real en esta VM.**
 
 </details>
 
@@ -532,7 +602,7 @@ curl -s -X POST http://voz:8082/tts/stream -d '{"texto":"Vale.","recorte_entrada
 perdido.
 
 <details>
-<summary><b>Descartado por medición</b> — nueve callejones sin salida</summary>
+<summary><b>Descartado por medición</b> — los callejones sin salida</summary>
 
 <br>
 
@@ -552,6 +622,8 @@ perdido.
 | **Acelerar el WSOLA de `estirar.py`** | es un bucle en Python puro | cuesta **0,01 s por segundo de audio**. No es cuello |
 | **Redondear en vez de truncar al pasar a PCM16** | 0,5 LSB de error frente a 0,25 | sin sesgo DC y a −96 dBFS: inaudible |
 | **8 o 10 pasos de difusión en vez de 6** | con 6 la última evaluación de la red cae en t=166 y el solver salta a cero; con 8 es t=125 y con 10 t=100, y el coste es pequeño | **medido con umbral fijado de antemano y no lo pasa**: ver la tabla de abajo. 8 sube el UTMOS +0,046 de media (se pedía +0,10) en 22 de 36 clips (se pedían 24) y mete una alucinación (WER 211 %); 10 lo baja. Se queda en 6 |
+| **Ajustes de hilos de OpenVINO y torch** (13-09-2026) | `/crono` daba 20-22 ms por pasada de LM dentro del servicio frente a 13,4 aislado, y OpenVINO 2025.4 trae `ENABLE_CPU_PINNING` activado | **nada que medir por encima del ruido, y el audio sale igual bit a bit en todos** (16/16 md5). Banco de 8 frases × 2 rondas en la VM, alternando con la base: base 1,131 / 1,154 / 1,270 · `ENABLE_CPU_PINNING=false` 1,289 · `OMP_WAIT_POLICY=PASSIVE` 1,128 · los dos 1,147 · torch a 2 hilos 1,195 · `CPU_DENORMALS_OPTIMIZATION` 1,137. Y en un microbanco del bucle de un fotograma, 107-127 ms en todas las variantes (un `ov.Core` compartido, sin torch, pasivo). Las tres bases se separan más que cualquier variante de su base |
+| **Buscar capas en implementación de referencia** | fue lo que destapó las depthwise en torch (106×) | con `PERF_COUNT`, el LM y la cabeza van por `brgemm_avx2` en un 89-95 %; lo que está en `ref` suma 1,2-1,7 ms por llamada. Donde sí había que mirar era el decodificador: ver la subida sin convolución traspuesta |
 
 **8 y 10 pasos, la tabla.** Banco emparejado en la VM (openvino, `sp-Spk1_man`, cfg 3,0, las 6 frases
 de `fidelidad.py` × las semillas 11, 7, 3, 23, 42 y 101, mismas semillas en los tres bancos; whisper

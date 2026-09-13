@@ -19,15 +19,15 @@ memoria: leer sus pesos a los 17,2 GB/s medidos costaria 20-40 ms, y tardaba
 165. Esos ~130 ms sobrantes eran despacho de Python sobre decenas de
 convoluciones pequenas, y eso es justo lo que elimina un grafo compilado.
 
-DONDE VA EL TIEMPO HOY (GET /crono en voz_stream.py, 684 fotogramas de una
-tanda real, sin solapar y con 6 hilos; un fotograma son 133,3 ms de audio):
+DONDE VA EL TIEMPO HOY (GET /crono de produccion, 13-09-2026, 1008 fotogramas,
+sin solapar y con 6 hilos; un fotograma son 133,3 ms de audio):
 
-    tts_lm      42,1 ms/fotograma  (34%)   2,11 pasadas de 20,0 ms
-    acustico    55,6 ms            (45%)   1 pasada
-    cabeza      15,6 ms            (13%)   6 pasadas de 2,60 ms
-    resto       10,2 ms             (8%)   torch, conector, EOS, Python
+    tts_lm      43,1 ms/fotograma  (39%)   2,11 pasadas de ~20 ms
+    acustico    41,3 ms            (37%)   1 pasada (antes 55,6-76,3: ver SubidaTr)
+    cabeza      15,9 ms            (14%)   6 pasadas de 2,6 ms
+    resto       11,1 ms            (10%)   torch, conector, EOS, Python
     -------------------------------------
-    generate   123,6 ms                    RTF 0,99
+    generate   111,4 ms                    RTF 0,98 de extremo a extremo
 
 Las 2,11 pasadas de backbone por fotograma no son un error de cuenta: el
 bucle de Microsoft evalua el backbone DOS VECES, con el contexto real y con

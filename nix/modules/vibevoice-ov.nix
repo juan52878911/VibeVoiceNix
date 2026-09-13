@@ -121,8 +121,13 @@ in
       type = lib.types.enum [ "int8" "int4" "fp16" ];
       default = "int8";
       description = ''
-        Compresion del decodificador acustico, que es la pieza mas cara del
-        bucle: 55,6 de los 123,6 ms que cuesta un fotograma (45 %).
+        Compresion del decodificador acustico. Era la pieza mas cara del bucle
+        (55,6-76,3 ms de un fotograma); desde que las subidas son productos de
+        matrices (decoder_mm_*, ver SubidaTr) cuesta 41,3 ms en la VM y el RTF
+        de produccion baja de 1,29 a 0,98. Las cifras de abajo son del
+        decodificador anterior y valen como comparacion entre precisiones; el
+        int8 nuevo queda del fp16 exactamente igual de lejos que el viejo
+        (16,9 dB por el camino del servicio).
 
         MEDIDO en la VM, banco de 12 clips con semilla fija, sin solapar y con
         6 hilos, y 24 clips mas para la calidad:
