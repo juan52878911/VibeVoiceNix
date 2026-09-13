@@ -364,6 +364,8 @@ in
         VIBEVOICE_IR_CABEZA = "${ov.directorioIR}/cabeza_${ov.precisionCabeza}.xml";
         VIBEVOICE_IR_ACUSTICO =
           "${ov.directorioIR}/decoder_mm_${ov.precisionAcustico}.xml";
+        VIBEVOICE_IR_DIFUSION =
+          "${ov.directorioIR}/difusion_p${toString vv.pasosDifusion}_int8.xml";
       }
       # El anclaje a nucleos acelera PyTorch un 3% pero RALENTIZA OpenVINO un
       # 118% (medido: 89 ms/llamada sin anclaje, 195 con el). El mismo ajuste,

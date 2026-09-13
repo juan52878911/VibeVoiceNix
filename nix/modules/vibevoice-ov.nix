@@ -41,6 +41,7 @@ let
       export VIBEVOICE_IR="$destino"
       export VIBEVOICE_MODELO="${pesos.modelo}"
       export HF_HUB_OFFLINE=1
+      export VIBEVOICE_PASOS="${toString vv.pasosDifusion}"
       # SIN anclaje de nucleos: ralentiza OpenVINO un 118% (medido).
       ${lib.optionalString (vv.hilos != 0)
         ''export OMP_NUM_THREADS="${toString vv.hilos}"''}
@@ -57,7 +58,10 @@ let
       # que ya los tenia no repite ninguno.
       #   convertir_decoder 2  subidas sin convolucion traspuesta
       #                        y sin estado en el IR (decoder_mm_*; ver SubidaTr)
-      for entrada in convertir_lm_estado:1 convertir_cabeza:1 convertir_decoder:2; do
+      #   convertir_difusion   el bucle de difusion entero en un grafo; el grafo es de
+      #                        unos pasos concretos, asi que la version SON los pasos
+      for entrada in convertir_lm_estado:1 convertir_cabeza:1 convertir_decoder:2 \
+                     "convertir_difusion:p${toString vv.pasosDifusion}"; do
         paso="''${entrada%%:*}"
         version="''${entrada##*:}"
         if [ "$version" = 1 ]; then

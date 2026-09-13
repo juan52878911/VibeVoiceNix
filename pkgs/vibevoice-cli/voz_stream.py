@@ -215,6 +215,10 @@ OV_CODIGO = os.environ.get("VIBEVOICE_OV_CODIGO", "")
 IR_LM = os.environ.get("VIBEVOICE_IR_LM", "")
 IR_CABEZA = os.environ.get("VIBEVOICE_IR_CABEZA", "")
 IR_ACUSTICO = os.environ.get("VIBEVOICE_IR_ACUSTICO", "")
+# El bucle de difusion entero en un grafo (pkgs/vibevoice-ov/convertir_difusion.py). Opcional:
+# si no esta, o los pasos pedidos no son los suyos, se hace paso a paso como siempre.
+IR_DIFUSION = os.environ.get("VIBEVOICE_IR_DIFUSION", "")
+_DIFUSION = {"bucle": None}
 # Cuanto se frena la extrapolacion de la guia (0 = nada, 1 = del todo). Ver
 # frenar_guia(): sin esto, una locucion larga con cfg alto se desboca de
 # volumen hasta recortar. El defecto se midio ahi.
@@ -254,8 +258,10 @@ RITMO = 24_000  # Hz de salida del modelo
 # Se anuncia al cliente en X-RTF-Esperado para que elija su politica de bufer.
 # En GPU no hay medida propia: se deja la de CPU, que sobreestima. Equivocarse
 # por arriba solo hace que el cliente reserve mas bufer del necesario; por
-# abajo le cortaria el audio a mitad.
-RTF_MEDIDO = 1.1 if MOTOR == "openvino" else 2.2
+# abajo le cortaria el audio a mitad. OpenVINO en la VM mide 0,92-0,98 desde las
+# subidas del decodificador como productos de matrices (13-09-2026; era 1,09):
+# 1,0 deja el margen de siempre sin anunciar mas de lo que tarda.
+RTF_MEDIDO = 1.0 if MOTOR == "openvino" else 2.2
 
 _estado: dict = {}
 # Un candado: UNA generacion a la vez. El modelo ya satura los 6 nucleos, asi
@@ -657,6 +663,13 @@ def cargar_modelo():
                 neg_cada=NEG_CADA,
             )
             marcar_rama_condicional(modelo)
+            if IR_DIFUSION and Path(IR_DIFUSION).exists() and FRENO_GUIA > 0:
+                from motor import DifusionOV
+                _DIFUSION["bucle"] = DifusionOV(IR_DIFUSION, HILOS)
+                print(f"[arranque] difusion en un grafo: {Path(IR_DIFUSION).name} "
+                      f"({_DIFUSION['bucle'].pasos} pasos)", flush=True)
+            elif IR_DIFUSION:
+                print(f"[aviso] no esta {IR_DIFUSION}: difusion paso a paso", flush=True)
             # El freno tambien aqui: sample_speech_tokens sigue siendo la de
             # torch con este motor (solo cambian los grafos que llama), y la
             # rampa de volumen se midio en LOS DOS motores.
@@ -835,6 +848,17 @@ def frenar_guia(modelo, freno: float = None) -> None:
 
     @torch.no_grad()
     def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
+        bucle = _DIFUSION["bucle"]
+        if bucle is not None and bucle.pasos == self.ddpm_inference_steps:
+            # EL MISMO BUCLE EN UNA LLAMADA (convertir_difusion.py): los pasos de
+            # la cabeza, la guia, este freno y el solver. El ruido sale del mismo
+            # torch.randn y con la misma forma, asi que la semilla consume igual.
+            # En torch fp32 el bucle convertido da diferencia 0,0 frente a este;
+            # en int8, 67,9 dB. 19,8 -> 13,9 ms por fotograma, medido en la VM.
+            condition = torch.cat([condition, neg_condition], dim=0)
+            speech = torch.randn(condition.shape[0],
+                                 self.config.acoustic_vae_dim).to(condition)
+            return bucle(condition, speech, cfg_scale, fi)
         self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
         condition = torch.cat([condition, neg_condition], dim=0).to(
             self.model.prediction_head.device)
@@ -3443,7 +3467,9 @@ def health() -> dict:
         # despliegue exige leer la unidad de systemd y creerse que nadie ha
         # dejado un drop-in por medio.
         "ir": {"lm": Path(IR_LM).name, "cabeza": Path(IR_CABEZA).name,
-               "acustico": Path(IR_ACUSTICO).name} if MOTOR == "openvino" else {},
+               "acustico": Path(IR_ACUSTICO).name,
+               "difusion": Path(IR_DIFUSION).name if _DIFUSION["bucle"] else None}
+              if MOTOR == "openvino" else {},
         "hilos": {"total": HILOS, "decoder": HILOS_DECODER,
                   "solapado": SOLAPAR_DECODER},
         "neg_cada": NEG_CADA,

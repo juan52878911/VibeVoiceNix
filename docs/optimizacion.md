@@ -25,7 +25,10 @@ channel*), salvo donde se indique otra cosa.
 | 3 | Motor OpenVINO (grafos compilados) | **1,09** | 2,00× | el decodificador acústico deja de despachar desde Python |
 | 4 | Reescribir las convoluciones *depthwise* | **0,75** | 1,45× | torch no trae kernel optimizado; se vectoriza a mano |
 | 5 | Solapar el decodificador acústico | **0,59**¹ | 1,26× | el decodificador es un sumidero: no realimenta el bucle |
+| 8 | El bucle de difusión entero en un grafo (OpenVINO, VM) | **0,885**³ | 1,06× | 6 pasos de cabeza + guía + freno + solver en una llamada; ver [el detalle](#8--el-bucle-de-difusión-en-un-grafo--seis-llamadas-y-el-solver-en-una) |
 | 7 | Subidas del decodificador sin convolución traspuesta (OpenVINO, VM) | **0,98**² | 1,1-1,3× | con k = 2s son un producto de matrices; ver [el detalle](#7--las-subidas-del-decodificador-sin-convolución-traspuesta--el-mismo-cálculo-un-tercio-del-tiempo) |
+
+³ Mediana del banco A/B de 238 clips, frente a 0,941 con la difusión paso a paso en el mismo banco.
 
 ² Motor OpenVINO en la VM de producción, desde RTF 1,13-1,29 con el decodificador anterior. En la VM
 el solapado (5) no se usa: con OpenVINO empeora.
@@ -357,6 +360,51 @@ Y el int4, que la tabla de `precisionAcustico` ya daba por cambio de timbre, **q
 números**: menos naturalidad, el recorrido tonal más plano y 16 clips que ni duran lo mismo — el recorte
 de silencio y la cola se deciden sobre el audio, así que al cambiar la amplitud se mueven —, por un 2 %
 de RTF.
+
+</details>
+
+<details>
+<summary><b>8 · El bucle de difusión en un grafo</b> — seis llamadas y el solver, en una</summary>
+
+<br>
+
+**Donde estaba.** Por cada fotograma, `sample_speech_tokens` hacía 6 llamadas a la cabeza de difusión y,
+entre cada dos, en torch: la guía (cfg), el freno de guía y un paso del solver DPM. Dentro del servicio
+cada llamada costaba 2,6 ms frente a 1,9 aislada, y el solver aparecía en el muestreador de pila.
+
+**Por qué se puede trazar.** Con los pasos fijos, lo que el solver hace en Python — índice del paso,
+primer orden al principio y al final, segundo orden en medio — es aritmética sobre constantes. El bucle
+entero cabe en un grafo: entradas `condition` [2,896], `speech` [2,64] (el ruido, que sigue saliendo de
+`torch.randn` con la misma forma, así que la semilla consume igual), `cfg_scale` y `freno`; salida el
+latente. `pkgs/vibevoice-ov/convertir_difusion.py`, int8 con la misma receta que la cabeza, y los pasos
+en el nombre del fichero (`difusion_p6_int8.xml`): con otros pasos `voz_stream.py` sigue paso a paso.
+
+| | paso a paso | un grafo |
+|---|---|---|
+| bucle de un fotograma, aislado | 19,8 ms | **13,9 ms** |
+| `generate` por fotograma, dentro del servicio (`/crono`) | 107,7 ms | **102,9 ms** |
+| `resto` (Python) por fotograma | 11,2 ms | **6,6 ms** |
+| paridad en torch fp32 | — | **0,0** |
+| int8 frente al camino de siempre, un fotograma | — | 67,9 dB |
+
+**Lo que cambia de verdad, y por qué hizo falta el banco.** A diferencia del decodificador, **este latente
+vuelve al LM**: un redondeo distinto hace que la locución tome otro camino igual de válido. 27 de 238
+clips cambian de duración, así que las medidas fotograma a fotograma no dicen nada aquí. Se juzgó con el
+banco A/B (238 parejas contra producción, whisper large-v3) y un criterio **escrito antes de ver un
+número**:
+
+| criterio | exigido | medido |
+|---|---|---|
+| WER, IC superior | ≤ +0,5 pts | **+0,405** (media −0,62: 3,84 → 3,21 %) |
+| UTMOS, IC inferior | ≥ −0,02 | **−0,012** (media −0,002) |
+| identidad, global y por clon | ±0,005 | +0,000 · andrés +0,0003 · isis −0,0023 · juan −0,0011 · santiago −0,0007 |
+| tono medio / recorrido | ±0,05 st o IC con el 0 | −0,023 [−0,091, +0,044] / +0,003 [−0,063, +0,073] |
+| final del habla / velocidad | ±20 ms / ±0,05 pal/s | +0,7 ms / +0,003 |
+| **RTF (mediana del banco)** | — | **0,941 → 0,885** |
+
+Lo que el criterio no cubría y se ve: **las pausas internas crecen un poco**, +0,06 por clip y +15 ms
+de duración [IC +3, +29]. Y las transcripciones que cambian (13 de 238) van en los dos sentidos: donde la
+difusión paso a paso sacaba «No, no, no, que es el olvido» la nueva dice «Vale, ahora mismo lo miro».
 
 </details>
 

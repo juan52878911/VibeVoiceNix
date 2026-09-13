@@ -246,6 +246,37 @@ class CabezaOV(torch.nn.Module):
         return salida
 
 
+class DifusionOV:
+    """El bucle de difusion entero de un fotograma en UNA llamada (convertir_difusion.py).
+
+    Sustituye las `pasos` llamadas a CabezaOV y el solver en torch. Solo vale para los
+    pasos con los que se convirtio, que van en el nombre del fichero (difusion_p6_int8.xml):
+    con otros pasos voz_stream.py sigue por el camino de siempre. El ruido lo pone quien
+    llama, con torch.randn, para que la semilla consuma lo mismo que antes.
+    """
+
+    def __init__(self, ruta_xml, hilos):
+        import re
+        import openvino as ov
+        core = ov.Core()
+        self.comp = core.compile_model(ruta_xml, "CPU",
+                                       {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1,
+                                        "PERFORMANCE_HINT": "LATENCY"})
+        self.pet = self.comp.create_infer_request()
+        m = re.search(r"_p(\d+)_", ruta_xml)
+        self.pasos = int(m.group(1)) if m else None
+
+    def __call__(self, condition, speech, cfg_scale, freno):
+        ini = time.perf_counter()
+        res = self.pet.infer([condition.detach().float().numpy(), speech.detach().float().numpy(),
+                              np.array(cfg_scale, dtype=np.float32), np.array(freno, dtype=np.float32)],
+                             share_inputs=True, share_outputs=True)
+        salida = torch.from_numpy(np.array(res[self.comp.output(0)]))
+        CRONO["cabeza"][0] += time.perf_counter() - ini
+        CRONO["cabeza"][1] += 1
+        return salida
+
+
 class AcusticoOV:
     """Reemplazo de acoustic_tokenizer.decode: IR con estado, formas fijas.
 
