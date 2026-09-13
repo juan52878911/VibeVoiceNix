@@ -229,7 +229,7 @@ pkgs/vibevoice/.venv/bin/python scripts/herramientas.py llamar leer_correo filtr
 
 ---
 
-## Tres cosas que costaron caro (y no se ven en el resultado)
+## Cuatro cosas que costaron caro (y no se ven en el resultado)
 
 **El modelo deja de llamar a las herramientas al tercer turno.** Turno 1
 perfecto, turno 2 perfecto, turno 3 se inventa el estado del servidor. Y no es
@@ -258,6 +258,30 @@ instrucción decía «de preguntarle al usuario se encarga el sistema», y el
 modelo empezó a decirlo en voz alta: «el sistema está a punto de crear un
 recordatorio, ¿lo dejo?», sin llamar a nada. Ahora la instrucción solo dice qué
 hacer.
+
+**Una lista no se puede decir, y el prompt solo la evita casi siempre.** Los
+perfiles ya piden «nada de listas ni markdown» y con eso el modelo cumple
+—medido con `qwen3:4b`, **9 de 9** respuestas limpias en los casos que más
+invitan a enumerar—, pero un modelo pequeño se salta la instrucción de vez en
+cuando (unas **2 de cada 9** con un prompt que no lo pida), y entonces la marca
+llega hasta la voz. Lo que se oye no es solo un «uno punto»: el `\n` delante de
+cada punto dispara la parada de fin de locución del modelo y el texto degenera.
+Mismo contenido, mismas cifras, misma semilla:
+
+| | dura | lo que transcribe whisper |
+|---|---|---|
+| con la lista | 13,1 s | «…de los costes. **Mi niños si hay bien mayores**, **uno**, computó 41, **dos**, disco 12, **3**, respaldo 7…» |
+| sin ella | **8,8 s** | «…de los costes, cómputo 41, disco 12, respaldo 7, red 3.» |
+
+El guardia está en `narrador.sin_marcas_de_lista()`, y **el sitio se eligió
+midiendo**, no por gusto: por fragmento (que es donde vive `limpiar()`) limpia
+**0 de 1**, porque el modelo suelta `\n`, luego `-` y luego ` Lunes` y la marca
+completa no está en ninguna pieza; sobre el buffer antes de trocear, **4 de
+6**, porque al pasar los saltos a comas se destruye el ancla que la regla
+necesita; sobre la frase ya cortada, **6 de 6** y **0 de 44** frases normales
+tocadas. Las 44 son once trampas —«son las 16. Nos vemos», «el disco va al 30.
+Luego miro el resto», «el total son 41, 12 y 7»— pasadas por cuatro troceos
+distintos, incluido letra a letra.
 
 **Y con un modelo LOCAL no funcionaba nada de esto, hasta el 12-09-2026.** La
 conversación se construye entera en la forma de Anthropic —`content` como lista

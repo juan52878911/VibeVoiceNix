@@ -76,6 +76,51 @@ MINIMO_PRIMERA = 25
 # palabra.
 MAXIMO_SIN_CORTE = 320
 
+# LAS LISTAS NO SE DICEN: un "1." se lee "uno punto" y un guion suelto sale
+# como una pausa rara. La primera defensa es el prompt -- los perfiles piden
+# "nada de listas ni markdown" y con eso el modelo cumple (medido con qwen3:4b:
+# 9 de 9 respuestas limpias en los casos duros) --, pero un modelo pequeño se
+# salta la instruccion de vez en cuando, y entonces la marca llega hasta la
+# voz. Esto es el guardia.
+#
+# VA AQUI, SOBRE LA FRASE YA CORTADA, Y ESO SE MIDIO. Se probaron los otros dos
+# sitios:
+#
+#   por fragmento (donde vive limpiar())   0 de 1  -- el modelo suelta "\n",
+#       luego "-" y luego " Lunes": la marca completa no esta en ninguno
+#   sobre el buffer, antes de trocear      4 de 6  -- al pasar los saltos a
+#       comas se destruye el ancla que la propia regla necesita
+#   sobre la frase, aqui                   6 de 6, y 0 de 44 frases normales
+#       tocadas
+#
+# Las 44 son once frases trampa (entre ellas "son las 16. Nos vemos", "el disco
+# va al 30. Luego miro el resto" y "el total son 41, 12 y 7") pasadas por la
+# tuberia de cuatro maneras distintas de trocear, incluida letra a letra. La
+# regla solo actua al EMPEZAR la frase o justo despues de un salto de linea,
+# que es lo que la deja fuera de los falsos positivos.
+MARCA_LISTA = re.compile(r"(?:(?<=\n)|^)[ \t]*(?:[-*•·]|\d{1,2}[.)])[ \t]+")
+# Y el marcador que el troceador parte en dos: "…41\n2." queda al final de una
+# frase porque un numero con punto parece un fin de frase. Sin esto se colaba
+# un "dos punto" suelto (era el unico caso que resistia de los seis).
+MARCA_PARTIDA = re.compile(r"\n[ \t]*\d{1,2}[.)][ \t]*$")
+
+
+def sin_marcas_de_lista(frase: str) -> str:
+    """Quita las marcas de lista de una frase y deshace sus saltos de linea.
+
+    El salto NO es inocuo aunque no se oiga: el bloque RESPIRO de
+    voz_stream.py tiene medido que un "\\n" hace que el modelo ejecute su
+    parada de FIN DE LOCUCION, de duracion loca (0,2-3,2 s) y a precio
+    completo. Una lista de cinco puntos serian cinco de esas. Asi que el salto
+    se convierte en lo que se diria hablando: un espacio si ya hay puntuacion
+    delante, y una coma si no.
+    """
+    frase = MARCA_LISTA.sub("", frase)
+    frase = MARCA_PARTIDA.sub("", frase)
+    frase = re.sub(r"([.:;,!?…])[ \t]*\n+[ \t]*", r"\1 ", frase)
+    frase = re.sub(r"[ \t]*\n+[ \t]*", ", ", frase)
+    return frase.strip().strip(",").strip()
+
 
 def _punto_de_corte(texto: str, minimo: int, con_clausula: bool):
     """Indice donde cortar respetando el lenguaje, o None si aun no toca.
@@ -119,12 +164,14 @@ def trocear(texto: str, forzar_final: bool = False, primera: bool = False,
         corte = _punto_de_corte(resto, minimo, con_clausula=(primera and not trozos))
         if corte is None:
             break
-        trozo = resto[:corte].strip()
+        trozo = sin_marcas_de_lista(resto[:corte])
         resto = resto[corte:].lstrip()
         if trozo:
             trozos.append(trozo)
     if forzar_final and resto.strip():
-        trozos.append(resto.strip())
+        ultimo = sin_marcas_de_lista(resto)
+        if ultimo:
+            trozos.append(ultimo)
         resto = ""
     return trozos, resto
 
