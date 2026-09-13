@@ -328,6 +328,36 @@ Ese «antes» cayó en el extremo lento de la base: en pasadas alternadas en la 
 1,13 a 1,27 y el decodificador nuevo de 1,02 a 1,06. **Un 10-24 % menos de RTF, y por primera vez por
 debajo de tiempo real en esta VM.**
 
+**El banco exhaustivo** (`scripts/banco_ab.py`, 13-09-2026): 7 voces — los cuatro clones y tres de
+serie — × 17 frases (números, preguntas, exclamaciones, un párrafo de ~25 s) × 2 semillas, cfg 3,5,
+238 parejas generadas por el servicio de verdad, whisper **large-v3** para la transcripción y las marcas
+por palabra, UTMOS22, ECAPA y F0 fotograma a fotograma. Con un **control**: el mismo decodificador en
+int4, un cambio de timbre conocido. Si el banco no lo separa, no vale para concluir.
+
+| | nuevo frente a viejo | control int4 frente a viejo |
+|---|---|---|
+| RTF (238 clips) | 1,057 → **0,924** | → 0,906 |
+| mismo largo | **238/238** | 222/238 |
+| SNR, mediana | 38,9 dB | 18,7 dB |
+| MCD / LSD, medianas | **1,16 / 0,41 dB** | 12,17 / 2,91 dB |
+| coseno ECAPA con el clip base, mediana | **0,9999** | 0,9888 |
+| identidad contra la huella de la voz, diferencia [IC 95 %] | **−0,000 [−0,000, +0,000]** | −0,000 [−0,001, +0,001] |
+| desvío de F0 donde suenan las dos, mediana (p95) | **0 cents (6,7)** | 0 cents (50,4) |
+| recorrido tonal, diferencia [IC] | +0,004 [−0,008, +0,016] st | **−0,040 [−0,072, −0,010] st** |
+| final del habla, diferencia [IC] | −0,2 [−0,6, +0,2] ms | −6,8 [−11,6, −1,8] ms |
+| desfase por palabra (marcas de whisper) | 0 ms | 0 ms |
+| transcripción idéntica | 234/238 | 226/238 |
+| WER | 3,80 → 3,84 % | 3,80 → 3,46 % |
+| UTMOS, diferencia [IC] | −0,001 [−0,002, +0,000] | **−0,043 [−0,052, −0,035]** |
+
+Por voz, los clones no se separan de las de serie: MCD 1,14-1,21 dB, identidad igual a la cuarta cifra
+(andrés 0,7933 → 0,7927, juan 0,8105 → 0,8104) y UTMOS igual. Las cuatro transcripciones que cambian son
+titubeos de whisper sobre audio que mide lo mismo («Ahora» / «Jora», «Lo siento» / «Y lo siento»).
+Y el int4, que la tabla de `precisionAcustico` ya daba por cambio de timbre, **queda descartado con
+números**: menos naturalidad, el recorrido tonal más plano y 16 clips que ni duran lo mismo — el recorte
+de silencio y la cola se deciden sobre el audio, así que al cambiar la amplitud se mueven —, por un 2 %
+de RTF.
+
 </details>
 
 <details>
@@ -623,7 +653,11 @@ perdido.
 | **Redondear en vez de truncar al pasar a PCM16** | 0,5 LSB de error frente a 0,25 | sin sesgo DC y a −96 dBFS: inaudible |
 | **8 o 10 pasos de difusión en vez de 6** | con 6 la última evaluación de la red cae en t=166 y el solver salta a cero; con 8 es t=125 y con 10 t=100, y el coste es pequeño | **medido con umbral fijado de antemano y no lo pasa**: ver la tabla de abajo. 8 sube el UTMOS +0,046 de media (se pedía +0,10) en 22 de 36 clips (se pedían 24) y mete una alucinación (WER 211 %); 10 lo baja. Se queda en 6 |
 | **Ajustes de hilos de OpenVINO y torch** (13-09-2026) | `/crono` daba 20-22 ms por pasada de LM dentro del servicio frente a 13,4 aislado, y OpenVINO 2025.4 trae `ENABLE_CPU_PINNING` activado | **nada que medir por encima del ruido, y el audio sale igual bit a bit en todos** (16/16 md5). Banco de 8 frases × 2 rondas en la VM, alternando con la base: base 1,131 / 1,154 / 1,270 · `ENABLE_CPU_PINNING=false` 1,289 · `OMP_WAIT_POLICY=PASSIVE` 1,128 · los dos 1,147 · torch a 2 hilos 1,195 · `CPU_DENORMALS_OPTIMIZATION` 1,137. Y en un microbanco del bucle de un fotograma, 107-127 ms en todas las variantes (un `ov.Core` compartido, sin torch, pasivo). Las tres bases se separan más que cualquier variante de su base |
+| **El decodificador en int4** (medido con el banco exhaustivo, 13-09-2026) | 0,924 → 0,906 de RTF | UTMOS −0,043 [IC −0,052, −0,035], recorrido tonal −0,040 st, 16 de 238 clips con otro largo, 12 transcripciones distintas; ver la tabla de la subida sin convolución traspuesta. Un 2 % de RTF no lo paga |
 | **Buscar capas en implementación de referencia** | fue lo que destapó las depthwise en torch (106×) | con `PERF_COUNT`, el LM y la cabeza van por `brgemm_avx2` en un 89-95 %; lo que está en `ref` suma 1,2-1,7 ms por llamada. Donde sí había que mirar era el decodificador: ver la subida sin convolución traspuesta |
+| **Cuantización dinámica de activaciones y precisión de la caché KV** (`DYNAMIC_QUANTIZATION_GROUP_SIZE` 0/64/128, `KV_CACHE_PRECISION` f16/f32) | la caché KV del LM figuraba como `u8` y el LM se encarece con el contexto (13,7 ms/paso con 400 tokens, 18-21 con 1400) | **no se aplican en esta CPU**: en las 14 combinaciones, LM, cabeza y decodificador dan la salida **bit a bit igual** que la base y los tiempos quedan en el ruido. La KV no va cuantizada: esa propiedad solo actúa sobre la atención fusionada con caché, que aquí no existe (fila siguiente) |
+| **Fusionar la atención del LM con la caché KV** (`ScaledDotProductAttentionWithKVCache`) | copiaría la caché en su sitio en vez de concatenarla en cada paso y usaría un kernel de atención | **no hay nodo de atención en AVX2**: el plugin de CPU descompone incluso un modelo que es SOLO `scaled_dot_product_attention`, estático o dinámico, en `Subgraph` de MatMul+Softmax. Ni `enable_gqa`, ni GQA a mano, ni quitar la máscara cambian el grafo compilado (probado con un LM de juguete y paridad 1e-8). Es cosa del hardware (sin AVX-512 ni AMX) |
+| **Buscar el coste en Python** | `resto` son 11-13 ms por fotograma en `/crono` | con un muestreador de pila (cada 2 ms, 24.929 muestras en el banco de 8 frases): **el 88 % de `generate()` está dentro de `infer()`** de OpenVINO — LM 38,9 %, decodificador 35,2 %, cabeza 13,9 % —, y el 12 % de Python está repartido (conector en torch 1,7 %, solver DPM ~2 %, `sample_speech_tokens` ~2 %). No hay un punto caliente que rehacer |
 
 **8 y 10 pasos, la tabla.** Banco emparejado en la VM (openvino, `sp-Spk1_man`, cfg 3,0, las 6 frases
 de `fidelidad.py` × las semillas 11, 7, 3, 23, 42 y 101, mismas semillas en los tres bancos; whisper
