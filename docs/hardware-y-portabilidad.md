@@ -46,9 +46,11 @@ caja improvisada. **Total 250-550 €** y el resultado deja de ser un mini-PC de
 
 **No lo recomiendo para este proyecto**, y no por el dinero:
 
-1. **Ya no lo necesitas.** El objetivo era tiempo real, y OpenVINO llegó a
-   **RTF 1,09** en CPU. Con streaming, la espera es de 271 ms. La GPU
-   resolvería un problema que ya está resuelto.
+1. **Ya no lo necesitas.** El objetivo era tiempo real, y OpenVINO en CPU
+   está hoy **por debajo**: RTF 0,92-0,98 en la VM desde que las subidas del
+   decodificador son productos de matrices (13-09-2026; era 1,09 al llegar a
+   OpenVINO). Con streaming, la espera es de ~0,4 s. La GPU resolvería un
+   problema que ya está resuelto.
 2. **El cuello es el ancho de banda**, y lo hemos medido tres veces. Una GPU
    con VRAM propia sí lo rompe — pero también lo rompe, en parte, el segundo
    módulo de RAM, que cuesta 20 € en vez de 400.
@@ -172,7 +174,7 @@ whisper.cpp →  entender audios, con Metal
 
 Eso es un asistente de voz completo en **menos de 500 MB de RAM**, respondiendo
 en décimas de segundo. VibeVoice es el laboratorio: úsalo en el homelab, donde
-ya está a RTF 1,09 con streaming.
+ya está por debajo de tiempo real (RTF 0,92-0,98) con streaming.
 
 ### Qué haría falta en el repo
 

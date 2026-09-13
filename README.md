@@ -742,7 +742,7 @@ pico paso a paso, no leyendo el estado de salida.
 - [x] Voces y pesos con hash verificado contra los ficheros reales
 - [x] `voz-api` construye y sirve `/tts`, `/stt`, `/health`, `/voces` y la consola
 - [x] `vibevoice-env` construye y genera audio en español desde el store
-- [x] **VibeVoice en tiempo real**: RTF 0,75, primer sonido 0,20 s
+- [x] **VibeVoice en tiempo real**: RTF 0,75 en el M4 (torch), **0,92-0,98 en la VM** (i7-8700T, OpenVINO, sin GPU); primer sonido 0,20 s
 - [x] Streaming, túnel WireGuard, imágenes Docker y colección Bruno
 - [ ] Despliegue de punta a punta contra Proxmox
 

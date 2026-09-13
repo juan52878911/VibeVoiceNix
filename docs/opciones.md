@@ -178,11 +178,13 @@ elegido se imprime al arrancar:
 [arranque] 6 hilos de inferencia (6 nucleos fisicos utilizables)
 ```
 
-> **Y para aprovechar los hilos que sobran, no subas este número.** Lo que funciona es solapar etapas:
-> [`services.voz-stream.solaparDecodificador`](#servicesvoz-stream) corre el decodificador acústico a la
-> vez que el resto del bucle y baja el RTF un 21 % con el audio idéntico bit a bit. Una sola etapa ya
-> satura el bus; dos etapas distintas, no. Ver
-> [optimizacion.md](optimizacion.md#5--solapar-el-decodificador-acústico--las-dos-etapas-a-la-vez).
+> **Y para aprovechar los hilos que sobran, no subas este número.** En el motor **torch** lo que funciona
+> es solapar etapas: [`services.voz-stream.solaparDecodificador`](#servicesvoz-stream) corre el
+> decodificador acústico a la vez que el resto del bucle y baja el RTF un 21 % con el audio idéntico bit a
+> bit. **Con OpenVINO no**: ahí cada etapa ya usa la máquina entera y solapar sobresuscribe (RTF 1,011
+> solapado frente a 0,988 sin solapar, medido en la VM), así que viene apagado. Lo que sí bajó el RTF con
+> OpenVINO fue quitar trabajo al decodificador: ver
+> [optimizacion.md](optimizacion.md#7--las-subidas-del-decodificador-sin-convolución-traspuesta--el-mismo-cálculo-un-tercio-del-tiempo).
 
 Las dos se pueden pisar por llamada sin reconstruir el sistema:
 
@@ -214,7 +216,7 @@ Módulo: [`nix/modules/voz-stream.nix`](../nix/modules/voz-stream.nix).
 | `abrirCortafuegos` | `bool` | `false` | Abre el puerto en la LAN. Con el túnel activo no hace falta. |
 | `ficheroToken` | `nullOr path` | `null` | Igual que en `voz-api`: fuera del store. |
 | `vocesPropias` | `nullOr path` | `null` | Directorio de la máquina con prefijos `.pt` propios. Fuera del store. |
-| `solaparDecodificador` | `bool` | `true` | Corre el decodificador acústico **a la vez** que el bucle: −21 % de RTF. |
+| `solaparDecodificador` | `bool` | `true` con torch, **`false` con OpenVINO** | Corre el decodificador acústico **a la vez** que el bucle: −21 % de RTF en torch; con OpenVINO empeora y viene apagado. |
 | `hilosDecodificador` | `int` | `0` | Hilos para el decodificador solapado. 0 = la mitad de `hilos`. |
 | `semilla` | `nullOr int` | `null` | Semilla del ruido cuando el cliente no manda ninguna. `null` = sorteo por petición; un número hace el servicio determinista por defecto. `/health` la anuncia como `semilla_defecto`. **La VM `voz` lleva `101`**, la que ganó el banco de 18 semillas (0 % de WER frente al 40,7 % de la peor; tabla en [plan-determinismo-calidad.md](plan-determinismo-calidad.md)). |
 | `motor` | `enum` | `"vibevoice"` | Qué modelo hay detrás de :8082: `vibevoice` (lo medido) o `qwen3tts` (Qwen3-TTS-0.6B-Base con el motor C). Mismo contrato HTTP. |
@@ -260,8 +262,8 @@ Los prefijos se fabrican con [`scripts/clonar_voz.py`](../scripts/clonar_voz.py)
 VM** — ver [clonado-de-voz.md §7.9](clonado-de-voz.md). Se hacen en una estación de trabajo y aquí llega
 el `.pt`, de 2,6 a 8,4 MB.
 
-**`solaparDecodificador` es la palanca de RTF más reciente, y la forma correcta de usar los hilos que
-sobran.** El decodificador acústico se lleva el 42 % del tiempo y —comprobado leyendo el bucle de
+**`solaparDecodificador` es la forma correcta de usar los hilos que sobran en el motor torch** (con
+OpenVINO, ver arriba: viene apagado). El decodificador acústico se lleva el 42 % del tiempo y —comprobado leyendo el bucle de
 Microsoft— es un **sumidero**: su salida se guarda y se emite, pero no vuelve a entrar en el modelo, que
 se realimenta por `acoustic_connector(speech_latent)`. Así que no tiene por qué estar en el camino
 crítico. Medido (M4, mismo texto y semilla, **mismo md5 en las 20 pasadas**):
