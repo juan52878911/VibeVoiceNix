@@ -529,6 +529,11 @@ cada arranque, y de ahí salía la unidad `voz-stream-sin-swap`.
 | arranque (carga + calentamiento) | 22,4-25,5 s | **12,8-12,9 s** |
 | RTF, mediana de las rondas válidas | 0,9490 | 0,9435 (en el ruido) |
 
+**Desplegado el 14-09-2026** (`b67ee49`). En producción, voz-stream arranca con VmHWM **1867 MB** y
+0 de swap, el md5 de las 8 frases es el de antes y `ws_fidelidad.py` sale «todo correcto». Con el
+mismo despliegue, whisper pasa a 4 hilos con `Nice 10` y `CPUWeight 20`, después de comprobar que
+transcribe exactamente lo mismo que a 6 (8/8 frases).
+
 En el laboratorio (`scripts/lab_fase0.py carga`) el pico de la carga sola baja de 4321 a 1361 MB. De los
 ~1,35 GB que quedan, ~700 MB son el repack del decodificador int8 de OpenVINO (360 anónimos y 340 del
 mmap del IR).

@@ -189,6 +189,20 @@ Reparto por fotograma en las rondas válidas: igual en las dos, con LM TTS ~48 m
 decodificador ~37 ms y resto ~6,9 ms. La mejora del 0,6 % de RTF queda dentro del ruido y no se
 atribuye al cambio.
 
+### Fase 1 desplegada (14-09-2026, ~18:45)
+
+`scripts/desplegar_vm_voz.sh` con el commit `b67ee49` (`origin/main` `de927bd` + A1+A2+A4 + A5):
+`git archive` a la VM y `nixos-rebuild switch --flake path:…#voz`. Verificación en producción (M):
+
+| | medido |
+|---|---|
+| `motor.py` desplegado | = HEAD (`2a7b754b…`) |
+| VmHWM de voz-stream tras arrancar | **1867 MB**; tras el banco 1942 MB (antes 4326-4503) |
+| RSS / swap | 1818-1828 MB / **0** |
+| md5 de las 8 frases, 2 rondas, frente a la base del A/B | **idéntico en todo** |
+| `ws_fidelidad.py` completo | **todo correcto** |
+| RTF de la ronda válida | 0,9422 (base 0,9490) |
+
 ### Fase 1: A5, whisper a 4 hilos — PASA (14-09-2026, 18:30-18:38)
 
 `scripts/fase1_whisper.sh`:
