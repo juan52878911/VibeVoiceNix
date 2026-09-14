@@ -159,6 +159,8 @@ rec {
     # El estirado temporal (velocidad sin cambiar el tono). Va al lado porque
     # voz_stream.py lo importa por ruta, igual que prueba.html.
     cp ${../../pkgs/vibevoice-cli/estirar.py} "$out/bin/estirar.py"
+    # Las pausas por voz (forma), tambien importadas por ruta.
+    cp ${../../pkgs/vibevoice-cli/pausas.py} "$out/bin/pausas.py"
     chmod +x "$out/bin/vibevoice-cli.py" "$out/bin/voz-stream.py"
   '';
 }

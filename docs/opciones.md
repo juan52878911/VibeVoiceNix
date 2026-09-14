@@ -418,6 +418,7 @@ para depurar.
 | `VIBEVOICE_SOLAPAR_DECODER` | `0` desactiva el solapamiento del decodificador. Es el A/B de una línea |
 | `VIBEVOICE_HILOS_DECODER` | hilos del decodificador solapado; `0` = la mitad |
 | `VIBEVOICE_SEMILLA` | semilla por defecto del ruido; vacía = sorteo por petición. Es `services.voz-stream.semilla` |
+| `VIBEVOICE_FORMA` | `0` por defecto. Pausas de la persona (`forma`): cada pausa del modelo dura lo que las reales de esa voz, sin tocar ninguna muestra con voz; `1` lo activa para las peticiones que no digan nada, con el perfil de la ficha `<voz>.json`. Por petición: `forma` o `pausas` (ver docs/api.md) |
 | `VIBEVOICE_RECORTE_ENTRADA` | `0` devuelve el aire de antes de la primera palabra (0,27-0,40 s). También por petición, con `recorte_entrada` |
 
 ```bash

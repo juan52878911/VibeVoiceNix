@@ -409,3 +409,54 @@ O con el cliente del repo, sin dependencias:
 python scripts/nota_voz.py --voz juan "Llego en diez minutos, id pidiendo."            # nota.ogg
 python scripts/nota_voz.py --voz isis --formato mp3 --salida saludo.mp3 "Feliz cumple."
 ```
+
+---
+
+## Pausas de la persona en voz-stream (:8082): `forma`, `pausas` y la ficha de cada voz
+
+Cada pausa que el modelo ya hace pasa a durar lo que duran las pausas **reales** de esa persona. **No toca
+ninguna muestra con voz**, así que no puede comerse ni inventar palabras; meter pausas desde el texto sí
+lo hacía. Por eso es el ajuste de ritmo que quedó (`docs/plan-personalidad-voz.md`, fases 4-4c). Medido
+con 4 semillas nuevas: la velocidad por clip se acerca a la real (−0,215 sílabas/s, IC por debajo de 0),
+WER −0,07 puntos, UTMOS −0,004, ECAPA +0,007 y ninguna catástrofe.
+
+Va **por petición** y está apagado por defecto (`VIBEVOICE_FORMA=0`). Funciona igual en `/tts/stream`, en
+las sesiones HTTP y en el websocket.
+
+| Campo | En | Qué hace |
+|---|---|---|
+| `pausas: [segundos, ...]` | `/tts/stream`, `/tts/sesion/{id}`, `abrir` del websocket | Conforma con esa distribución. Es la forma de dobla: la mide en el vídeo y la manda, sin escribir nada en el servidor. |
+| `forma: true` | ídem | Usa el perfil guardado en la ficha de la voz. Si la voz no tiene perfil, responde **422**. |
+| `forma: false` | ídem | Apaga el ajuste aunque el servicio lo tenga activado por defecto. |
+
+- **No se combina** con `velocidad != 1`: responde 422, porque en la fase 4b estirar y conformar a la vez costó 0,14-0,25 de UTMOS.
+- **En las sesiones sustituye al respiro**, ya que los dos alargan pausas.
+- **Latencia:** la voz sale con como mucho 10 ms de retención. En silencio se retienen hasta 150 ms antes de decidir que es una pausa.
+
+```bash
+curl -X POST http://voz:8082/tts/stream -H "Authorization: Bearer $VOZ_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"texto":"Bueno, buenos días a todos. Hoy vamos a hablar de la operación.","voz":"carlos","semilla":3,
+       "pausas":[0.36,0.52,0.78,1.12]}' --output conformado.wav
+```
+
+### La ficha de cada voz
+
+`<voz>.json` va junto al `.pt`. Lo deja `clonar_voz.py` con techo, semilla del clon y fuentes. El perfil
+de pausas se añade con:
+
+```bash
+# desde clips sueltos de la persona (WAV a 24 kHz y mono)
+python scripts/perfil_pausas.py --ficha voces/carlos.json --audio a.wav --texto "..." --audio b.wav --texto "..."
+# desde un vídeo de dobla: la pista de voces separada y la anotación del editor
+python scripts/perfil_pausas.py --ficha voces/charla-h0.json --pista voces24k.wav --anotacion anotacion.json --hablante 0
+```
+
+| Endpoint | Qué devuelve o hace |
+|---|---|
+| `GET /voces?detalle=1` | Todas las voces con su ficha. Sin `detalle`, solo los nombres, como antes. |
+| `GET /voces/{nombre}` | La ficha y si la voz tiene perfil de `forma`. |
+| `POST /voces/{nombre}/pausas` | Mide y guarda el perfil. Acepta `{"audios": [WAV base64...], "textos": [...]}` o directamente `{"dist": [...]}`. |
+
+- **Dónde se puede escribir:** solo donde el directorio de voces es escribible, como en el contenedor de dobla. En la VM ese directorio es de enlaces y se rehace al arrancar: la respuesta avisa con `"persistente": false`. Allí la ficha va junto al `.pt` en `voces-propias`, y el módulo de Nix la enlaza.
+- **En `/health`**, el bloque `forma` indica el valor por defecto, la versión del detector y qué voces tienen perfil.

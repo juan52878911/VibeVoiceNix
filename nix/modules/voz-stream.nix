@@ -393,6 +393,12 @@ in
               ln -sf "$f" ${dirCombinado}/
               propias=$((propias + 1))
             done
+            # La ficha de cada voz (<voz>.json: techo, semilla, perfil de pausas
+            # de forma) va al lado de su .pt: voz_stream.ficha_voz la busca ahi.
+            for f in ${cfg.vocesPropias}/*.json; do
+              [ -e "$f" ] || continue
+              ln -sf "$f" ${dirCombinado}/
+            done
             echo "[voces] $propias propias sobre $(ls ${pesos.voces}/*.pt | wc -l) oficiales"
           '');
 

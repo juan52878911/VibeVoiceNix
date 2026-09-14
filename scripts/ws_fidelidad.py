@@ -96,9 +96,12 @@ def pedir(url, token, cuerpo=None, metodo=None, tiempo=600):
     return urllib.request.urlopen(pet, timeout=tiempo)
 
 
-def http_stream(url, token, texto, voz, cfg, semilla, pasos, neg_cada=None):
+def http_stream(url, token, texto, voz, cfg, semilla, pasos, neg_cada=None,
+                pausas=None):
     """/tts/stream de una vez. Se le quitan los 44 bytes de cabecera WAV."""
     cuerpo = {"texto": texto, "voz": voz, "cfg_scale": cfg, "semilla": semilla}
+    if pausas is not None:
+        cuerpo["pausas"] = pausas
     if pasos is not None:
         cuerpo["pasos"] = pasos
     if neg_cada is not None:
@@ -107,11 +110,13 @@ def http_stream(url, token, texto, voz, cfg, semilla, pasos, neg_cada=None):
 
 
 def http_sesion(url, token, nombre, frases, voz, cfg, semilla, pasos,
-                respiro=False):
+                respiro=False, pausas=None):
     """Sesion HTTP: se meten todas las frases y se escucha el WAV continuo."""
     import threading
     base = {"voz": voz, "cfg_scale": cfg, "semilla": semilla,
             "respiro": respiro}
+    if pausas is not None:
+        base["pausas"] = pausas
     if pasos is not None:
         base["pasos"] = pasos
     pcm = bytearray()
@@ -402,7 +407,7 @@ def main():
     ap.add_argument("--pasos", type=int, default=6)
     ap.add_argument("--pruebas",
                     default="fidelidad,eventos,concurrencia,pausa,pausa-stream,"
-                            "respiro,corte,errores,auth")
+                            "respiro,forma,corte,errores,auth")
     a = ap.parse_args()
     pruebas = a.pruebas.split(",")
     fallos = []
@@ -858,6 +863,53 @@ def main():
             print(f"  {'OK ' if ok else 'FALLO'} {etiqueta:12s} -> {salida}")
             if not ok:
                 fallos.append(f"auth {etiqueta}")
+
+    # ----------------------------------------------------------- forma --
+    # Las pausas de la persona (bloque FORMA de voz_stream.py). Su garantia es
+    # estructural: ni una muestra con voz cambia. Se comprueba sobre el audio
+    # del servidor con el mismo detector con el que conforma (pausas.py), y
+    # ademas que la sesion HTTP conforma igual que /tts/stream (mismo md5) y
+    # que pedir forma a una voz sin perfil da un 422 claro.
+    if "forma" in pruebas:
+        import numpy as np
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", "pkgs", "vibevoice-cli"))
+        import pausas as PZ
+        print("\n[forma]")
+        dist = [0.25, 0.45, 0.8]
+        texto = " ".join(FRASES)
+        base = http_stream(a.url, a.token, texto, a.voz, a.cfg, a.semilla, a.pasos)
+        conf = http_stream(a.url, a.token, texto, a.voz, a.cfg, a.semilla, a.pasos,
+                           pausas=dist)
+        ses = http_sesion(a.url, a.token, f"forma-{a.semilla}", FRASES, a.voz,
+                          a.cfg, a.semilla, a.pasos, pausas=dist)
+        a_float = lambda b: np.frombuffer(b, "<i2").astype(np.float32) / 32768
+        ok, detalle = PZ.tramos_identicos(a_float(base), a_float(conf))
+        n_pausas = len(PZ.rachas(a_float(base)))
+        print(f"  base {dur(base):5.2f} s ({n_pausas} pausas) · forma {dur(conf):5.2f} s "
+              f"· sesion {dur(ses):5.2f} s")
+        print(f"  {'OK ' if ok else 'FALLO'} tramos con voz: {detalle}")
+        if not ok:
+            fallos.append(f"forma: {detalle}")
+        cambia = n_pausas == 0 or len(base) != len(conf)
+        print(f"  {'OK ' if cambia else 'FALLO'} las pausas cambian de duracion")
+        if not cambia:
+            fallos.append("forma: el audio conformado dura lo mismo que la base")
+        igual = md5(ses) == md5(conf)
+        print(f"  {'OK ' if igual else 'FALLO'} sesion HTTP == /tts/stream con forma "
+              f"({md5(ses)} / {md5(conf)})")
+        if not igual:
+            fallos.append("forma: la sesion HTTP no conforma igual que /tts/stream")
+        try:
+            pedir(f"{a.url}/tts/stream", a.token,
+                  {"texto": "Hola.", "voz": a.voz, "forma": True}).read()
+            sin_perfil = "no dio error"
+        except urllib.error.HTTPError as e:
+            sin_perfil = f"HTTP {e.code}"
+        ok422 = sin_perfil == "HTTP 422"
+        print(f"  {'OK ' if ok422 else 'FALLO'} forma=true sin perfil -> {sin_perfil}")
+        if not ok422:
+            fallos.append(f"forma: sin perfil da {sin_perfil} y no 422")
 
     print("\n" + "=" * 70)
     if fallos:

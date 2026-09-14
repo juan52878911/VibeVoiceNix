@@ -82,6 +82,9 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+import base64
+import io
+import wave
 from typing import Literal, Optional
 
 import numpy as np
@@ -89,6 +92,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from estirar import estirar  # noqa: E402
+import pausas as PAUSAS  # noqa: E402
 import uvicorn
 from fastapi import (
     Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect,
@@ -1398,6 +1402,71 @@ def prefijo_voz(nombre: str):
     return _estado["prefijos"][nombre]
 
 
+# FORMA: LAS PAUSAS DE ESA PERSONA (pausas.py; docs/plan-personalidad-voz.md, 4b y 4c)
+#
+# Cada pausa que el modelo YA hace pasa a durar lo que duran las pausas reales de la
+# persona. No toca ni una muestra con voz (pausas.tramos_identicos lo comprueba), asi
+# que no puede comerse ni inventar palabras: meter pausas por el texto si lo hacia
+# ("\n" dispara el fin de locucion; los trozos cortos inventan). Medido con 4 semillas
+# nuevas (4c): la velocidad por clip se acerca a la real (-0,215 silabas/s, IC bajo 0),
+# WER -0,07 puntos, UTMOS -0,004, ECAPA +0,007 y cero catastrofes.
+#
+# La distribucion sale de <voz>.json -> "pausas": {"dist": [...]} (la escribe
+# scripts/perfil_pausas.py o POST /voces/{nombre}/pausas) o viene en la peticion
+# ("pausas": [segundos, ...]), que es lo que usa dobla para no escribir en el
+# directorio de voces. Apagado por defecto (VIBEVOICE_FORMA=0): encendido, el audio
+# deja de coincidir por md5 con el de las pruebas de fidelidad y respiro. Excluyente
+# con el respiro, porque los dos alargan pausas y se sumarian.
+FORMA_DEFECTO = os.environ.get("VIBEVOICE_FORMA", "0") not in ("0", "no", "")
+_FICHAS: dict = {}
+
+
+def ficha_voz(nombre: str) -> Optional[dict]:
+    """<voz>.json junto al .pt (lo deja clonar_voz.py), releido si cambia en disco."""
+    ruta = VOCES_DIR / f"{nombre}.json"
+    try:
+        marca = ruta.stat().st_mtime
+    except OSError:
+        return None
+    guardada = _FICHAS.get(nombre)
+    if guardada is None or guardada[0] != marca:
+        try:
+            _FICHAS[nombre] = (marca, json.loads(ruta.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return None
+    return _FICHAS[nombre][1]
+
+
+def distribucion_pausas(voz: str, forma: Optional[bool], pausas: Optional[list]) -> Optional[list]:
+    """La distribucion con la que conformar esta peticion, o None si no lleva forma."""
+    if pausas:
+        return [float(x) for x in pausas]
+    if not (FORMA_DEFECTO if forma is None else forma):
+        return None
+    dist = ((ficha_voz(voz) or {}).get("pausas") or {}).get("dist")
+    if dist:
+        return dist
+    if forma:
+        raise HTTPException(422, f"la voz '{voz}' no tiene perfil de pausas ({voz}.json -> "
+                                 f"pausas.dist): mandalo como 'pausas' en la peticion o "
+                                 f"crealo con POST /voces/{voz}/pausas")
+    return None   # forma por defecto del servicio y una voz sin perfil: la de siempre
+
+
+def conformador(dist: Optional[list], semilla: Optional[int]):
+    return PAUSAS.ConformadorPausas(dist, semilla or 0) if dist else None
+
+
+def _wav_pcm16(datos: bytes) -> np.ndarray:
+    try:
+        with wave.open(io.BytesIO(datos)) as w:
+            if w.getsampwidth() != 2 or w.getnchannels() != 1 or w.getframerate() != RITMO:
+                raise HTTPException(422, f"los audios tienen que ser WAV PCM16 mono a {RITMO} Hz")
+            return np.frombuffer(w.readframes(w.getnframes()), "<i2").astype(np.float32) / 32768
+    except (wave.Error, EOFError) as e:
+        raise HTTPException(422, f"audio que no es WAV: {e}")
+
+
 @asynccontextmanager
 async def ciclo_vida(app: FastAPI):
     _estado["prefijos"] = {}
@@ -1631,7 +1700,8 @@ class StreamerCancelable:
     cliente que se va dejaria la CPU 20 s generando audio para nadie.
     """
 
-    def __init__(self, cola_final: int = None, recorte_entrada: bool = None):
+    def __init__(self, cola_final: int = None, recorte_entrada: bool = None,
+                 forma=None):
         from vibevoice.modular import AsyncAudioStreamer
         self.interno = AsyncAudioStreamer(batch_size=1, stop_signal=None)
         self.cancelado = False
@@ -1644,6 +1714,8 @@ class StreamerCancelable:
         self.remate = RemateEOS(cola_final)
         # Y el aire de antes de la primera palabra, que no se emite.
         self.entrada = RecorteEntrada(recorte_entrada)
+        # Las pausas de la persona (bloque FORMA). None = el audio del modelo.
+        self.forma = forma
 
     def put(self, trozos, indices):
         # Solo aborta si el que se fue es el CLIENTE.
@@ -1666,6 +1738,10 @@ class StreamerCancelable:
             return
         if not self.entrada.deja_pasar(trozos[0]):
             return
+        if self.forma is not None:
+            for x in self.forma.empujar(trozos[0].detach().float().cpu().numpy()):
+                self.interno.put([torch.from_numpy(x).reshape(1, -1)], indices)
+            return
         self.interno.put(trozos, indices)
 
     def end(self, indices=None):
@@ -1676,6 +1752,10 @@ class StreamerCancelable:
         if self.remate.retener_cierre(indices):
             return
         self.terminado = True
+        if self.forma is not None:
+            # Lo que el conformador aun retiene es el silencio final: sale tal cual.
+            for x in self.forma.cerrar():
+                self.interno.put([torch.from_numpy(x).reshape(1, -1)], [0])
         # Si NADA sono, el recorte se lo habria comido todo: se devuelve un
         # fotograma para no cerrar con un WAV vacio.
         rescate = self.entrada.rescate()
@@ -2709,8 +2789,10 @@ class ColaAudioSesion:
     """
 
     def __init__(self, lazo, cola, texto=None, respiro=False, cola_final=None,
-                 recorte_entrada=None):
+                 recorte_entrada=None, forma=None):
         self.lazo, self.cola = lazo, cola
+        # Las pausas de la persona (bloque FORMA): si va puesto, el respiro no.
+        self.forma = forma
         # El TextoEnCurso de ESTA generate(): la fuente de la senal de
         # prorroga. Sin el (None) no se retiene nunca, put() como siempre.
         self.texto = texto
@@ -2765,6 +2847,10 @@ class ColaAudioSesion:
             if not self.entrada.deja_pasar(trozos[i]):
                 continue
             trozo = trozos[i].detach().float().cpu()
+            if self.forma is not None:
+                for x in self.forma.empujar(trozo.numpy()):
+                    self._emitir(torch.from_numpy(x).reshape(1, -1))
+                continue
             if not self.respiro:
                 self._emitir(trozo)
                 continue
@@ -2857,6 +2943,9 @@ class ColaAudioSesion:
         # cierra el end() sin indices con el que generate() sale del bucle.
         if self.remate.retener_cierre(indices):
             return
+        if self.forma is not None:
+            for x in self.forma.cerrar():
+                self._emitir(torch.from_numpy(x).reshape(1, -1))
         # Si NADA sono en toda la generate(), el recorte de entrada se lo comio
         # todo: se devuelve un fotograma para no cerrar en vacio.
         rescate = self.entrada.rescate()
@@ -2882,8 +2971,11 @@ class SesionViva:
 
     def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo,
                  respiro=True, cola_final=None, neg_cada=None,
-                 recorte_entrada=None):
+                 recorte_entrada=None, pausas=None):
         self.nombre = nombre
+        # Distribucion de pausas de la persona (bloque FORMA) o None. Cada
+        # generate() monta su propio conformador, igual que su cola.
+        self.pausas = pausas
         self.voz = voz
         self.cfg_scale = cfg_scale
         self.semilla = semilla
@@ -2898,7 +2990,7 @@ class SesionViva:
         # El respiro (pausa de verdad en cada punto; ver el bloque RESPIRO) es
         # por sesion Y por servicio: el campo `respiro` de la peticion manda,
         # pero VIBEVOICE_RESPIRO=0 lo apaga globalmente.
-        self.respiro = bool(respiro) and RESPIRO_ACTIVO
+        self.respiro = bool(respiro) and RESPIRO_ACTIVO and not pausas
         # Fotogramas de cola tras el EOS (bloque COLA FINAL). None = el defecto
         # del servicio; va por sesion para poder medir el antes y el despues
         # sin reiniciar nada, que es como se midio.
@@ -3220,7 +3312,8 @@ class SesionViva:
         audio = ColaAudioSesion(self.lazo, self.cola, texto=al,
                                 respiro=self.respiro,
                                 cola_final=self.cola_final,
-                                recorte_entrada=self.recorte_entrada)
+                                recorte_entrada=self.recorte_entrada,
+                                forma=conformador(self.pausas, self.semilla))
         with self._cond:
             # Bajo el candado y comprobando abortada: si el cliente se fue entre
             # que se armo la cola y que se registra, abortar() no la habria
@@ -3475,6 +3568,11 @@ class PeticionTTS(BaseModel):
     # con el mismo binario, que es como se midio.
     recorte_entrada: Optional[bool] = None
 
+    # Pausas de la persona (bloque FORMA). forma=True usa el perfil de <voz>.json;
+    # "pausas" manda la distribucion (segundos) en la propia peticion y la activa.
+    # None = VIBEVOICE_FORMA. Solo se mira al crear la locucion.
+    forma: Optional[bool] = None
+    pausas: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
     # Formato del audio que viaja (ver FORMATOS_AUDIO): wav, ogg (Opus, notas de
     # voz de WhatsApp) o mp3. Solo cambia la codificacion de salida, nunca lo
     # que genera el modelo.
@@ -3504,6 +3602,11 @@ class PeticionSesion(BaseModel):
     neg_cada: Optional[int] = Field(None, ge=1, le=6)
     # Recorte del aire de entrada, como en PeticionTTS. Solo al CREAR.
     recorte_entrada: Optional[bool] = None
+    # Pausas de la persona (bloque FORMA). forma=True usa el perfil de <voz>.json;
+    # "pausas" manda la distribucion (segundos) en la propia peticion y la activa.
+    # None = VIBEVOICE_FORMA. Solo se mira al crear la locucion.
+    forma: Optional[bool] = None
+    pausas: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
     # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
     fin: bool = False
 
@@ -3554,6 +3657,11 @@ def health() -> dict:
         # El aire de ANTES de la primera palabra, que tampoco se emite. Igual
         # que cola_final, va por las dos vias.
         "recorte_entrada": RECORTE_ENTRADA,
+        # Las pausas de la persona (bloque FORMA): por peticion, apagado si no se pide.
+        "forma": {"defecto": FORMA_DEFECTO, "detector": PAUSAS.VERSION,
+                  "voces_con_perfil": sorted(
+                      p.stem for p in VOCES_DIR.glob("*.json")
+                      if ((ficha_voz(p.stem) or {}).get("pausas") or {}).get("dist"))},
         "sesiones": {"activas": SESIONES_ACTIVAS,
                      "abiertas": sorted(_SESIONES),
                      "espera_texto_s": ESPERA_TEXTO,
@@ -3622,16 +3730,83 @@ def crono(reset: bool = True) -> dict:
 
 
 @app.get("/voces")
-def voces(_=Depends(autorizar)):
+def voces(detalle: bool = False, _=Depends(autorizar)):
     """Las voces instaladas. Sin esto el cliente tiene que adivinar nombres, y
     equivocarse solo se nota con un 404 a mitad de una peticion."""
-    return {"voces": sorted(p.stem for p in VOCES_DIR.glob("*.pt")),
+    nombres = sorted(p.stem for p in VOCES_DIR.glob("*.pt"))
+    if not detalle:
+        return {"voces": nombres, "defecto": VOZ_DEFECTO}
+    return {"voces": [{"nombre": n, "ficha": ficha_voz(n)} for n in nombres],
             "defecto": VOZ_DEFECTO}
+
+
+@app.get("/voces/{nombre}")
+def voz_detalle(nombre: str, _=Depends(autorizar)):
+    """La ficha de una voz (<voz>.json: techo, semilla del clon, fuentes, pausas)."""
+    if not (VOCES_DIR / f"{nombre}.pt").exists():
+        raise HTTPException(404, f"voz '{nombre}' no existe")
+    ficha = ficha_voz(nombre)
+    return {"nombre": nombre, "ficha": ficha,
+            "forma": bool(((ficha or {}).get("pausas") or {}).get("dist"))}
+
+
+class PeticionPausas(BaseModel):
+    """Perfil de pausas de una voz a partir de audio REAL de esa persona."""
+    # WAV PCM16 mono a 24 kHz, en base64, con sus transcripciones si se quieren
+    # tambien las silabas por segundo.
+    audios: Optional[list[str]] = Field(None, min_length=1, max_length=500)
+    textos: Optional[list[str]] = None
+    # O la distribucion ya medida con pausas.perfil (segundos).
+    dist: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
+
+
+@app.post("/voces/{nombre}/pausas")
+def voz_pausas(nombre: str, pet: PeticionPausas, _=Depends(autorizar)):
+    """Guarda en <voz>.json el perfil de pausas con el que forma conforma esa voz.
+
+    Solo sirve donde el directorio de voces se puede escribir (el contenedor de
+    dobla). En la VM es un directorio de enlaces que se rehace al arrancar: ahi
+    se avisa de que no es persistente, y lo bueno es mandar "pausas" en la
+    peticion o dejar la ficha junto al .pt en voces-propias."""
+    pt = VOCES_DIR / f"{nombre}.pt"
+    if not pt.exists():
+        raise HTTPException(404, f"voz '{nombre}' no existe")
+    if pet.dist:
+        perfil = {"dist": [float(x) for x in pet.dist], "n": len(pet.dist),
+                  "detector": "enviado"}
+    elif pet.audios:
+        clips = [_wav_pcm16(base64.b64decode(a)) for a in pet.audios]
+        if pet.textos is not None and len(pet.textos) != len(clips):
+            raise HTTPException(422, "hace falta un texto por audio")
+        try:
+            perfil = PAUSAS.perfil(clips, pet.textos)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+    else:
+        raise HTTPException(422, "manda 'audios' (WAV base64) o 'dist'")
+    ruta = VOCES_DIR / f"{nombre}.json"
+    ficha = dict(ficha_voz(nombre) or {})
+    ficha["pausas"] = perfil
+    try:
+        temporal = ruta.with_suffix(".json.tmp")
+        temporal.write_text(json.dumps(ficha, ensure_ascii=False, indent=1), encoding="utf-8")
+        temporal.replace(ruta)
+    except OSError as e:
+        raise HTTPException(409, f"no se puede escribir {ruta.name} ({e.strerror}): manda "
+                                 f"'pausas' en cada peticion o deja la ficha junto al .pt")
+    _FICHAS.pop(nombre, None)
+    return {"nombre": nombre, "persistente": pt.resolve().parent == VOCES_DIR.resolve(),
+            "pausas": {k: v for k, v in perfil.items() if k != "dist"},
+            "n_dist": len(perfil["dist"])}
 
 
 @app.post("/tts/stream")
 async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingResponse:
     prefijo_voz(pet.voz)  # valida ANTES de enviar cabeceras, para dar un 404 limpio
+    dist_pausas = distribucion_pausas(pet.voz, pet.forma, pet.pausas)
+    if dist_pausas and abs(pet.velocidad - 1.0) > 1e-3:
+        # Medido en la fase 4b: estirar ademas de conformar baja UTMOS 0,14-0,25.
+        raise HTTPException(422, "forma y velocidad no se combinan: pide una u otra")
     # La velocidad NO se hace remuestreando. Remuestrear mueve el tono junto
     # con la duracion, y a +-15% lo que se oye es "mas agudo", no "mas rapido".
     # Aqui se estira el tiempo de verdad (WSOLA, ver estirar.py) y el ritmo de
@@ -3643,7 +3818,8 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
         # El candado se toma DENTRO del generador: si hay otra sintesis en
         # curso, esta espera su turno sin bloquear el bucle de eventos.
         async with _candado:
-            streamer = StreamerCancelable(pet.cola_final, pet.recorte_entrada)
+            streamer = StreamerCancelable(pet.cola_final, pet.recorte_entrada,
+                                          forma=conformador(dist_pausas, pet.semilla))
             lazo = asyncio.get_running_loop()
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
@@ -3738,6 +3914,7 @@ async def sesion_texto(nombre: str, pet: PeticionSesion,
         raise HTTPException(503, "sesiones desactivadas (VIBEVOICE_SESIONES=0)")
     _caducar_sesiones()
     prefijo_voz(pet.voz or VOZ_DEFECTO)  # valida antes de montar nada
+    dist_pausas = distribucion_pausas(pet.voz or VOZ_DEFECTO, pet.forma, pet.pausas)
     s = _SESIONES.get(nombre)
     reabierta = s is not None and s.terminada
     if reabierta:
@@ -3749,7 +3926,8 @@ async def sesion_texto(nombre: str, pet: PeticionSesion,
                        pet.semilla, pet.pasos, asyncio.get_running_loop(),
                        respiro=pet.respiro, cola_final=pet.cola_final,
                        neg_cada=pet.neg_cada,
-                       recorte_entrada=pet.recorte_entrada)
+                       recorte_entrada=pet.recorte_entrada,
+                       pausas=dist_pausas)
         _SESIONES[nombre] = s
     elif pet.voz is not None and pet.voz != s.voz:
         raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
@@ -3922,6 +4100,11 @@ class AbrirSesionWS(BaseModel):
     neg_cada: Optional[int] = Field(None, ge=1, le=6)
     # Recorte del aire de entrada, como en PeticionTTS.
     recorte_entrada: Optional[bool] = None
+    # Pausas de la persona (bloque FORMA). forma=True usa el perfil de <voz>.json;
+    # "pausas" manda la distribucion (segundos) en la propia peticion y la activa.
+    # None = VIBEVOICE_FORMA. Solo se mira al crear la locucion.
+    forma: Optional[bool] = None
+    pausas: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
     # Aceptado solo para poder dar un error claro; ver el bloque VELOCIDAD.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
@@ -4137,6 +4320,7 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
         _caducar_sesiones()
         try:
             prefijo_voz(cfg.voz)   # valida antes de montar nada
+            dist_pausas = distribucion_pausas(cfg.voz, cfg.forma, cfg.pausas)
         except HTTPException as e:
             await evento(tipo="error", texto=str(e.detail))
             return
@@ -4148,7 +4332,8 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
         s = SesionViva(nombre, cfg.voz, cfg.cfg_scale, cfg.semilla, cfg.pasos,
                        lazo, respiro=cfg.respiro, cola_final=cfg.cola_final,
                        neg_cada=cfg.neg_cada,
-                       recorte_entrada=cfg.recorte_entrada)
+                       recorte_entrada=cfg.recorte_entrada,
+                       pausas=dist_pausas)
         # El audio ya sale por aqui: que GET /tts/sesion/{id}/audio no lo robe.
         s.escuchando = True
         _SESIONES[nombre] = s
