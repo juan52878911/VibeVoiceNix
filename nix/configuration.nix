@@ -101,7 +101,13 @@
     enable = true;
     modelo = "small";
     idioma = "es";
-    hilos = 6;
+    # 4 y no 6, con prioridad baja (plan de rendimiento, A5): voz-stream ya usa los 6
+    # nucleos fisicos y el paquete vive en su limite de 35 W, asi que un STT a la vez que
+    # una sintesis eran 12 hilos sobre 6 nucleos quitandole computo al tiempo real.
+    # Puerta medida el 14-09-2026: las 8 frases del banco transcritas con 4 y 6 hilos dan
+    # el MISMO texto, byte a byte, en las 3 repeticiones de cada una.
+    hilos = 4;
+    prioridadBaja = true;
   };
 
   services.voz-api = {

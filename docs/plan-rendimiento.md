@@ -189,6 +189,21 @@ Reparto por fotograma en las rondas válidas: igual en las dos, con LM TTS ~48 m
 decodificador ~37 ms y resto ~6,9 ms. La mejora del 0,6 % de RTF queda dentro del ruido y no se
 atribuye al cambio.
 
+### Fase 1: A5, whisper a 4 hilos — PASA (14-09-2026, 18:30-18:38)
+
+`scripts/fase1_whisper.sh`:
+- **Montaje:** las 8 frases de `banco_md5.py`, generadas por producción con semilla 101, se
+  transcribieron 3 veces con whisper-server de producción (6 hilos, :8081) y 3 veces con una segunda
+  instancia del mismo binario y modelo a 4 hilos (:8091).
+- **Resultado:** **8/8 transcripciones idénticas** byte a byte entre 6 y 4 hilos, y ninguna variación
+  entre repeticiones de un mismo lado. Whisper mantiene sus propios errores en los dos casos («¡H4!» por
+  «Hecho.», «a una máxima» por «ahora mismo»).
+- **Tiempo medio por transcripción:** 9,89 s a 6 hilos y 4,25 s a 4. **No se atribuye a los hilos**,
+  porque son procesos distintos y el orden fue fijo (primero producción, en marcha desde hace horas,
+  y después la instancia nueva).
+- **Cambio en `nix/configuration.nix`:** `hilos = 4` y `prioridadBaja = true`, es decir, `Nice 10` y
+  `CPUWeight 20`.
+
 ### Fase 1: A3, poda de disco (ejecutada por Juan, 14-09-2026 ~18:25)
 
 `scripts/podar_disco.sh --borrar` en la VM voz (M):
