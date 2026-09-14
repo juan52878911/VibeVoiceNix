@@ -27,10 +27,11 @@ pve() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "$@"; }
 vm() { ssh -i "$CLAVE" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 "root@$IP" "$@"; }
 
 reiniciar_con_ram() {
-  local mb=$1
+  local mb=$1 unidades=$2
   echo "apagando VM $VOZ..."
   pve "qm shutdown $VOZ --timeout 180 || qm stop $VOZ"
-  pve "qm set $VOZ --memory $mb --balloon 0"
+  # cpuunits: con 512 AuraCRM (1024 por defecto) va primero cuando las dos piden CPU
+  pve "qm set $VOZ --memory $mb --balloon 0 --cpuunits $unidades"
   pve "qm start $VOZ"
   echo "esperando SSH en $IP..."
   for _ in $(seq 1 60); do vm true 2>/dev/null && return 0; sleep 5; done
@@ -40,19 +41,19 @@ reiniciar_con_ram() {
 case "${1:-}" in
   on)
     pve "pct status $CT_NOTICIAS | grep -q running && pct stop $CT_NOTICIAS || true"
-    reiniciar_con_ram "$RAM_TALLER"
+    reiniciar_con_ram "$RAM_TALLER" 512
     vm 'systemctl stop voz-stream voz-api homelab-whisper 2>/dev/null; systemctl is-active voz-stream voz-api homelab-whisper; free -g | sed -n 2p'
     echo "modo taller: VM $VOZ con $RAM_TALLER MB y la voz parada"
     ;;
   off)
-    reiniciar_con_ram "$RAM_VOZ"
+    reiniciar_con_ram "$RAM_VOZ" 1024
     for _ in $(seq 1 60); do vm 'curl -sf localhost:8082/health >/dev/null' 2>/dev/null && break; sleep 5; done
     vm 'systemctl is-active voz-stream voz-api; free -g | sed -n 2p'
     pve "pct start $CT_NOTICIAS"
     echo "modo voz: VM $VOZ con $RAM_VOZ MB y servicios arriba; app-noticias arrancado"
     ;;
   estado)
-    pve "qm config $VOZ | grep -E '^memory'; pct status $CT_NOTICIAS; free -m | sed -n 2p"
+    pve "qm config $VOZ | grep -E '^(memory|cpuunits)'; pct status $CT_NOTICIAS; free -m | sed -n 2p"
     vm 'systemctl is-active voz-stream voz-api homelab-whisper; free -g | sed -n 2p; pgrep -fa "fase[0-9]_|entrenar" | head -3' || true
     ;;
   *)
