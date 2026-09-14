@@ -189,5 +189,16 @@ Reparto por fotograma en las rondas válidas: igual en las dos, con LM TTS ~48 m
 decodificador ~37 ms y resto ~6,9 ms. La mejora del 0,6 % de RTF queda dentro del ruido y no se
 atribuye al cambio.
 
+### Fase 1: A3, poda de disco (ejecutada por Juan, 14-09-2026 ~18:25)
+
+`scripts/podar_disco.sh --borrar` en la VM voz (M):
+- **Disco:** `/` pasa de 19 a **17 GB** usados de 39.
+- **IR que quedan en `/var/lib/voz/ov`:** `cabeza_fp16`, `cabeza_int8`, `decoder_mm_fp16`,
+  `decoder_mm_int4`, `decoder_mm_int8`, `difusion_p6_int8` y `tts_lm_estado_{fp16,int4,int8}`, justo lo
+  que la puerta mandaba conservar.
+- **`/health`:** lista los mismos cuatro IR de producción que antes.
+- **Pendiente:** el md5 de las 8 frases tras la poda. Lo cubre la verificación del despliegue, que lo
+  compara con la base del A/B.
+
 **0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
 tokens de contexto.
