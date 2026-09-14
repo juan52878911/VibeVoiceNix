@@ -808,3 +808,25 @@ código instalado, así que el `state_dict` entra con `strict=True` en
 Las medidas de esta nota salen de `tono()` en `scripts/sondeo_voz.py` y de
 `transcribir`/`normalizar`/`wer` en `scripts/fidelidad.py`, con el whisper del
 stack en el 8080.
+
+## Voces de la charla larga: referencia y semilla elegidas contra audio real apartado (criterio fijado el 14-09-2026, antes de medir)
+
+Hay dos identidades con consentimiento registrado en dobla, **Sebastián** (hablante 0, 43,7 min) y **Avril**
+(hablante 1, 14,9 min), en una reunión de 74 minutos. Es el primer caso con decenas de minutos de la misma voz,
+así que la referencia y la semilla se eligen midiendo contra audio real que el clon **no ha oído**.
+
+1. **Referencias.** `scripts/mejor_referencia.py` toma los segmentos puros de la anotación (al menos 3 s, con
+   menos de 0,3 s pisados por otra voz) y **aparta uno de cada cuatro**, repartidos por toda la charla. Con el
+   resto calcula el centroide ECAPA y elige referencias de ~30 s y ~60 s con los segmentos más consistentes.
+2. **Candidatos por voz.** Tres referencias (el banco actual de dobla, que es el control; la consistente de 30 s y
+   la consistente de 60 s) por cinco semillas de clonado (1-5): 15 prefijos con `clonar_voz.py --lote`.
+3. **Síntesis.** `scripts/evaluar_clones.py` genera con voz-stream en la VM (motor de producción), 4 frases en
+   español y 4 en inglés, semilla de síntesis 11, cfg 3,0, 6 pasos y sin `forma`.
+4. **Medidas por clip.** Identidad ECAPA contra el centroide de los apartados, WER con whisper large-v3 en el
+   idioma de la frase, UTMOS22 y desvío de tono contra la mediana real.
+5. **Criterio de elección, por voz.** Quedan fuera los candidatos con algún clip por encima del 25 % de WER o con
+   un WER medio más de 3 puntos peor que el mejor en español o en inglés. Entre los que quedan, gana la mayor
+   identidad media juntando español e inglés. Si ninguno queda, no se elige nada y se informa.
+
+Los datos (clips, huellas, prefijos) son biométricos: se quedan fuera del repo, en el espacio de trabajo local o
+en el banco de dobla.
