@@ -81,4 +81,41 @@ puntos; identidad ±0,005 global y ±0,0023 por clon; tono medio y recorrido ±0
 
 ## Resultados
 
-(pendiente)
+### Fase 0 (14-09-2026, VM voz recién reiniciada, voz-stream parado)
+
+**0.1 Memoria de la carga (M)**, `lab_fase0.py carga`, MB:
+
+| paso | carga vieja RSS | pico | carga nueva RSS | pico |
+|---|---|---|---|---|
+| torch + openvino importados | 238 | 238 | 237 | 237 |
+| from_pretrained fp32 entero / pesos vivos leídos | 3016 | **4321** | 728 | 844 |
+| soltar LM TTS y decodificador | 1370 | 4321 | — | — |
+| LM de texto en int8 (+ malloc_trim en la vieja) | 962 | 4321 | 830 | 844 |
+| compile LM TTS int4 | 1046 | 4321 | 868 | 868 |
+| compile cabeza int8 | 1049 | 4321 | (perezosa) | — |
+| compile decodificador int8 | 1742 | 4321 | 1342 | 1342 |
+| compile difusión p6 int8 | 1753 | 4321 | 1363 | 1363 |
+| malloc_trim final | **1610** (anon 1196) | 4321 | **1355** (anon 852) | **1361** |
+
+- **Repacks de OpenVINO (d):** el decodificador int8 añade ~700 MB, 360 anónimos y 340 de fichero; el LM
+  TTS ~85 MB; la difusión ~12 MB; la cabeza ~3 MB.
+- **Segunda medida, con la huella:** pico 4477 → 1366 MB.
+
+**Huella de A1+A2 (M): IDÉNTICA**, 65 de 65 tensores (forma, dtype, sha256; Linear int8 por
+`int_repr` y escalas; embeddings comparados como fp32). Pasa la prueba previa.
+
+**0.2 LM TTS aislado: primera tanda NO CONCLUYENTE** (2 rondas, con AuraCRM arrancando en el host). ms por
+pasada de 1 token:
+
+| ronda | posiciones | 6 h | 3 h | 2 h | par 2 streams | par 2 modelos |
+|---|---|---|---|---|---|---|
+| 0 | 500 | 14,4 | 18,0 | 21,0 | 62,8 | 35,8 |
+| 0 | 1500 | 20,1 | 24,5 | 27,9 | 85,9 | 46,9 |
+| 1 | 500 | 15,7 | 18,4 | 24,9 | 33,3 | 68,3 |
+| 1 | 1500 | **41,5** | 38,0 | 36,2 | 43,6 | 50,7 |
+
+t6 a 1500 posiciones se dobla de una ronda a otra y los pares se invierten: se repite con la regla de
+agregación fijada arriba. Lo que sí se repite en las cuatro filas es t3/t6 = 0,92-1,26 (≤ 1,6).
+
+**0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
+tokens de contexto.
