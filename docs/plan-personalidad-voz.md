@@ -121,6 +121,28 @@ de ejemplos de los 16,9 min. Validación con clips enteros apartados por persona
 persona por encima del azar con validación dejando fuera una grabación. Sirve como **juez de
 personalidad** en el banco A/B aunque la fase 3 no llegue.
 
+#### Resultado (13-09-2026, `scripts/fase2_estilo.py`)
+
+1473 fragmentos (765 reales, 708 de clones de la fase 1), validación con 64 clips enteros apartados;
+17 épocas (~10 min de entrenamiento en la VM en modo taller, la mejor la 9).
+
+| salida | clips apartados | puerta |
+|---|---|---|
+| estilo, R² por clip | 8/8 positivos: tono 0,88 · inclinación 0,63 · recorrido 0,32 · desviación 0,30 · energía 0,27 · microvariación 0,16 · armonicidad 0,06 · movimiento 0,05 | pasa |
+| persona | 100 % en Carlos, Laura y Liliana (azar 33 %) — Carlos y Liliana salen de la MISMA grabación, así que no es el canal | pasa |
+| real / clon | AUC 1,000 | pasaba, **pero no vale** |
+
+**El control de canal lo tumbó** (`scripts/fase2_control_canal.py`): el audio REAL de los clips apartados,
+pasado por el códec de VibeVoice (codificador → decodificador), sale marcado como clon — P(real) 0,917 el
+real, **0,251 la ida y vuelta**, 0,095 el clon; AUC real frente a ida y vuelta **0,996**. La ida y vuelta
+casi no mueve la prosodia (tono −0,6 Hz, recorrido +0,09 st, microvariación +0,7 cents): el juez oía la
+TEXTURA DEL CÓDEC, no la personalidad. Queda algo más (ida y vuelta frente a clon, AUC 0,80), tapado por
+el códec.
+
+Consecuencia: el codificador de **estilo** y la salida de **persona** sirven; el juez real/clon se
+reentrena con el audio real de ida y vuelta etiquetado como real (`scripts/fase2_idavuelta.py`,
+`--idavuelta`), con su puerta fijada antes: AUC(ida y vuelta, clon) > 0,7 y AUC(real, ida y vuelta) < 0,75.
+
 ### 3 · Adaptador de estilo en la difusión
 
 Un adaptador pequeño (FiLM) sobre la condición de la cabeza de difusión, con el vector del codificador
