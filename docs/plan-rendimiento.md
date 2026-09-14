@@ -151,5 +151,43 @@ agregación fijada arriba. Lo que sí se repite en las cuatro filas es t3/t6 = 0
   sin GPU. Máximo 86 °C, sin estrangulamiento térmico. La frecuencia de esos segundos no vale para el
   umbral, porque la carga de CPU no era la misma con y sin GPU.
 
+**0.4 Temperatura y potencia durante un banco (M)**, `vigilar_host.sh` en pve mientras corría el A/B de la
+fase 1 (18:00:42-18:11:10, 608 s):
+
+| minuto | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| MHz medios | 3733 | 3192 | 3351 | 3165 | 3215 | 3262 | 3558 | 3212 | 3456 | 3212 | 3445 |
+| W paquete | 27,8 | 36,7 | 30,8 | 35,8 | 35,0 | 33,5 | 31,1 | 35,3 | 31,5 | 35,2 | 28,3 |
+| °C | 72,8 | 77,7 | 75,4 | 77,4 | 77,4 | 77,3 | 75,6 | 77,7 | 76,8 | 77,5 | 76,0 |
+
+- **Temperatura:** media 76,5 °C, máxima 90 °C, **sin estrangulamiento térmico** (el contador del
+  paquete no se movió).
+- **Potencia:** paquete a 33,0 W de media, con **438 de 608 s a ≥ 34 W**, es decir, en el PL1 de 35 W.
+- **Frecuencia:** baja justo en los minutos de más vatios.
+- **Conclusión:** la varianza de base la pone **el límite de potencia, no la temperatura**. Cualquier
+  consumidor nuevo (iGPU, más hilos) sale de esos 35 W.
+
+### Fase 1: A1 + A2 + A4 — PASA (14-09-2026, 18:00-18:11)
+
+`scripts/fase1_ab.sh` en la VM voz: cuatro procesos nuevos alternos en 127.0.0.1:8092, con el entorno,
+el python y el `voz-stream.py` de producción en marcha (commit `8c34be8`, `sha256:b0b0eaabf4e7`). La
+variante es el mismo código OpenVINO con **solo `motor.py` cambiado**, y el sha de origen se comprobó
+antes de empezar. `banco_md5.py`: 8 frases con semilla 101, 3 rondas por tanda; cada tanda devuelve el
+swap a RAM al arrancar.
+
+| puerta | exigido | medido | |
+|---|---|---|---|
+| huella de tensores | idéntica | 65/65 idénticos | ✅ |
+| md5 | idéntico en todo | **8/8 frases × 12 rondas × 4 tandas idénticos** | ✅ |
+| `ws_fidelidad.py` completo contra la variante | todo correcto | **25 OK, «todo correcto»** (md5 de referencia `2a978a26…`, el de producción) | ✅ |
+| RTF, mediana de las rondas válidas | variante ≤ 1,02 × base | base **0,9490** (0,9488 · 0,9493 · 0,9525 · 0,9387) · variante **0,9435** (0,9265 · 0,9388 · 0,9481 · 0,9529) | ✅ |
+| memoria (objetivo) | pico −1 GB | VmHWM **4326 / 4503 → 1952 / 1945 MB** (−2,4 GB) · RSS tras el banco 2168 / 2166 → 1841 / 1831 MB (−330 MB) | ✅ |
+
+Además (M): la variante arranca en 12,8-12,9 s frente a 22,4-25,5 s de la base, y no toca el swap.
+La base empuja 860 MB al swap en cada arranque, y en producción eso lo arregla `voz-stream-sin-swap`.
+Reparto por fotograma en las rondas válidas: igual en las dos, con LM TTS ~48 ms, cabeza ~16 ms,
+decodificador ~37 ms y resto ~6,9 ms. La mejora del 0,6 % de RTF queda dentro del ruido y no se
+atribuye al cambio.
+
 **0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
 tokens de contexto.

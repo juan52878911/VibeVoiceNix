@@ -499,6 +499,50 @@ activaciones—. Y `MALLOC_ARENA_MAX=2` evita que glibc abra una arena por hilo.
 </details>
 
 <details>
+<summary><b>8b · Cargar solo lo que se usa</b> — pico de carga 4,4 → 1,95 GB, audio idéntico</summary>
+
+<br>
+
+**Donde estaba.** `motor.cargar()` hacía `from_pretrained(float32)` del checkpoint **entero**: 2 GB en
+bf16 pasaban a ~4 GB en fp32 para soltar acto seguido el LM TTS, el decodificador, el codificador y la
+cabeza, que sustituye OpenVINO. Ese pico (VmHWM 4,3-4,5 GB en una VM de 4,9) empujaba 860 MB al swap en
+cada arranque, y de ahí salía la unidad `voz-stream-sin-swap`.
+
+**Tres cambios en `pkgs/vibevoice-ov/motor.py`, bit a bit:**
+- **A1:** el modelo se construye en `meta` (`accelerate.init_empty_weights`, con el config en float32
+  como hace `from_pretrained`). Las piezas sustituidas se sueltan **antes** de leer nada, y del
+  safetensors se leen con `safe_open` solo los tensores que siguen vivos.
+- **A2:** la tabla de embeddings del LM de texto (151936 × 896) se sirve **por mmap** del safetensors en
+  bf16 y se pasa a fp32 al consultarla (`EmbeddingMmap`). bf16 → fp32 es exacto, así que consultar y
+  luego convertir da los mismos bytes.
+- **A4:** `CabezaOV` se compila en su primera llamada. Con la difusión en un grafo no se llama nunca.
+
+**La puerta, fijada antes de medir** ([plan-rendimiento.md](plan-rendimiento.md)):
+
+| | base (carga vieja) | variante |
+|---|---|---|
+| huella de los 65 tensores torch | — | **idéntica** |
+| md5 de 8 frases, semilla 101, 12 rondas en 4 procesos alternos | — | **idéntico en todo** |
+| `ws_fidelidad.py` completo | — | **todo correcto** |
+| VmHWM de voz-stream | 4326 / 4503 MB | **1952 / 1945 MB** |
+| RSS tras el banco | 2168 / 2166 MB | **1841 / 1831 MB** |
+| arranque (carga + calentamiento) | 22,4-25,5 s | **12,8-12,9 s** |
+| RTF, mediana de las rondas válidas | 0,9490 | 0,9435 (en el ruido) |
+
+En el laboratorio (`scripts/lab_fase0.py carga`) el pico de la carga sola baja de 4321 a 1361 MB. De los
+~1,35 GB que quedan, ~700 MB son el repack del decodificador int8 de OpenVINO (360 anónimos y 340 del
+mmap del IR).
+
+**Tres trampas del banco que costaron intentos**, antes de la primera cifra:
+- **Swap desigual:** la base arrancaba con páginas en swap y la variante no, así que cada tanda
+  devuelve el swap a RAM como `voz-stream-sin-swap`.
+- **PATH vacío en `systemd-run`:** arranca sin PATH, y ni `pgrep` ni `systemctl` existían.
+- **PATH de la unidad sin `curl`:** copiar el entorno de la unidad trae su `PATH` de NixOS, que no
+  incluye `curl`.
+
+</details>
+
+<details>
 <summary><b>9 · Detalles de calidad que costaron poco y se notan</b></summary>
 
 <br>

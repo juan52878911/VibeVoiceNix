@@ -58,6 +58,18 @@ in
       default = 6;
       description = "Hilos de inferencia. Conviene dejar alguno libre para voz-api.";
     };
+
+    prioridadBaja = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Nice 10 y CPUWeight 20: si una nota de voz coincide con una sintesis de
+        voz-stream, el TTS (tiempo real) se queda los nucleos y el STT (por
+        lotes, nadie lo oye en directo) espera. En la VM voz, con 6 nucleos
+        fisicos y el paquete en su limite de 35 W, los dos a la vez a 6 hilos
+        eran 12 hilos sobre 6 nucleos.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -80,6 +92,8 @@ in
         DynamicUser = true;
         Restart = "on-failure";
         RestartSec = 5;
+        Nice = lib.mkIf cfg.prioridadBaja 10;
+        CPUWeight = lib.mkIf cfg.prioridadBaja 20;
 
         # Solo lee un modelo del store y escucha en loopback: no necesita nada mas.
         NoNewPrivileges = true;
