@@ -296,6 +296,53 @@ Queda para decidir: regularizar el adaptador (menos movimiento de la condición,
 que sale de generar) o cambiar de palanca: pausas y ritmo, que la fase 1 señaló como la mayor diferencia y
 son del LM, no de la difusión.
 
+### 4 · Pausas y ritmo, sin tocar el modelo
+
+Decidido por el usuario tras la 3b: ir a pausas y ritmo, cubriendo todas las frases y sin WER catastróficos.
+
+**Lo que ya se sabía y lo que midió el sondeo** (14-09-2026, clips reales):
+
+| | palabras/min | pausas ≥ 150 ms/min | mediana de pausa | palabras por pausa | palabras por signo |
+|---|---|---|---|---|---|
+| Carlos (131 clips) | 154 | 21,2 | 0,52 s (p90 1,12) | **7,2** | **7,2** |
+| Liliana (33 clips) | 197 | 15,9 | 0,35 s (p90 0,45) | 12,4 | 8,5 |
+
+Carlos pausa, de media, una vez por signo de puntuación; su clon hace la mitad de pausas (10/min) y va
+más lento (4,6 frente a 5,2 sílabas/s). El modelo pausa en comas y puntos, pero se salta muchas, y nunca
+pausa dentro de una frase (`voz_stream.py`, EL RESPIRO): la puntuación ya está, falta que la cumpla.
+Liliana no difería de su clon en la fase 1: es el **control**, lo que se haga no puede estropearla.
+
+**Variantes** (`scripts/fase4_pausas.py`), mismo texto y semilla por voz-stream (motor de producción,
+cfg 3,0, 6 pasos, semillas 101 y 7):
+
+- `base`: el texto tal cual.
+- `trozos`: el texto partido en los signos donde toca pausar, una petición por trozo, unidos con pausas.
+- `saltos`: una petición con `\n` en esos signos (la parada de fin de locución del modelo).
+- `trozos_r`, `saltos_r`: lo mismo con la velocidad ajustada a la de la persona (WSOLA, `estirar.py`).
+
+En las cuatro, cada pausa (racha callada ≥ 150 ms) pasa a durar lo que sale de la distribución de pausas
+reales de la persona (0,15–1,2 s, sorteada con semilla por clip). Dónde pausar: en un signo si desde la
+última pausa van al menos K palabras, con K calibrado en los clips de entrenamiento para igualar sus
+palabras por pausa reales; los trozos de menos de 4 palabras se unen al siguiente. La velocidad se
+calibra con 12 textos de entrenamiento (factor entre 0,85 y 1,20). Los clips apartados de la fase 2b
+no se usan para calibrar nada.
+
+**Puerta** (fijada antes de medir), cada variante contra `base`, en los textos apartados (hay audio real
+del mismo texto) y en las 6 frases nuevas:
+
+- **Carlos** (objetivo), clips apartados: la distancia de pausas/min a su clip real baja con el IC 95 %
+  superior < 0; la distancia de sílabas/s no sube de media.
+- **Liliana** (control), clips apartados: la distancia de pausas/min no sube más de 2 de media, ni la de
+  sílabas/s más de 0,3.
+- **Cobertura y WER**, en todos los clips de las dos personas: WER medio sin subir más de 0,5 puntos;
+  **ningún clip con WER > 25 % si en la base tenía ≤ 10 %**; ningún clip con las palabras transcritas
+  fuera de 0,85–1,15 veces las del texto si en la base estaba dentro (ni frases sin decir ni repetidas).
+- **Calidad**: UTMOS medio ≥ −0,05 e identidad ECAPA contra su audio real ≥ −0,01.
+
+Pasa la variante que cumpla todo; si pasa más de una, la de menor distancia de pausas en Carlos. Son
+cuatro variantes contra la misma base: una que pase por los pelos se confirma con otras semillas antes
+de llevarla a producción.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
