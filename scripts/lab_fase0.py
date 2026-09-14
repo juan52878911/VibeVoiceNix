@@ -73,7 +73,8 @@ def huella(modelo):
             continue
         salida[nombre] = [list(t.shape), str(t.dtype), h(t)]
     for nombre, mod in modelo.named_modules():
-        if hasattr(mod, "_packed_params"):          # Linear dinamico int8
+        # Linear dinamico int8 (su hijo LinearPackedParams tambien tiene _packed_params y no weight())
+        if isinstance(mod, torch.ao.nn.quantized.dynamic.Linear):
             w = mod.weight()
             escalas = w.q_per_channel_scales() if w.qscheme() in (torch.per_channel_affine,) else torch.tensor([w.q_scale()])
             salida[nombre + ".weight(int8)"] = [list(w.shape), str(w.dtype), h(w.int_repr()), h(escalas)]
