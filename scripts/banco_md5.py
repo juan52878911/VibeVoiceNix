@@ -104,6 +104,9 @@ def comparar(rutas):
     for b in bancos:
         por_etiqueta.setdefault(b["etiqueta"].split("-")[0], []).extend(r["rtf"] for r in b["rondas"][1:])
     for e, v in por_etiqueta.items():
+        if not v:
+            print(f"{e:<12} sin rondas validas (solo la ronda 0): no hay RTF que comparar")
+            continue
         print(f"{e:<12} RTF valido (sin ronda 0): mediana {statistics.median(v):.4f}  n={len(v)}  {v}")
     print("MD5 IDENTICO EN TODO" if todo_igual else "HAY MD5 DISTINTOS")
     return 0 if todo_igual else 1

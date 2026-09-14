@@ -197,8 +197,8 @@ atribuye al cambio.
   `decoder_mm_int4`, `decoder_mm_int8`, `difusion_p6_int8` y `tts_lm_estado_{fp16,int4,int8}`, justo lo
   que la puerta mandaba conservar.
 - **`/health`:** lista los mismos cuatro IR de producción que antes.
-- **Pendiente:** el md5 de las 8 frases tras la poda. Lo cubre la verificación del despliegue, que lo
-  compara con la base del A/B.
+- **md5 tras la poda:** las 8 frases generadas por producción a las 18:30, ya podada la VM, dan
+  **8/8 md5 idénticos** a la base del A/B de la fase 1. **A3 PASA.**
 
 **0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
 tokens de contexto.
