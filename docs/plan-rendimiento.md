@@ -134,7 +134,17 @@ agregación fijada arriba. Lo que sí se repite en las cuatro filas es t3/t6 = 0
   **~16 dB** con amplitud realista (int8 15,9 y fp16 15,9, RMS 0,022). Con latentes pequeños la
   salida es casi muda y la cifra no significa nada (4,7 dB con un RMS de 1e-6).
 - **Lectura:** 16 dB es del orden del error del int8 frente al fp16 (16,9 dB) y queda lejos de los
-  25 dB que pide C1. La sospecha es el cálculo en f16 que la GPU usa por defecto: se prueba forzando f32.
+  25 dB que pide C1. La sospecha era el cálculo en f16 que la GPU usa por defecto, y se confirma:
+- **Forzando `INFERENCE_PRECISION_HINT=f32` en la GPU:**
+
+  | IR | ms mediana (p90) | SNR GPU frente a CPU |
+  |---|---|---|
+  | `decoder_mm_int8` | **57,4** (60,0), compila en 10,5 s | **52,9 dB** (escala 2) · **57,8 dB** (escala 5, RMS 0,022) |
+  | `decoder_mm_fp16` | 105,8 (112,6) | (pendiente) |
+
+  **El int8 en f32 es numéricamente el mismo decodificador** (dif. máx. 2e-3 sobre picos de ~0,2) y queda
+  bajo los 90 ms. En f16 se descarta: 16 dB. Esto cumple la primera mitad del umbral, **preliminar**
+  mientras no se repita con el host en reposo.
 - **Falta** la segunda mitad del umbral, la frecuencia de la CPU con la GPU al 100 %.
 
 **0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
