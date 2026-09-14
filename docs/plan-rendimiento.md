@@ -140,7 +140,7 @@ agregación fijada arriba. Lo que sí se repite en las cuatro filas es t3/t6 = 0
   | IR | ms mediana (p90) | SNR GPU frente a CPU |
   |---|---|---|
   | `decoder_mm_int8` | **57,4** (60,0), compila en 10,5 s | **52,9 dB** (escala 2) · **57,8 dB** (escala 5, RMS 0,022) |
-  | `decoder_mm_fp16` | 105,8 (112,6) | (pendiente) |
+  | `decoder_mm_fp16` | 105,8 (112,6): **fuera del umbral de 90 ms** | sin medir: cargado a la vez en CPU y GPU no cabe en los 3 GB del LXC (la GPU usa la RAM) y se paró al ver 728 % de CPU del host |
 
   **El int8 en f32 es numéricamente el mismo decodificador** (dif. máx. 2e-3 sobre picos de ~0,2) y queda
   bajo los 90 ms. En f16 se descarta: 16 dB. Esto cumple la primera mitad del umbral, **preliminar**
