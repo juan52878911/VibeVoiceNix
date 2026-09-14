@@ -426,6 +426,25 @@ ningún clip con WER > 25 % si la base tenía ≤ 10 %, cobertura 0,85-1,15, UTM
 Si pasa, `forma` se integra en voz-stream como ajuste de pausas por voz; si no, el ritmo se queda como está.
 Los resultados de las semillas 23 y 42 no se suman: la confirmación se decide solo con las nuevas.
 
+#### Resultado de la fase 4c (14-09-2026): NO PASA por un solo clip de cobertura
+
+204 peticiones en 18 min con la voz en marcha; 128 parejas de Carlos y 52 de Liliana.
+
+| `forma` − `base` | Carlos (104 apartados / 128 clips) | Liliana (28 / 52) |
+|---|---|---|
+| sílabas/s por clip, distancia al real | **−0,215 [−0,320, −0,111]** ✅ (4,70 → 5,14; real 5,19) | +0,03 ✅ |
+| mediana de pausa, distancia al real | −0,118 [−0,214, −0,031] | +0,01 |
+| pausas/min, distancia al real | −0,06 [−0,64, +0,59] (17,5 → 19,3; real 22,5) | −0,12 ✅ |
+| WER (puntos) | **−0,07 [−0,82, +0,65]** ✅ | −0,11 ✅ |
+| UTMOS | −0,004 ✅ | −0,009 ✅ |
+| ECAPA | +0,007 ✅ | 0,000 ✅ |
+| catástrofes | **0** ✅ | 0 ✅ |
+| fuera de cobertura | **1** ❌ | 0 ✅ |
+
+- Con cuatro semillas nuevas el WER de Carlos, que tumbó la 4b (+0,95), sale en −0,07: aquello era ruido de whisper.
+- El único fallo es `carlos-segura__videoplayback-068__s11`. La base tenía una pausa de 2,48 s tras «De esta forma.»; `forma` la acorta y whisper transcribe desde «Y acá…» (cobertura 0,81 con mínimo 0,85). **Comprobado byte a byte**: los 6 tramos con voz de la base están idénticos y en el mismo orden dentro de `forma` (5,56 s de voz). Las palabras están; es whisper sin el contexto de la pausa larga. La base de Carlos tiene 9 de 128 clips fuera de cobertura: la medida de cobertura con whisper es inestable en fragmentos cortos.
+- **La puerta dice NO y no se reinterpreta.** Llevar `forma` a producción es una decisión del usuario sabiendo esto: la puerta con whisper no puede certificar la cobertura de una transformación que, por construcción, no cambia la voz; la garantía de contenido de `forma` es estructural (tramos con voz idénticos), y esa sería la prueba que tendría que llevar en el servicio.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
