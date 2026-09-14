@@ -21,6 +21,22 @@ Nada de esto cambia el servicio. Las cifras deciden si se abren las fases 2 y 3.
 | 0.3 | iGPU UHD 630 en un LXC con `/dev/dri` (sin passthrough, sin tocar la VM 200): decodificador int8 y fp16 y LM int4 con el plugin GPU de OpenVINO; ms por fotograma, RAPL, temperatura | LXC de laboratorio en pve | **C1 y C2 se cierran si no se cumplen las dos:** decodificador ≤ 90 ms por fotograma en GPU (mediana de 200 llamadas tras calentar, en int8 o fp16) **y** con la GPU al 100 % la frecuencia media de los núcleos del host baja ≤ 15 % frente a la GPU en reposo, con la misma carga de CPU en la VM |
 | 0.4 | Temperatura, frecuencia y potencia del paquete durante un banco normal | `scripts/vigilar_host.sh` en pve mientras corre `scripts/banco_md5.py` | informativo: dice si la varianza de base (1,13-1,27) es térmica |
 
+### 0.2 repetida: regla de agregación (fijada el 14-09-2026 tras una primera tanda no concluyente)
+
+La primera tanda (2 rondas) no se usa para decidir: la pasada a 6 hilos con 1500 posiciones dio 20,1 ms
+en una ronda y 41,5 ms en la otra, y los dos pares en paralelo se invirtieron de una ronda a otra,
+mientras arrancaba AuraCRM en el host. La puerta de B2 no decía cómo combinar rondas, así que se
+fija ahora, **antes** de repetir y sin mirar qué resultado da cada regla:
+
+- 6 rondas completas y alternas, cada una con todas las configuraciones (6, 3 y 2 hilos, par con 2
+  streams y par con 2 modelos) en las dos longitudes, y voz-stream parado.
+- Por configuración y longitud se toma la **mediana de las 6 rondas**. Los cocientes se calculan
+  con esas medianas.
+- Se usa el mejor de los dos montajes del par. B2 se abre si en **las dos** longitudes t3/t6 ≤ 1,6 **y**
+  par/(2·t6) ≤ 0,80.
+- **La medida no vale**, y B2 queda sin decidir, si el recorrido intercuartílico de t6 supera el 25 %
+  de su mediana; en ese caso se anota y se repite con el host en reposo.
+
 ## Fase 1: bit a bit (A1 + A2 + A4 en código, A5 y A3 por Nix y a mano)
 
 **Qué entra.**
