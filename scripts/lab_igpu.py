@@ -103,16 +103,21 @@ def cmd_medir(a):
 
 
 def cmd_snr(a):
-    rng = np.random.default_rng(1)
-    lats = [(rng.standard_normal((1, 64, 1)) * 0.5).astype(np.float32) for _ in range(a.n)]
-    salidas = {}
-    for d in ("CPU", "GPU"):
-        b = Banco(a.ir, d)
-        salidas[d] = np.concatenate([b.llamada(x).reshape(-1) for x in lats])
-    ref, x = salidas["CPU"].astype(np.float64), salidas["GPU"].astype(np.float64)
-    snr = 10 * np.log10((ref ** 2).sum() / max(((ref - x) ** 2).sum(), 1e-30))
-    print(json.dumps({"ir": a.ir.split("/")[-1], "fotogramas": a.n, "snr_gpu_vs_cpu_db": round(float(snr), 2),
-                      "dif_max": float(np.abs(ref - x).max())}), flush=True)
+    """Con latentes aleatorios la salida puede quedar casi muda y la SNR no dice nada: se imprime el RMS
+    de la referencia y se barre la escala. La puerta de C1 se mide con latentes reales contra torch fp32."""
+    for escala in a.escalas:
+        rng = np.random.default_rng(1)
+        lats = [(rng.standard_normal((1, 64, 1)) * escala).astype(np.float32) for _ in range(a.n)]
+        salidas = {}
+        for d in ("CPU", "GPU"):
+            b = Banco(a.ir, d)
+            salidas[d] = np.concatenate([b.llamada(x).reshape(-1) for x in lats])
+        ref, x = salidas["CPU"].astype(np.float64), salidas["GPU"].astype(np.float64)
+        snr = 10 * np.log10((ref ** 2).sum() / max(((ref - x) ** 2).sum(), 1e-30))
+        print(json.dumps({"ir": a.ir.split("/")[-1], "escala": escala, "fotogramas": a.n,
+                          "rms_cpu": float(np.sqrt((ref ** 2).mean())), "rms_gpu": float(np.sqrt((x ** 2).mean())),
+                          "snr_gpu_vs_cpu_db": round(float(snr), 2), "dif_max": float(np.abs(ref - x).max())}),
+              flush=True)
 
 
 def cmd_bucle(a):
@@ -139,6 +144,7 @@ def main():
         p.add_argument("--n", type=int, default=200 if nombre == "medir" else 40)
         p.add_argument("--calentar", type=int, default=20)
         p.add_argument("--segundos", type=int, default=60)
+        p.add_argument("--escalas", type=lambda s: [float(x) for x in s.split(",")], default=[0.5, 2.0, 5.0])
     a = ap.parse_args()
     {"medir": cmd_medir, "snr": cmd_snr, "bucle": cmd_bucle}[a.cmd](a)
 
