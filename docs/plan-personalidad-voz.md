@@ -414,6 +414,18 @@ Liliana 1,05 y 1,04.
 Queda para decidir: confirmar `forma` con más semillas (el WER medio se estabiliza con más clips y la
 puerta sería la misma) o dejar el ritmo donde está.
 
+#### Fase 4c: confirmación de `forma`, puerta fijada antes de medir (14-09-2026)
+
+Pedida por el usuario. Solo `base` y `forma`, **cuatro semillas nuevas (3, 11, 55 y 89)**, nunca usadas
+en las fases 4 y 4b; mismos textos (26 apartados de Carlos y 7 de Liliana, más las 6 frases nuevas): 128
+parejas de Carlos y 52 de Liliana. La calibración de pausas es la misma (clips de entrenamiento).
+
+**Puerta: la de la 4b sin tocar** — Carlos, |sílabas/s − real| por clip baja con IC 95 % superior < 0;
+Liliana, pausas/min no más de +2 y sílabas/s no más de +0,3; en todos los clips WER medio ≤ +0,5 puntos,
+ningún clip con WER > 25 % si la base tenía ≤ 10 %, cobertura 0,85-1,15, UTMOS ≥ −0,05 y ECAPA ≥ −0,01.
+Si pasa, `forma` se integra en voz-stream como ajuste de pausas por voz; si no, el ritmo se queda como está.
+Los resultados de las semillas 23 y 42 no se suman: la confirmación se decide solo con las nuevas.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
