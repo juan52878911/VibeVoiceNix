@@ -13,6 +13,11 @@
 #   4. nixos-rebuild switch --flake .#taller sobre esa IP: cambia nombre, IP a
 #      .55, apaga los servicios de voz e instala Qwen3. Construye en la propia
 #      VM (--build-host): el Mac no puede construir x86_64-linux.
+#
+# OJO, MEDIDO EL 13-09-2026: EN ESTE HOST NO FUNCIONA TAL CUAL. El almacenamiento `local` no admite
+# discos de VM (`storage 'local' does not support vm images`) y `local-lvm` ya no tiene sitio para un
+# clon completo sin arriesgar al resto de VM. El paso 1 falla DESPUES de haber parado la voz. Usar
+# scripts/modo_taller_voz.sh (la VM voz con más RAM) o habilitar `images` en `local` antes.
 set -euo pipefail
 
 PVE="${TALLER_PVE:-pve}"
