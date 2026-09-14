@@ -830,3 +830,17 @@ así que la referencia y la semilla se eligen midiendo contra audio real que el 
 
 Los datos (clips, huellas, prefijos) son biométricos: se quedan fuera del repo, en el espacio de trabajo local o
 en el banco de dobla.
+
+### Añadido tras ver a Sebastián: referencia por limpieza (14-09-2026)
+
+Contra lo esperado, con Sebastián **ganó el banco de dobla**. Semilla de clonado 5: identidad 0,582 (0,651 en
+español y 0,513 en inglés), WER 0,0 y 1,4 y UTMOS 2,10. Las referencias por consistencia, con un techo de
+0,89-0,90, quedaron por debajo, y 9 de sus 10 candidatos cayeron por WER: la de 60 s llegó a un 44 % en inglés
+y su UTMOS fue 1,71-1,80. **El techo (consistencia ECAPA) no predice la calidad del clon.** Dobla elige su banco
+por SNR, así que la limpieza del audio parece pesar más.
+
+Como es un experimento **posterior a ver los datos**, va aparte: se añade a los dos la variante `limpia`, unos
+30 s elegidos por SNR estimada (p90−p10 de la energía en ventanas de 10 ms) entre los segmentos con consistencia
+igual o mayor que la mediana, con las semillas de clonado 1-5. Se aplica el mismo criterio de elección de
+arriba. Con Avril se evalúan juntas las cuatro variantes; con Sebastián solo se añaden estos cinco candidatos a
+los que ya había.

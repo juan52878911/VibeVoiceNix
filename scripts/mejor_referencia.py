@@ -49,6 +49,10 @@ def main():
     ap.add_argument("--max-seg", type=float, default=15.0, help="los segmentos más largos se parten en trozos de este tope")
     ap.add_argument("--pureza", type=float, default=0.3)
     ap.add_argument("--apartar", type=float, default=0.25, help="fracción de segmentos para evaluar, nunca referencia")
+    ap.add_argument("--criterio", choices=("consistencia", "limpieza"), default="consistencia",
+                    help="limpieza: por relación señal/ruido estimada (p90-p10 de la energía en ventanas de 10 ms), "
+                         "entre los segmentos con consistencia >= la mediana. MEDIDO con Sebastián: la consistencia "
+                         "sola (techo 0,89-0,90) dio peor clon que el banco de dobla, que elige por SNR")
     a = ap.parse_args()
     import librosa
     import soundfile as sf
@@ -109,6 +113,11 @@ def main():
     centro /= np.linalg.norm(centro)
     for s in puros:
         s["consistencia"] = float(np.dot(s["huella"], centro))
+        x = trozo(s)
+        n = len(x) // PZ.VENTANA
+        rms = np.sqrt(np.mean(x[:n * PZ.VENTANA].reshape(n, PZ.VENTANA).astype(np.float64) ** 2, 1)) + 1e-7
+        db = 20 * np.log10(rms)
+        s["snr_db"] = float(np.percentile(db, 90) - np.percentile(db, 10))
     cons_pool = np.array([s["consistencia"] for s in pool])
     print(f"consistencia con el centroide (pool): p10 {np.percentile(cons_pool, 10):.3f} · "
           f"mediana {np.median(cons_pool):.3f} · p90 {np.percentile(cons_pool, 90):.3f}", flush=True)
@@ -126,8 +135,13 @@ def main():
                                      "p90": float(np.percentile(cons_pool, 90))},
                "pausas": {k: v for k, v in PZ.perfil([trozo(s) for s in pool]).items() if k != "dist"},
                "selecciones": {}}
-    candidatos = sorted([s for s in pool if s["entero"] and s["texto"].strip()],
-                        key=lambda s: -s["consistencia"])
+    enteros = [s for s in pool if s["entero"] and s["texto"].strip()]
+    if a.criterio == "limpieza":
+        corte = float(np.median([s["consistencia"] for s in enteros]))
+        candidatos = sorted([s for s in enteros if s["consistencia"] >= corte], key=lambda s: -s["snr_db"])
+    else:
+        candidatos = sorted(enteros, key=lambda s: -s["consistencia"])
+    sufijo = "" if a.criterio == "consistencia" else "-limpia"
     for D in a.duraciones:
         sel, acum = [], 0.0
         for s in candidatos:
@@ -136,7 +150,7 @@ def main():
             sel.append(s)
             acum += s["fin"] - s["ini"]
         sel.sort(key=lambda s: s["ini"])
-        carpeta = sal / f"seleccion-{int(D)}s"
+        carpeta = sal / f"seleccion{sufijo}-{int(D)}s"
         carpeta.mkdir(exist_ok=True)
         refs = []
         for i, s in enumerate(sel):
@@ -147,12 +161,14 @@ def main():
         t = techo(sel)
         info = {"segundos": acum, "clips": len(sel), "techo_mitades": t,
                 "consistencia_media": float(np.mean([s["consistencia"] for s in sel])),
-                "segmentos": [{k: s[k] for k in ("ini", "fin", "texto", "consistencia")} for s in sel]}
-        json.dump(info, open(sal / f"seleccion-{int(D)}s.json", "w"), ensure_ascii=False, indent=1)
-        resumen["selecciones"][f"{int(D)}s"] = {k: v for k, v in info.items() if k != "segmentos"}
-        print(f"  seleccion {int(D)} s: {len(sel)} clips, {acum:.1f} s, consistencia media "
-              f"{info['consistencia_media']:.3f}, techo por mitades {t if t is None else round(t, 3)}", flush=True)
-    json.dump(resumen, open(sal / "resumen.json", "w"), ensure_ascii=False, indent=1)
+                "snr_db_medio": float(np.mean([s["snr_db"] for s in sel])),
+                "segmentos": [{k: s[k] for k in ("ini", "fin", "texto", "consistencia", "snr_db")} for s in sel]}
+        json.dump(info, open(sal / f"seleccion{sufijo}-{int(D)}s.json", "w"), ensure_ascii=False, indent=1)
+        resumen["selecciones"][f"{a.criterio}-{int(D)}s"] = {k: v for k, v in info.items() if k != "segmentos"}
+        print(f"  seleccion {a.criterio} {int(D)} s: {len(sel)} clips, {acum:.1f} s, consistencia media "
+              f"{info['consistencia_media']:.3f}, SNR {info['snr_db_medio']:.1f} dB, "
+              f"techo por mitades {t if t is None else round(t, 3)}", flush=True)
+    json.dump(resumen, open(sal / f"resumen{sufijo}.json", "w"), ensure_ascii=False, indent=1)
     print(f"pausas reales: {resumen['pausas']}")
 
 
