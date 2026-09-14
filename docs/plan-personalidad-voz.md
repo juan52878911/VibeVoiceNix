@@ -263,6 +263,39 @@ nota al generar. Mismo diseño que la 3b (torch a los dos lados, cfg 3,0, 6 paso
 P(real) con IC inferior > 0; distancia de los 8 descriptores al perfil real con IC superior < 0; ECAPA
 contra su audio real ≥ −0,005; UTMOS ≥ −0,02; WER sin subir más de 0,5 puntos.
 
+#### Resultado de la 3b con Carlos (14-09-2026): NO PASA, y el juez se deja engañar
+
+64 parejas en 42 min en la VM (torch, RTF ~2,8); WER, UTMOS y ECAPA en el Mac con whisper large-v3.
+
+| adaptador − base (n=64) | base | diferencia [IC 95 %] | puerta |
+|---|---|---|---|
+| juez P(real) | 0,087 | **+0,216** [+0,159, +0,273] | pasa |
+| distancia por clip al perfil real | 0,806 | −0,070 [−0,152, +0,009] | no |
+| ECAPA contra su audio real | 0,635 | −0,030 [−0,044, −0,016] | no |
+| UTMOS | 3,411 | **−0,335** [−0,415, −0,254] | no |
+| WER (puntos) | 4,5 | **+15,7** [+8,3, +23,8] | no |
+
+Descriptores de media (distancia al perfil real de Carlos en desviaciones, base → adaptador): recorrido
+0,73 → 0,14, desviación 0,70 → 0,09, movimiento 0,54 → 0,07, inclinación 0,37 → 0,00, microvariación
+0,90 → 0,59; pero el tono medio se pasa (133,6 → 121,4 Hz con el real en 130,6: 0,22 → 0,69) y la
+armonicidad no cambia. La WER sube igual con frases nuevas (0 → 19,8) que con los textos apartados (5,6 →
+20,3), con clips que pasan de 0 a 93 % y uno a 200 %: el clon con adaptador se vuelve poco inteligible.
+
+Lectura:
+
+- **La melodía media sí se acerca a Carlos**, que era lo que faltaba en la fase 1, pero a costa de romper
+  el habla. El adaptador mueve la condición un 29 % para bajar la pérdida un 2,5 %: al generar, la condición
+  sale de la zona que la cabeza conoce y los latentes se degradan. La pérdida con forzado no avisa de eso,
+  porque al entrenar la condición siempre viene del audio real y al generar viene de lo que el propio clon
+  va diciendo (hipótesis, no medida).
+- **El juez solo no vale como puerta**: sube +0,22 con un audio peor en todo lo demás. Aprendió «suena a
+  grabación real» y un audio más sucio se le parece más. Siempre acompañado de WER, UTMOS e identidad.
+- La puerta con varias métricas cumplió su función: sin ella, el +0,22 del juez habría parecido un éxito.
+
+Queda para decidir: regularizar el adaptador (menos movimiento de la condición, entrenar con la condición
+que sale de generar) o cambiar de palanca: pausas y ritmo, que la fase 1 señaló como la mayor diferencia y
+son del LM, no de la difusión.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
