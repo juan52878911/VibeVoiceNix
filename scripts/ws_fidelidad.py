@@ -877,11 +877,15 @@ def main():
         import pausas as PZ
         print("\n[forma]")
         dist = [0.25, 0.45, 0.8]
-        texto = " ".join(FRASES)
+        # Un parrafo con varios finales de frase: las FRASES cortas pueden salir
+        # sin ninguna pausa de 150 ms y entonces la prueba no probaria nada.
+        texto = ("Bueno, buenos dias a todos. Hoy vamos a hablar de la operacion del "
+                 "banco, de los documentos y de los tiempos de respuesta. Primero, el "
+                 "proceso actual. Despues, lo que cambia con la plataforma nueva.")
         base = http_stream(a.url, a.token, texto, a.voz, a.cfg, a.semilla, a.pasos)
         conf = http_stream(a.url, a.token, texto, a.voz, a.cfg, a.semilla, a.pasos,
                            pausas=dist)
-        ses = http_sesion(a.url, a.token, f"forma-{a.semilla}", FRASES, a.voz,
+        ses = http_sesion(a.url, a.token, f"forma-{a.semilla}", [texto], a.voz,
                           a.cfg, a.semilla, a.pasos, pausas=dist)
         a_float = lambda b: np.frombuffer(b, "<i2").astype(np.float32) / 32768
         ok, detalle = PZ.tramos_identicos(a_float(base), a_float(conf))
@@ -891,10 +895,11 @@ def main():
         print(f"  {'OK ' if ok else 'FALLO'} tramos con voz: {detalle}")
         if not ok:
             fallos.append(f"forma: {detalle}")
-        cambia = n_pausas == 0 or len(base) != len(conf)
-        print(f"  {'OK ' if cambia else 'FALLO'} las pausas cambian de duracion")
+        cambia = n_pausas > 0 and len(base) != len(conf)
+        print(f"  {'OK ' if cambia else 'FALLO'} las pausas cambian de duracion"
+              + ("" if n_pausas else " (la base no tiene pausas: la prueba no prueba nada)"))
         if not cambia:
-            fallos.append("forma: el audio conformado dura lo mismo que la base")
+            fallos.append("forma: sin pausas en la base o el conformado dura lo mismo")
         igual = md5(ses) == md5(conf)
         print(f"  {'OK ' if igual else 'FALLO'} sesion HTTP == /tts/stream con forma "
               f"({md5(ses)} / {md5(conf)})")
