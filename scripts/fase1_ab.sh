@@ -67,8 +67,10 @@ tanda() {  # $1 etiqueta  $2 voz-stream.py  $3 codigo OV
   local etiqueta=$1
   VIBEVOICE_OV_CODIGO=$3 $PY "$2" > "$SALIDA/$etiqueta.log" 2>&1 &
   SERVIDOR=$!
-  for _ in $(seq 1 100); do
+  # Hasta 12 min, como voz-stream-sin-swap: la carga vieja con swap tardo mas de 5 (14-09-2026)
+  for _ in $(seq 1 240); do
     curl -fsS -m 3 "http://127.0.0.1:$PUERTO/health" >/dev/null 2>&1 && break
+    kill -0 "$SERVIDOR" 2>/dev/null || break
     sleep 3
   done
   if ! curl -fsS -m 3 "http://127.0.0.1:$PUERTO/health" >/dev/null 2>&1; then
