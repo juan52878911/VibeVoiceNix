@@ -1754,13 +1754,14 @@ class StreamerCancelable:
         self.terminado = True
         if self.forma is not None:
             # Lo que el conformador aun retiene es el silencio final: sale tal cual.
+            # El indice va como tensor: AsyncAudioStreamer.put hace .item().
             for x in self.forma.cerrar():
-                self.interno.put([torch.from_numpy(x).reshape(1, -1)], [0])
+                self.interno.put([torch.from_numpy(x).reshape(1, -1)], torch.LongTensor([0]))
         # Si NADA sono, el recorte se lo habria comido todo: se devuelve un
         # fotograma para no cerrar con un WAV vacio.
         rescate = self.entrada.rescate()
         if rescate is not None:
-            self.interno.put([rescate], [0])
+            self.interno.put([rescate], torch.LongTensor([0]))
         self.interno.end(indices)
 
     def flujo(self):
