@@ -2,14 +2,17 @@
 """Fase 4, puerta: pausas y ritmo contra la base, con cobertura, WER, UTMOS e identidad.
 
     pkgs/vibevoice/.venv/bin/python scripts/fase4_puerta.py --dir dir/fase4 --reales dir/reales
+    pkgs/vibevoice/.venv/bin/python scripts/fase4_puerta.py --dir dir/fase4b --reales dir/reales --primario silabas
 
 --dir es la salida de fase4_pausas.py (una carpeta por variante y medidas_vm.json); --reales tiene
 <persona>/*.wav con su audio real, solo para la huella ECAPA (se borra al acabar: datos biométricos).
 Guarda lo medido por clip en <dir>/puerta4_cache.json, así que se puede relanzar a mitad.
 
-PUERTA (fijada antes de medir, docs/plan-personalidad-voz.md, fase 4), cada variante contra base:
-  objetivo (Carlos), clips apartados: |pausas/min − real| baja con IC 95 % superior < 0; |sílabas/s − real|
-      no sube de media
+PUERTA (fijada antes de medir, docs/plan-personalidad-voz.md, fases 4 y 4b), cada variante contra base:
+  objetivo (Carlos), clips apartados:
+      --primario pausas (fase 4):  |pausas/min − real| baja con IC 95 % superior < 0 y |sílabas/s − real|
+                                   no sube de media
+      --primario silabas (fase 4b): |sílabas/s − real| baja con IC 95 % superior < 0 (las pausas se informan)
   control (Liliana), clips apartados: |pausas/min − real| no sube más de 2 de media; |sílabas/s − real|
       no más de 0,3
   todas las personas, todos los clips: WER medio sin subir más de 0,5 puntos; NINGÚN clip con WER > 25 %
@@ -29,11 +32,9 @@ sys.path.insert(0, str(RAIZ))
 import fidelidad as FI  # noqa: E402
 import naturalidad as NA  # noqa: E402
 
-VARIANTES = ("base", "trozos", "saltos", "trozos_r", "saltos_r")
-
 
 def ic95(d, n=2000):
-    d = np.asarray([v for v in d if v == v], float)
+    d = np.asarray([v for v in d if v is not None and v == v], float)
     if len(d) == 0:
         return float("nan"), float("nan"), float("nan")
     medias = np.random.default_rng(0).choice(d, (n, len(d)), replace=True).mean(1)
@@ -52,6 +53,7 @@ def main():
     ap.add_argument("--reales", required=True)
     ap.add_argument("--objetivo", default="carlos-segura")
     ap.add_argument("--control", nargs="*", default=["liliana-morales"])
+    ap.add_argument("--primario", choices=("pausas", "silabas"), default="pausas")
     ap.add_argument("--whisper", default="large-v3")
     a = ap.parse_args()
     import librosa
@@ -61,6 +63,7 @@ def main():
     torch.set_num_threads(os.cpu_count() or 8)
     d = Path(a.dir)
     vm = json.load(open(d / "medidas_vm.json", encoding="utf-8"))
+    variantes = vm.get("variantes", ["base", "trozos", "saltos", "trozos_r", "saltos_r"])
     frases = json.load(open(d / "base" / "frases.json", encoding="utf-8"))
     cache_ruta = d / "puerta4_cache.json"
     cache = json.load(open(cache_ruta)) if cache_ruta.exists() else {}
@@ -86,7 +89,7 @@ def main():
 
     for i, (fichero, fila) in enumerate(sorted(vm["clips"].items()), 1):
         texto = frases[fila["frase"]]
-        for var in VARIANTES:
+        for var in variantes:
             clave = f"{var}/{fichero}"
             if clave in cache:
                 continue
@@ -108,27 +111,33 @@ def main():
         return cache[f"{var}/{fichero}"][k]
 
     informe = {}
-    for var in VARIANTES[1:]:
+    for var in variantes[1:]:
         r = {"personas": {}}
         for p in vm["personas"]:
             clips = {f: fila for f, fila in vm["clips"].items() if fila["voz"] == p}
             ap_ = {f: fila for f, fila in clips.items() if fila["tipo"] == "apartado"}
             rv = vm["reales_val"][p]
 
-            def dist(f, fila, k, v):
-                return abs(fila["variantes"][v][k] - rv[fila["clip_real"]][k])
+            def dist(fila, k, v):
+                a_, b_ = fila["variantes"][v][k], rv[fila["clip_real"]][k]
+                return None if a_ is None or b_ is None else abs(a_ - b_)
 
-            dp = [dist(f, fl, "pausas_min", var) - dist(f, fl, "pausas_min", "base") for f, fl in ap_.items()]
-            ds = [dist(f, fl, "silabas_s", var) - dist(f, fl, "silabas_s", "base") for f, fl in ap_.items()]
+            def dif(fila, k):
+                dv, db = dist(fila, k, var), dist(fila, k, "base")
+                return None if dv is None or db is None else dv - db
+
+            dp = [dif(fl, "pausas_min") for fl in ap_.values()]
+            ds = [dif(fl, "silabas_s") for fl in ap_.values()]
+            dm = [dif(fl, "mediana_pausa") for fl in ap_.values()]
             wer = [m(var, f, "wer") - m("base", f, "wer") for f in clips]
             catastrofes = [f for f in clips if m(var, f, "wer") > 25 and m("base", f, "wer") <= 10]
             cobertura = [f for f in clips if not 0.85 <= m(var, f, "cobertura") <= 1.15
                          and 0.85 <= m("base", f, "cobertura") <= 1.15]
             ut = [m(var, f, "utmos") - m("base", f, "utmos") for f in clips]
             ec = [m(var, f, "ecapa") - m("base", f, "ecapa") for f in clips]
-            fila = {"dist_pausas": ic95(dp), "dist_silabas": ic95(ds), "wer": ic95(wer), "utmos": ic95(ut),
-                    "ecapa": ic95(ec), "catastrofes": catastrofes, "fuera_de_cobertura": cobertura,
-                    "n_apartados": len(ap_), "n_clips": len(clips),
+            fila = {"dist_pausas": ic95(dp), "dist_silabas": ic95(ds), "dist_mediana_pausa": ic95(dm),
+                    "wer": ic95(wer), "utmos": ic95(ut), "ecapa": ic95(ec), "catastrofes": catastrofes,
+                    "fuera_de_cobertura": cobertura, "n_apartados": len(ap_), "n_clips": len(clips),
                     "media": {k: float(np.mean([fl["variantes"][var][k] for fl in ap_.values()]))
                               for k in ("pausas_min", "silabas_s")},
                     "media_base": {k: float(np.mean([fl["variantes"]["base"][k] for fl in ap_.values()]))
@@ -138,8 +147,11 @@ def main():
             crit = {"wer": fila["wer"][0] <= 0.5, "sin_catastrofes": not catastrofes, "cobertura": not cobertura,
                     "utmos": fila["utmos"][0] >= -0.05, "ecapa": fila["ecapa"][0] >= -0.01}
             if p == a.objetivo:
-                crit["pausas"] = fila["dist_pausas"][2] < 0
-                crit["silabas"] = fila["dist_silabas"][0] <= 0
+                if a.primario == "pausas":
+                    crit["pausas"] = fila["dist_pausas"][2] < 0
+                    crit["silabas"] = fila["dist_silabas"][0] <= 0
+                else:
+                    crit["silabas"] = fila["dist_silabas"][2] < 0
             elif p in a.control:
                 crit["pausas"] = fila["dist_pausas"][0] <= 2.0
                 crit["silabas"] = fila["dist_silabas"][0] <= 0.3
@@ -149,19 +161,20 @@ def main():
         r["pasa"] = all(f["pasa"] for f in r["personas"].values())
         informe[var] = r
     que_pasan = [v for v in informe if informe[v]["pasa"]]
-    mejor = min(que_pasan, key=lambda v: informe[v]["personas"][a.objetivo]["dist_pausas"][0]) if que_pasan else None
-    json.dump({"variantes": informe, "pasan": que_pasan, "elegida": mejor}, open(d / "puerta4.json", "w"),
-              ensure_ascii=False, indent=1)
+    clave_orden = "dist_pausas" if a.primario == "pausas" else "dist_silabas"
+    mejor = min(que_pasan, key=lambda v: informe[v]["personas"][a.objetivo][clave_orden][0]) if que_pasan else None
+    json.dump({"variantes": informe, "pasan": que_pasan, "elegida": mejor, "primario": a.primario},
+              open(d / "puerta4.json", "w"), ensure_ascii=False, indent=1)
 
-    print("\n== puerta 4 (variante − base; apartados para pausas y sílabas, todos los clips para el resto)")
+    print(f"\n== puerta (primario {a.primario}; variante − base; apartados para pausas y sílabas, todos los clips para el resto)")
     for var, r in informe.items():
         print(f"\n  {var}: {'PASA' if r['pasa'] else 'no pasa'}")
         for p, f in r["personas"].items():
             print(f"    {p} (apartados {f['n_apartados']}, clips {f['n_clips']}) · pausas/min {f['media_base']['pausas_min']:.1f} -> "
                   f"{f['media']['pausas_min']:.1f} [real {f['media_real']['pausas_min']:.1f}] · silabas/s {f['media_base']['silabas_s']:.2f} -> "
                   f"{f['media']['silabas_s']:.2f} [real {f['media_real']['silabas_s']:.2f}]")
-            for k in ("dist_pausas", "dist_silabas", "wer", "utmos", "ecapa"):
-                print(f"      {k:12s} {f[k][0]:+.3f} [{f[k][1]:+.3f}, {f[k][2]:+.3f}]")
+            for k in ("dist_pausas", "dist_silabas", "dist_mediana_pausa", "wer", "utmos", "ecapa"):
+                print(f"      {k:18s} {f[k][0]:+.3f} [{f[k][1]:+.3f}, {f[k][2]:+.3f}]")
             print(f"      catastrofes {len(f['catastrofes'])} · fuera de cobertura {len(f['fuera_de_cobertura'])} · "
                   + " ".join(f"{k}={'ok' if v else 'NO'}" for k, v in f["criterios"].items()))
     print(f"\n  pasan {que_pasan} · elegida {mejor}")

@@ -3,6 +3,8 @@
 
     python scripts/fase4_pausas.py --dataset /var/lib/taller/dataset-voces --fase2 /var/lib/taller/fase2b \
         --voces /var/lib/taller/fase1/voces --salida /var/lib/taller/fase4
+    python scripts/fase4_pausas.py ... --salida /var/lib/taller/fase4b --semillas 23 42 \
+        --variantes base forma forma_r frases frases_r
 
 LO QUE SE SABE (docs/plan-personalidad-voz.md, fase 4):
   - El clon de Carlos hace 10 pausas por minuto y Carlos 21, y va más lento (4,6 frente a 5,2 sílabas/s).
@@ -13,16 +15,21 @@ LO QUE SE SABE (docs/plan-personalidad-voz.md, fase 4):
 
 LAS VARIANTES, mismo texto y misma semilla por voz-stream (el motor de producción):
   base      el texto tal cual
+  forma     la base con las pausas re-duradas (fase 4b: el contenido es el de la base)
   trozos    partido en los signos donde toca pausar, una petición por trozo, unidos con una pausa
   saltos    una sola petición con "\n" en esos signos
+  frases    como trozos, pero cortando SOLO en fin de frase y con trozos de al menos 8 palabras (fase 4b)
   *_r       lo mismo con la velocidad de la persona (WSOLA de estirar.py)
-En todas menos la base, cada pausa (racha callada >= 150 ms, la definición de perfil_vocal.py) pasa a
-durar lo que sale de la distribución de pausas reales de la persona, sorteada con semilla por clip.
+Salvo en la base, cada pausa (racha callada >= 150 ms, la definición de perfil_vocal.py) pasa a durar lo
+que sale de la distribución de pausas reales de la persona, sorteada con semilla por clip.
 
-DÓNDE PAUSAR: en un signo, si desde la última pausa van al menos K palabras. K se calibra con los clips de
-ENTRENAMIENTO para igualar sus palabras por pausa reales. Los trozos de menos de 4 palabras se unen al
-siguiente: un trozo muy corto es donde el modelo se inventa cosas. La velocidad se calibra con 12 textos
-de entrenamiento (factor 0,85-1,20). Los clips apartados de la fase 2b no calibran nada.
+MEDIDO EN LA FASE 4: `saltos` se come el último tramo (el "\n" dispara el fin de locución) y `trozos`
+con trozos cortos inventa, se salta palabras o repite texto de la referencia de voz. De ahí la 4b.
+
+DÓNDE PAUSAR (trozos, saltos): en un signo, si desde la última pausa van al menos K palabras. K se calibra
+con los clips de ENTRENAMIENTO para igualar sus palabras por pausa reales. Los trozos de menos de 4
+palabras se unen al siguiente. La velocidad se calibra con 12 textos de entrenamiento (factor 0,85-1,20).
+Los clips apartados de la fase 2b no calibran nada.
 
 Deja <salida>/<variante>/ con los WAV, clips.csv y frases.json (el texto SIN los "\n": es lo que se pidió
 decir) y <salida>/medidas_vm.json con pausas y velocidad de cada clip y de los clips reales apartados.
@@ -50,11 +57,19 @@ SR = 24000
 HOP = 240
 MIN_RACHA = 15          # 150 ms, como perfil_vocal.py
 MIN_TROZO = 4
-SEMILLAS = (101, 7)
+MIN_FRASE = 8
 SIGNOS = ",.;:?!"
+FIN_FRASE = ".?!"
 VOCALES = re.compile(r"[aeiouáéíóúü]+", re.I)
 CORTE = re.compile(r"(?<=[,.;:?!])\s+")
-VARIANTES = ("base", "trozos", "saltos", "trozos_r", "saltos_r")
+CONOCIDAS = ("base", "forma", "forma_r", "trozos", "trozos_r", "saltos", "saltos_r", "frases", "frases_r")
+
+
+def descomponer(var):
+    """variante -> (de qué generación sale, si se re-duran las pausas, si se cambia la velocidad)."""
+    rapida = var.endswith("_r")
+    raiz = var.removesuffix("_r")
+    return ("base" if raiz in ("base", "forma") else raiz), raiz != "base", rapida
 
 
 # ------------------------------------------------------------------ medida
@@ -95,23 +110,23 @@ def medir(x, texto):
 
 
 # ------------------------------------------------------------------ texto
-def trozos(texto, k):
+def trozos(texto, k, signos=SIGNOS, min_trozo=MIN_TROZO):
     piezas = [p for p in CORTE.split(texto.strip()) if p]
     out, cur = [], []
     for p in piezas:
         cur.append(p)
-        if palabras(" ".join(cur)) >= k and p[-1] in SIGNOS:
+        if palabras(" ".join(cur)) >= k and p[-1] in signos:
             out.append(" ".join(cur))
             cur = []
     if cur:
         out.append(" ".join(cur))
     unidos = []
     for t in out:
-        if unidos and palabras(unidos[-1]) < MIN_TROZO:
+        if unidos and palabras(unidos[-1]) < min_trozo:
             unidos[-1] = f"{unidos[-1]} {t}"
         else:
             unidos.append(t)
-    if len(unidos) > 1 and palabras(unidos[-1]) < MIN_TROZO:
+    if len(unidos) > 1 and palabras(unidos[-1]) < min_trozo:
         ultimo = unidos.pop()
         unidos[-1] = f"{unidos[-1]} {ultimo}"
     return unidos
@@ -183,6 +198,9 @@ def main():
     ap.add_argument("--voces", required=True, help="los .pt de clonar_voz.py de la fase 1")
     ap.add_argument("--salida", required=True)
     ap.add_argument("--personas", nargs="+", default=["carlos-segura", "liliana-morales"])
+    ap.add_argument("--semillas", nargs="+", type=int, default=[101, 7])
+    ap.add_argument("--variantes", nargs="+", default=["base", "trozos", "saltos", "trozos_r", "saltos_r"],
+                    choices=CONOCIDAS)
     ap.add_argument("--url", default="http://127.0.0.1:8082")
     ap.add_argument("--token-env", default="/var/lib/voz/token.env")
     ap.add_argument("--voces-servicio", default="/run/voz-stream/voces")
@@ -193,6 +211,10 @@ def main():
     import soundfile as sf
     from estirar import estirar
     sal, ds = Path(a.salida), Path(a.dataset)
+    variantes = ["base"] + [v for v in a.variantes if v != "base"]
+    fuentes = sorted({descomponer(v)[0] for v in variantes})
+    rapidas = sorted({descomponer(v)[0] for v in variantes if descomponer(v)[2]})
+    print(f"variantes {variantes} · generaciones {fuentes} · semillas {a.semillas}", flush=True)
 
     def leer(ruta):
         x, _ = sf.read(str(ruta), dtype="float32")
@@ -241,11 +263,17 @@ def main():
             clip = Path(f["fichero"]).stem
             if f["hablante"] == p and (p, clip) in apartados:
                 reales_val[p][clip] = medir(leer(ds / f["fichero"]), f["texto"])
-                trabajo.append((p, clip, f["texto"].strip(), "apartado", SEMILLAS))
+                trabajo.append((p, clip, f["texto"].strip(), "apartado", tuple(a.semillas)))
         for i, t in enumerate(FRASES_NUEVAS):
-            trabajo.append((p, f"nuevo-{i}", t, "nuevo", SEMILLAS))
+            trabajo.append((p, f"nuevo-{i}", t, "nuevo", tuple(a.semillas)))
         for f in cal:
-            trabajo.append((p, f"cal-{Path(f['fichero']).stem}", f["texto"].strip(), "calibracion", (101,)))
+            trabajo.append((p, f"cal-{Path(f['fichero']).stem}", f["texto"].strip(), "calibracion", (a.semillas[0],)))
+    texto_de = {(p, clave): texto for p, clave, texto, _, _ in trabajo}
+
+    def partes_de(p, texto, fuente):
+        if fuente == "frases":
+            return trozos(texto, 1, FIN_FRASE, MIN_FRASE)
+        return trozos(texto, calib[p]["k"])
 
     # ------------------------------------------------ generar por voz-stream
     token = next(linea.split("=", 1)[1].strip() for linea in open(a.token_env) if linea.startswith("VOZ_TOKEN="))
@@ -269,47 +297,45 @@ def main():
             copiadas.append(destino)
         print(f"== generando {len(trabajo)} textos", flush=True)
         for p, clave, texto, tipo, semillas in trabajo:
-            partes = trozos(texto, calib[p]["k"])
             for s in semillas:
                 nombre = f"{p}__{clave}__s{s}"
-                if tipo != "calibracion":
-                    pedir(sal / "_crudo" / "base" / f"{nombre}.wav", texto, p, s)
-                for i, t in enumerate(partes):
-                    pedir(sal / "_crudo" / "trozos" / f"{nombre}__t{i}.wav", t, p, s)
-                pedir(sal / "_crudo" / "saltos" / f"{nombre}.wav", "\n".join(partes), p, s)
+                for fuente in fuentes:
+                    if fuente == "base":
+                        pedir(sal / "_crudo" / "base" / f"{nombre}.wav", texto, p, s)
+                    elif fuente == "saltos":
+                        pedir(sal / "_crudo" / "saltos" / f"{nombre}.wav", "\n".join(partes_de(p, texto, fuente)), p, s)
+                    else:
+                        for i, t in enumerate(partes_de(p, texto, fuente)):
+                            pedir(sal / "_crudo" / fuente / f"{nombre}__t{i}.wav", t, p, s)
     finally:
         for c in copiadas:
             c.unlink(missing_ok=True)
     print(f"== generado en {(time.time() - t0) / 60:.1f} min ({n} peticiones nuevas)", flush=True)
 
     # ------------------------------------------------ variantes
-    texto_de = {(p, clave): texto for p, clave, texto, _, _ in trabajo}
-
-    def onda_cruda(p, clave, s, variante):
+    def onda_cruda(p, clave, s, fuente):
         nombre = f"{p}__{clave}__s{s}"
-        if variante == "base":
-            return leer(sal / "_crudo" / "base" / f"{nombre}.wav")
-        if variante == "saltos":
-            return leer(sal / "_crudo" / "saltos" / f"{nombre}.wav")
-        partes = trozos(texto_de[(p, clave)], calib[p]["k"])
-        return unir([leer(sal / "_crudo" / "trozos" / f"{nombre}__t{i}.wav") for i in range(len(partes))],
+        if fuente in ("base", "saltos"):
+            return leer(sal / "_crudo" / fuente / f"{nombre}.wav")
+        partes = partes_de(p, texto_de[(p, clave)], fuente)
+        return unir([leer(sal / "_crudo" / fuente / f"{nombre}__t{i}.wav") for i in range(len(partes))],
                     zlib.crc32(nombre.encode()))
 
     velocidad = {}
     for p in a.personas:
         velocidad[p] = {}
-        for var in ("trozos", "saltos"):
+        for fuente in rapidas:
             voc_r = dur_r = voc_v = dur_v = 0.0
             for p2, clave, texto, tipo, _ in trabajo:
                 if p2 != p or tipo != "calibracion":
                     continue
-                nombre = f"{p}__{clave}__s101"
-                y = forma_pausas(onda_cruda(p, clave, 101, var), calib[p]["dist"], zlib.crc32(nombre.encode()))
+                nombre = f"{p}__{clave}__s{a.semillas[0]}"
+                y = forma_pausas(onda_cruda(p, clave, a.semillas[0], fuente), calib[p]["dist"], zlib.crc32(nombre.encode()))
                 real = leer(ds / p / f"{clave[4:]}.wav")
                 voc = len(VOCALES.findall(texto))
                 voc_r, dur_r = voc_r + voc, dur_r + len(real) / SR
                 voc_v, dur_v = voc_v + voc, dur_v + len(y) / SR
-            velocidad[p][var] = float(np.clip((voc_r / dur_r) / (voc_v / dur_v), 0.85, 1.20))
+            velocidad[p][fuente] = float(np.clip((voc_r / dur_r) / (voc_v / dur_v), 0.85, 1.20))
         print(f"{p}: velocidad calibrada {velocidad[p]}", flush=True)
 
     medidas, frases = {}, {}
@@ -322,19 +348,19 @@ def main():
             sem = zlib.crc32(nombre.encode())
             fila = {"voz": p, "frase": f"{p}__{clave}", "tipo": tipo, "clip_real": clave if tipo == "apartado" else None,
                     "variantes": {}}
-            for var in VARIANTES:
+            for var in variantes:
                 ruta = sal / var / f"{nombre}.wav"
                 if not ruta.exists():
-                    base_var = var.removesuffix("_r")
-                    y = onda_cruda(p, clave, s, base_var)
-                    if var.endswith("_r"):
-                        y = estirar(y, velocidad[p][base_var])
-                    if var != "base":
+                    fuente, con_forma, rapida = descomponer(var)
+                    y = onda_cruda(p, clave, s, fuente)
+                    if rapida:
+                        y = estirar(y, velocidad[p][fuente])
+                    if con_forma:
                         y = forma_pausas(y, calib[p]["dist"], sem)
                     escribir(ruta, y)
                 fila["variantes"][var] = medir(leer(ruta), texto)
             medidas[f"{nombre}.wav"] = fila
-    for var in VARIANTES:
+    for var in variantes:
         with open(sal / var / "clips.csv", "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=["fichero", "frase", "voz", "semilla"])
             w.writeheader()
@@ -345,7 +371,7 @@ def main():
     for c in calib.values():
         c.pop("dist")
     json.dump({"calibracion": calib, "velocidad": velocidad, "reales_val": reales_val, "clips": medidas,
-               "personas": a.personas, "argumentos": vars(a)},
+               "personas": a.personas, "variantes": variantes, "argumentos": vars(a)},
               open(sal / "medidas_vm.json", "w"), ensure_ascii=False, indent=1)
 
     print("\n== pausas/min y silabas/s de media (clips apartados; real entre corchetes)")
@@ -354,7 +380,7 @@ def main():
         rp = np.mean([reales_val[p][f["clip_real"]]["pausas_min"] for f in ap_clips])
         rs = np.mean([reales_val[p][f["clip_real"]]["silabas_s"] for f in ap_clips])
         print(f"   {p} [real {rp:.1f} pausas/min · {rs:.2f} silabas/s]")
-        for var in VARIANTES:
+        for var in variantes:
             print(f"     {var:9s} {np.mean([f['variantes'][var]['pausas_min'] for f in ap_clips]):5.1f} pausas/min · "
                   f"{np.mean([f['variantes'][var]['silabas_s'] for f in ap_clips]):.2f} silabas/s")
     print(f"listo en {(time.time() - t0) / 60:.1f} min · {sal / 'medidas_vm.json'}")

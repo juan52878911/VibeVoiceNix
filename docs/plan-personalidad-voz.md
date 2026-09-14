@@ -343,6 +343,50 @@ Pasa la variante que cumpla todo; si pasa más de una, la de menor distancia de 
 cuatro variantes contra la misma base: una que pase por los pelos se confirma con otras semillas antes
 de llevarla a producción.
 
+#### Resultado de la fase 4 (14-09-2026): NO PASA NINGUNA
+
+431 peticiones a voz-stream en 30 min con la voz en marcha. K salió 1 para las dos (pausar en todos los
+signos; aun así la regla da 17,5 palabras por pausa con Carlos frente a 7,4 reales: los clips tienen
+pocos signos por dentro). Velocidad calibrada: Carlos 1,00 (trozos) y 1,05 (saltos); Liliana 1,08-1,09.
+
+| clips apartados, media | pausas/min | sílabas/s |
+|---|---|---|
+| Carlos real | 22,5 | 5,19 |
+| Carlos base → trozos / saltos / trozos_r / saltos_r | 17,7 → 20,8 / 22,0 / 21,0 / 22,2 | 4,49 → 5,18 / 4,94 / 5,18 / 5,16 |
+| Liliana real | 17,3 | 5,92 |
+| Liliana base → trozos / saltos / trozos_r / saltos_r | 13,9 → 21,9 / 26,6 / 23,5 / 26,1 | 5,84 → 5,17 / 5,02 / 5,55 / 5,47 |
+
+- **Carlos, de media, sí**: pausas y velocidad quedan casi en las suyas, y la distancia de sílabas/s por clip
+  baja con IC bajo 0 en trozos y trozos_r. Pero la de pausas por clip no (IC cruza 0: en clips de 5-10 s
+  una pausa más o menos son ±6-12 por minuto), y `trozos` mete 2 clips catastróficos.
+- **Liliana, no**: todas le sobran pausas (22-27 frente a 17) y su WER sube 7-12 puntos. El control hizo
+  su trabajo: pausar en todos los signos no es «su» ritmo.
+- **Por qué fallan, leyendo las transcripciones**:
+  - `saltos`: el `\n` dispara el fin de locución y el modelo se COME el último tramo («No todos los», «Fui el
+    sábado y la verdad me pareció carísimo…», «Íbamos ganando…»). Es exactamente lo que no se puede permitir.
+  - `trozos`: un trozo corto con poco contexto hace que el modelo invente — en Liliana repite texto de la
+    transcripción de SU PROPIA referencia de voz («…nosotros debemos dar a las entes pues mejore también») —,
+    se salte palabras («de horas extras») o convierta la frase en pregunta («¿Para qué es información?»).
+  - La base también tiene 8 de 90 clips con WER > 25 % (sobre todo Liliana y frases nuevas): no es todo
+    de las variantes, pero la puerta solo cuenta los que la base decía bien.
+
+#### Fase 4b: ritmo sin tocar el contenido, puerta fijada antes de medir (14-09-2026)
+
+Lo que no rompe la cobertura es no cambiar lo que se genera. Variantes, todas desde la misma generación
+que la base salvo `frases`:
+
+- `forma`: la base con cada pausa ≥ 150 ms re-durada con la distribución real de la persona.
+- `forma_r`: lo mismo con la velocidad de la persona (calibrada en 12 textos de entrenamiento).
+- `frases`, `frases_r`: cortes SOLO en fin de frase (. ? !) y trozos de al menos 8 palabras, para no dar
+  al modelo trozos cortos; luego pausas re-duradas (y velocidad).
+
+**Semillas nuevas, 23 y 42**: las 101 y 7 ya se han mirado. Mismos textos (apartados y frases nuevas).
+
+**Puerta**: la de la fase 4 (cobertura, catástrofes, WER, UTMOS, ECAPA y el control de Liliana) salvo el
+criterio principal de Carlos, que pasa a ser el RITMO: |sílabas/s − real| por clip baja con IC 95 %
+superior < 0. Las pausas por minuto se informan pero no deciden (`forma` no puede cambiar cuántas hay).
+Pasa la que cumpla todo; si pasa más de una, la de menor distancia de sílabas/s en Carlos.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
