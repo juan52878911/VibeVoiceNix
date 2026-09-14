@@ -255,6 +255,14 @@ luego se sobreajusta. Se usa el paso 100.
 Lectura: el adaptador aprende algo de la voz real con unos 9 min de audio y no con menos de 2. Para
 Liliana (y cualquier voz con poco audio) el cuello es la cantidad de datos, no el método.
 
+#### 3b solo con Carlos: experimento aparte, puerta fijada antes de medir (14-09-2026)
+
+Pedido por el usuario tras ver la 3a. No rescata la fase 3: responde si el −2,5 % de pérdida de Carlos se
+nota al generar. Mismo diseño que la 3b (torch a los dos lados, cfg 3,0, 6 pasos, semillas 101 y 7, sus
+26 textos apartados más las 6 frases nuevas: 64 parejas) y los mismos umbrales, solo para Carlos: juez
+P(real) con IC inferior > 0; distancia de los 8 descriptores al perfil real con IC superior < 0; ECAPA
+contra su audio real ≥ −0,005; UTMOS ≥ −0,02; WER sin subir más de 0,5 puntos.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.

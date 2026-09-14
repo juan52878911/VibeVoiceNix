@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--cfg", type=float, default=3.0)
     ap.add_argument("--pasos", type=int, default=6)
     ap.add_argument("--hilos", type=int, default=6)
+    ap.add_argument("--personas", nargs="*", default=[], help="limitar a estas personas (por defecto, todas las evaluables)")
     a = ap.parse_args()
     import soundfile as sf
     import torch
@@ -66,7 +67,7 @@ def main():
     cuenta = {}
     for p, _ in apartados:
         cuenta[p] = cuenta.get(p, 0) + 1
-    evaluables = sorted(p for p, n in cuenta.items() if n >= 5)
+    evaluables = sorted(p for p, n in cuenta.items() if n >= 5 and (not a.personas or p in a.personas))
     frases = {}
     for p in evaluables:
         for _, c in [x for x in apartados if x[0] == p]:
