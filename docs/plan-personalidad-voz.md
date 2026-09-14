@@ -169,6 +169,29 @@ frente a conversar, que es justo lo que se quiere acercar. Validación con 33 cl
 (Juan Pablo y Daniel Felipe tienen muy poca voz para apartar clips). Pesos e informe en
 `/var/lib/taller/fase2b` de la VM, fuera del repo.
 
+#### Prueba con frases que la persona nunca dijo (13-09-2026, `scripts/fase2_texto_nuevo.py`)
+
+El juez solo había visto clones diciendo el mismo texto que el clip real. Seis frases nuevas (como mucho
+Jaccard 0,21 de palabras con cualquier clip del dataset, casi todo palabras vacías) dichas por el clon de
+Carlos, Laura y Liliana a través de voz-stream (motor de producción, sin modo taller), más el clon por
+voz-stream diciendo los textos de los clips apartados como control del motor. Puerta fijada antes: AUC(real,
+nuevo) > 0,7, AUC(mismo texto, nuevo) < 0,75 y persona por encima del azar.
+
+| P(real) media | real | clon fase 1 (torch) | voz-stream, mismo texto | voz-stream, texto nuevo |
+|---|---|---|---|---|
+| Carlos | 0,998 (26) | 0,038 (25) | 0,504 (26) | 0,377 (6) |
+| Liliana | 0,883 (7) | 0,012 (5) | 0,102 (7) | 0,258 (6) |
+| Laura | 0,658 (1) | — | 0,771 (1) | 0,525 (6) |
+
+- **Pasa**: AUC real/nuevo **0,980**; mismo texto/nuevo **0,560** (el texto no mueve el veredicto); persona
+  acertada **100 %** en los cuatro grupos, también con las frases nuevas.
+- **Hallazgo**: el juez se entrenó con clones de `decir.py` (torch) y los de voz-stream (OpenVINO int8) le
+  parecen bastante más reales (AUC clon torch / voz-stream 0,082). Real frente a voz-stream sigue en 0,967,
+  así que los separa, pero con menos margen. Parte de lo que aprendió es propio del motor torch. Para la
+  fase 3, juzgar siempre con el mismo motor a los dos lados del A/B, o reentrenar el juez con clones de
+  producción.
+- Laura tiene un solo clip apartado: su fila no dice nada por sí sola.
+
 ### 3 · Adaptador de estilo en la difusión
 
 Un adaptador pequeño (FiLM) sobre la condición de la cabeza de difusión, con el vector del codificador
