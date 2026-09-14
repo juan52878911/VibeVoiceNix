@@ -78,6 +78,39 @@ rango de energía, inclinación espectral, HNR y huella ECAPA.
 **Puerta**: la diferencia real − clon en cada descriptor, con intervalo por bootstrap. Si no hay una
 diferencia clara en entonación o energía, lo «plano» es timbre y la fase 3 va al decodificador.
 
+#### Resultado (13-09-2026, VM voz en modo taller, ~45 min, `scripts/fase1_personalidad.py`)
+
+Cada persona clonada con ~33 s de sus clips más largos y su transcripción; el clon dice los textos del
+RESTO de sus clips (semilla 101, cfg 3,5, 6 pasos; `decir.py` a RTF 2,83 en CPU). Diferencia clon − real
+con IC 95 % por bootstrap. Laura (4 clips de prueba), Juan Pablo y Daniel Felipe (0) quedan clonados pero
+sin evaluar.
+
+| descriptor | Carlos (n=127): real → clon | clon − real [IC] | Liliana (n=27): real → clon | clon − real [IC] |
+|---|---|---|---|---|
+| F0 | 129 → 131 Hz | +2,2 [−0,5, +4,7] | 189 → 203 Hz | **+18,9 [+12,6, +25,2]** |
+| recorrido tonal | 6,96 → 8,24 st | **+0,99 [+0,68, +1,32]** | 5,66 → 8,79 st | **+3,14 [+2,54, +3,72]** |
+| desviación | 2,15 → 2,52 st | **+0,29** | 1,71 → 2,68 st | **+0,91** |
+| microvariación | 16,5 → 18,5 cents | **+2,3** | 14,3 → 17,8 cents | **+4,1** |
+| sílabas/s | 5,22 → 4,63 | **−0,59 [−0,73, −0,45]** | 6,31 → 6,59 | +0,17 [−0,13, +0,48] |
+| pausas/min | 20,9 → 10,2 | **−8,9 [−10,7, −7,0]** | 13,1 → 13,6 | −3,5 [−7,7, +1,3] |
+| rango de energía | 22,5 → 21,1 dB | **−1,17 [−1,60, −0,78]** | 20,8 → 21,0 dB | +0,1 [−0,9, +1,0] |
+| inclinación espectral | −12,6 → −12,1 dB | **+0,50** | −9,7 → −8,4 dB | **+1,23** |
+| armonicidad (HPSS) | 1,23 → 1,00 dB | **−0,34 [−0,67, −0,02]** | 2,38 → 1,06 dB | **−0,95 [−1,64, −0,25]** |
+
+**La hipótesis se cae.** Los clones no son planos de tono: se mueven MÁS que las personas (recorrido,
+desviación y microvariación por encima en los dos). Lo que les falta es **ritmo y pausas** (el clon de
+Carlos hace la mitad de pausas y va más lento), **dinámica de energía** y **calidad de voz**: menos
+armónica y más brillante. Y el de Liliana sale ~1,3 st más agudo que ella.
+
+Salvedad que no se puede ignorar: el audio real es conversación ESPONTÁNEA separada con demucs, y el clon
+LEE la transcripción. Parte de las pausas y de la velocidad es estilo de habla espontánea, y la separación
+puede tocar la armonicidad medida. La fase 3 tiene que medirse contra eso, no contra una lectura.
+
+**Consecuencia para la fase 3**: el adaptador no va a por el tono. Ritmo y pausas son del **LM** (lo más
+caro de condicionar); dinámica, calidad de voz e inclinación son de la **difusión y el decodificador**.
+El orden razonable es empezar por lo barato y medible: condicionar la difusión (energía, calidad) y dejar
+el ritmo para después.
+
 ### 2 · Codificador de estilo
 
 Red pequeña (convolucional sobre mel, ~1-3 M de parámetros) que, de un fragmento de 2 s, predice los
