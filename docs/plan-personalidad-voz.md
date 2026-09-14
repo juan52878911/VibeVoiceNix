@@ -204,6 +204,32 @@ clon sin él — los descriptores de la fase 1 más cerca de los reales, identid
 igual o mejor, UTMOS sin bajar más de 0,02 y WER sin subir más de 0,5 puntos. Si pasa: `convertir_difusion.py`
 recibe el adaptador y el grafo fusionado lo lleva dentro.
 
+#### Diseño concreto y puertas, fijados antes de medir (13-09-2026)
+
+**Un adaptador por voz, no desde el vector de estilo.** Con cinco identidades, una red que lleve del vector
+del codificador de estilo al ajuste no generaliza a una voz nueva: sería una tabla por persona con pasos
+de más. Lo que sí se puede comprobar es si ajustar la difusión a UNA voz con su audio real la acerca a esa
+voz. Si funciona, el producto es «afinar una voz clonada con unos minutos de su audio». El vector de estilo
+sigue sirviendo de juez. `c' = c + rms(c)·(β + γ⊙ĉ + U·Vᵀ·ĉ)`, de rango 4, empieza siendo la identidad
+(~9 000 parámetros por voz); en producción son constantes dentro del grafo de difusión.
+
+**Datos** (`scripts/fase3_condiciones.py`): audio real → encoder comunitario → latentes escalados como los
+ve la cabeza; `generate()` con el prefijo del clon y la transcripción, forzado a devolver el latente REAL
+de cada fotograma y guardando la condición del LM que lo acompaña. Ni difusión ni decodificador: solo el LM.
+
+**3a · pérdida** (`scripts/fase3_adaptador.py`). Comprobación previa: la cabeza base tiene que dar menos
+pérdida con la condición de su fotograma que con la de otro al azar; si no, el forzado está mal y no se
+entrena. Puerta: en los clips que apartó la fase 2b, para cada persona con al menos 5 (Carlos y Liliana), la
+pérdida v con adaptador por debajo de la de la base con el IC 95 % por bootstrap sobre clips entero bajo 0,
+con el mismo ruido a los dos lados. El paso de entrenamiento se elige con una parte interna del
+entrenamiento, nunca con los apartados.
+
+**3b · oído** (solo si pasa la 3a). Motor torch a los dos lados, cfg 3,0, 6 pasos, semillas 101 y 7; textos
+de los clips apartados más las 6 frases nuevas. Por persona evaluable, diferencia emparejada adaptador −
+base: juez P(real) con IC inferior > 0; distancia de los 8 descriptores al perfil real (en unidades de su
+desviación) con IC superior < 0; ECAPA contra su audio real ≥ −0,005; UTMOS ≥ −0,02; WER sin subir más de
+0,5 puntos. Pasa si se cumple todo en Carlos y en Liliana.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
