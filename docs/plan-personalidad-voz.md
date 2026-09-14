@@ -387,6 +387,33 @@ criterio principal de Carlos, que pasa a ser el RITMO: |sílabas/s − real| por
 superior < 0. Las pausas por minuto se informan pero no deciden (`forma` no puede cambiar cuántas hay).
 Pasa la que cumpla todo; si pasa más de una, la de menor distancia de sílabas/s en Carlos.
 
+#### Resultado de la fase 4b (14-09-2026): NO PASA NINGUNA, pero ninguna rompe la cobertura
+
+234 peticiones en 19 min con la voz en marcha. Velocidad calibrada: Carlos 0,93 (base) y 0,89 (frases),
+Liliana 1,05 y 1,04.
+
+| variante − base | Carlos: sílabas/s por clip | WER (puntos) | UTMOS | ECAPA | catástrofes / fuera de cobertura | Liliana |
+|---|---|---|---|---|---|---|
+| `forma` | **−0,15** [−0,28, −0,02] ✅ | **+0,95** [+0,18, +1,84] ❌ | −0,02 ✅ | +0,00 ✅ | 0 / 0 | todo ✅ |
+| `forma_r` | −0,16 [−0,28, −0,04] ✅ | +0,78 ❌ | **−0,14** ❌ | +0,01 | 0 / 1 ❌ | UTMOS −0,13, ECAPA −0,04 ❌ |
+| `frases` | −0,01 ❌ (se pasa: 5,44 frente a 5,19) | +0,98 ❌ | −0,03 ✅ | **+0,04** ✅ | 0 / 0 | todo ✅ |
+| `frases_r` | −0,07 ❌ | +1,69 ❌ | **−0,25** ❌ | −0,01 | 0 / 2 ❌ | ECAPA −0,02 ❌ |
+
+- **Cero catástrofes en las cuatro**, y `forma` y `frases` sin un solo clip fuera de cobertura: cortar solo
+  en fin de frase con trozos ≥ 8 palabras quita los fallos de la fase 4.
+- **`forma` falla solo por el WER medio de Carlos (+0,95 con tope +0,5)** y no pierde contenido: es la
+  misma generación con las pausas re-duradas. 9 clips suben, 2 bajan y 53 quedan igual, y lo que cambia es
+  cómo transcribe whisper la misma voz («familias»/«familiares», «roca»/«rock a», signos de pregunta, un «que…»
+  final colgado). Comprobado: la cola tras la última pausa es idéntica muestra a muestra (0 LSB) en los
+  clips donde whisper deja de oír ese «que». Aun así la puerta dice NO y no se reinterpreta.
+- **La velocidad con WSOLA cuesta naturalidad** (UTMOS −0,14 a −0,25): descartada como palanca de ritmo.
+- **El motor de producción ya está más cerca de Carlos de lo que decía la fase 1**: esa fase medía clones de
+  torch con cfg 3,5 (10 pausas/min, 4,6 sílabas/s); por voz-stream con cfg 3,0 la base hace 16,9-17,7
+  pausas/min y 4,5-4,95 sílabas/s según la semilla, frente a 22,5 y 5,19 reales.
+
+Queda para decidir: confirmar `forma` con más semillas (el WER medio se estabiliza con más clips y la
+puerta sería la misma) o dejar el ritmo donde está.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
