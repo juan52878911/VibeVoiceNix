@@ -244,6 +244,35 @@ def cmd_lm(a):
         json.dump(resultados, open(a.salida, "w"), indent=1)
 
 
+def cmd_resumen_lm(a):
+    """Aplica la regla de docs/plan-rendimiento.md (0.2 repetida), fijada antes de medir:
+    mediana por configuracion y longitud sobre todas las rondas; cocientes con esas medianas; el mejor
+    de los dos montajes del par; la medida no vale si el IQR de t6 pasa del 25 % de su mediana."""
+    filas = json.load(open(a.lm))
+    veredictos, valida = [], True
+    for P in sorted({f["posiciones"] for f in filas}):
+        grupo = [f for f in filas if f["posiciones"] == P]
+        med = {k: statistics.median(f[k] for f in grupo)
+               for k in ("ms_6h", "ms_3h", "ms_2h", "ms_par_2streams", "ms_par_2modelos")}
+        t6 = sorted(f["ms_6h"] for f in grupo)
+        q1, q3 = np.percentile(t6, 25), np.percentile(t6, 75)
+        iqr_rel = (q3 - q1) / med["ms_6h"]
+        ok_iqr = iqr_rel <= 0.25
+        valida &= ok_iqr
+        r3 = med["ms_3h"] / med["ms_6h"]
+        par = min(med["ms_par_2streams"], med["ms_par_2modelos"]) / (2 * med["ms_6h"])
+        cumple = r3 <= 1.6 and par <= 0.80
+        veredictos.append(cumple)
+        print(f"{P:>5} posiciones, {len(grupo)} rondas: medianas "
+              + " ".join(f"{k[3:]}={v:.2f}" for k, v in med.items())
+              + f" | t3/t6={r3:.3f} par/(2 t6)={par:.3f} -> {'cumple' if cumple else 'NO cumple'}"
+              + f" | IQR t6 {100 * iqr_rel:.0f} % {'ok' if ok_iqr else 'DEMASIADO RUIDO'}")
+    if not valida:
+        print("MEDIDA NO VALIDA (IQR de t6 > 25 %): B2 sin decidir, repetir con el host en reposo")
+    else:
+        print("B2 SE ABRE" if all(veredictos) else "B2 SE CIERRA")
+
+
 # ------------------------------------------------------------------ LM de texto
 def cmd_lm_texto(a):
     import torch
@@ -287,6 +316,8 @@ def main():
     m.add_argument("--n", type=int, default=60)
     m.add_argument("--rondas", type=int, default=2)
     m.add_argument("--salida")
+    r = sub.add_parser("resumen_lm")
+    r.add_argument("lm")
     t = sub.add_parser("lm_texto")
     t.add_argument("--codigo", required=True)
     t.add_argument("--modelo", default=MODELO)
@@ -295,7 +326,8 @@ def main():
     t.add_argument("--contextos", type=lambda s: [int(x) for x in s.split(",")], default=[50, 200, 500])
     t.add_argument("--n", type=int, default=30)
     a = ap.parse_args()
-    {"carga": cmd_carga, "comparar": cmd_comparar, "lm": cmd_lm, "lm_texto": cmd_lm_texto}[a.cmd](a)
+    {"carga": cmd_carga, "comparar": cmd_comparar, "lm": cmd_lm, "resumen_lm": cmd_resumen_lm,
+     "lm_texto": cmd_lm_texto}[a.cmd](a)
 
 
 if __name__ == "__main__":
