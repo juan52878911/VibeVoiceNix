@@ -34,13 +34,16 @@ def tipo(modelo):
 
 
 class Banco:
-    def __init__(self, ir, dispositivo, posiciones=500, hilos=None):
+    def __init__(self, ir, dispositivo, posiciones=500, hilos=None, precision=None):
         core = ov.Core()
         self.modelo = core.read_model(ir)
         self.tipo = tipo(self.modelo)
         cfg = {"PERFORMANCE_HINT": "LATENCY"}
         if dispositivo == "CPU":
             cfg.update({"INFERENCE_NUM_THREADS": hilos or 6, "NUM_STREAMS": 1})
+        elif precision:
+            # la GPU calcula en f16 por defecto aunque el IR sea int8 o fp16
+            cfg["INFERENCE_PRECISION_HINT"] = precision
         t = time.perf_counter()
         self.comp = core.compile_model(self.modelo, dispositivo, cfg)
         self.compilar_s = time.perf_counter() - t
@@ -84,7 +87,7 @@ class Banco:
 
 
 def cmd_medir(a):
-    b = Banco(a.ir, a.dispositivo, a.posiciones, a.hilos)
+    b = Banco(a.ir, a.dispositivo, a.posiciones, a.hilos, a.precision)
     t = time.perf_counter()
     b.llamada()
     primera = time.perf_counter() - t
@@ -110,18 +113,19 @@ def cmd_snr(a):
         lats = [(rng.standard_normal((1, 64, 1)) * escala).astype(np.float32) for _ in range(a.n)]
         salidas = {}
         for d in ("CPU", "GPU"):
-            b = Banco(a.ir, d)
+            b = Banco(a.ir, d, precision=a.precision)
             salidas[d] = np.concatenate([b.llamada(x).reshape(-1) for x in lats])
         ref, x = salidas["CPU"].astype(np.float64), salidas["GPU"].astype(np.float64)
         snr = 10 * np.log10((ref ** 2).sum() / max(((ref - x) ** 2).sum(), 1e-30))
-        print(json.dumps({"ir": a.ir.split("/")[-1], "escala": escala, "fotogramas": a.n,
+        print(json.dumps({"ir": a.ir.split("/")[-1], "precision_gpu": a.precision or "defecto",
+                          "escala": escala, "fotogramas": a.n,
                           "rms_cpu": float(np.sqrt((ref ** 2).mean())), "rms_gpu": float(np.sqrt((x ** 2).mean())),
                           "snr_gpu_vs_cpu_db": round(float(snr), 2), "dif_max": float(np.abs(ref - x).max())}),
               flush=True)
 
 
 def cmd_bucle(a):
-    b = Banco(a.ir, a.dispositivo, a.posiciones, a.hilos)
+    b = Banco(a.ir, a.dispositivo, a.posiciones, a.hilos, a.precision)
     fin = time.time() + a.segundos
     while time.time() < fin:
         seg, ts = int(time.time()), []
@@ -145,6 +149,7 @@ def main():
         p.add_argument("--calentar", type=int, default=20)
         p.add_argument("--segundos", type=int, default=60)
         p.add_argument("--escalas", type=lambda s: [float(x) for x in s.split(",")], default=[0.5, 2.0, 5.0])
+        p.add_argument("--precision", choices=("f16", "f32"), help="INFERENCE_PRECISION_HINT de la GPU")
     a = ap.parse_args()
     {"medir": cmd_medir, "snr": cmd_snr, "bucle": cmd_bucle}[a.cmd](a)
 

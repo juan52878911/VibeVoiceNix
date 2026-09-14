@@ -120,5 +120,22 @@ pasada de 1 token:
 t6 a 1500 posiciones se dobla de una ronda a otra y los pares se invierten: se repite con la regla de
 agregación fijada arriba. Lo que sí se repite en las cuatro filas es t3/t6 = 0,92-1,26 (≤ 1,6).
 
+**0.3 iGPU, primera pasada PRELIMINAR** (LXC 204 con `/dev/dri`, OpenVINO 2025.4.1, `intel-opencl-icd`
+22.43 de Debian 12; host sin reposo, con la VM voz desplegando; no decide la puerta):
+
+| IR en GPU | resultado |
+|---|---|
+| `decoder_mm_int8` | **41,9 ms** mediana (p90 44,6), compila en 6,2 s, cálculo en f16 |
+| `decoder_mm_fp16` | 52,1 ms (p90 55,8) |
+| `difusion_p6_int8` | no compila: el plugin GPU no acepta sus formas dinámicas (`to_shape was called on a dynamic shape`) |
+| `tts_lm_estado_int4` | no compila: falta un kernel OpenCL en este runtime para Gen9 (`intel_sub_group_block_read`) |
+
+- **SNR del decodificador, GPU frente a CPU** con el mismo IR y los mismos latentes aleatorios:
+  **~16 dB** con amplitud realista (int8 15,9 y fp16 15,9, RMS 0,022). Con latentes pequeños la
+  salida es casi muda y la cifra no significa nada (4,7 dB con un RMS de 1e-6).
+- **Lectura:** 16 dB es del orden del error del int8 frente al fp16 (16,9 dB) y queda lejos de los
+  25 dB que pide C1. La sospecha es el cálculo en f16 que la GPU usa por defecto: se prueba forzando f32.
+- **Falta** la segunda mitad del umbral, la frecuencia de la CPU con la GPU al 100 %.
+
 **0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
 tokens de contexto.
