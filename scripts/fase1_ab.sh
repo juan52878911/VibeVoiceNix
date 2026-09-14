@@ -75,6 +75,14 @@ tanda() {  # $1 etiqueta  $2 voz-stream.py  $3 codigo OV
     echo "[ab] $etiqueta no arranco"; tail -20 "$SALIDA/$etiqueta.log"; exit 1
   fi
   tr '\r' '\n' < "$SALIDA/$etiqueta.log" | grep -E '\[carga\]|modelo listo'
+  # Lo mismo que voz-stream-sin-swap en produccion, en las dos variantes: la carga vieja empuja paginas
+  # del modelo al swap y la nueva no, y medir la base con fallos de pagina mayores no seria su RTF real.
+  usado=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{print (t-f)}' /proc/meminfo)
+  libre=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+  echo "[ab] $etiqueta: swap usado $((usado / 1024)) MB, disponible $((libre / 1024)) MB"
+  if [ "$usado" -gt 0 ] && [ "$usado" -lt $((libre - 524288)) ]; then
+    swapoff -a && swapon -a && echo "[ab] $etiqueta: swap devuelto a RAM"
+  fi
   $PY cli/banco_md5.py --url "http://127.0.0.1:$PUERTO" --etiqueta "$etiqueta" --rondas 3 \
       --pid "$SERVIDOR" --salida "$SALIDA/$etiqueta.json"
   if [ "$etiqueta" = variante-1 ]; then

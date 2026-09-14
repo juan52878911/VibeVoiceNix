@@ -59,6 +59,9 @@ fija ahora, **antes** de repetir y sin mirar qué resultado da cada regla:
 4. **RTF**: tandas alternas base → variante → base → variante, cada una un proceso nuevo con voz-stream
    parado; la primera ronda de cada proceso no cuenta. Pasa si la mediana del RTF de la variante
    ≤ 1,02 × la de la base. Una mejora de más del 2 % se anota pero no se atribuye al cambio sin repetir.
+   Cada tanda, base y variante por igual, devuelve el swap a RAM en cuanto el servidor responde, igual
+   que hace `voz-stream-sin-swap` en producción (añadido antes de la primera cifra: el primer intento
+   se paró al ver que la base arrancaba con 1,8 GB de pico de swap y la variante no lo tendría).
 5. **Memoria** (objetivo, no puerta de calidad): VmHWM y RSS tras el calentamiento, base y variante. Si
    el pico no baja al menos 1 GB, A1 no aporta lo que prometía y se documenta así.
 
