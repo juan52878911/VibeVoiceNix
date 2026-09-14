@@ -146,6 +146,10 @@ agregación fijada arriba. Lo que sí se repite en las cuatro filas es t3/t6 = 0
   bajo los 90 ms. En f16 se descarta: 16 dB. Esto cumple la primera mitad del umbral, **preliminar**
   mientras no se repita con el host en reposo.
 - **Falta** la segunda mitad del umbral, la frecuencia de la CPU con la GPU al 100 %.
+- **Host durante esa pasada (M, sin carga controlada, 900 s):** la iGPU tira de **9,9 W** de uncore de
+  media cuando trabaja (pico 12,5 W). El paquete sube a 34,7 W, justo el PL1 de 35 W, frente a 22,6 W
+  sin GPU. Máximo 86 °C, sin estrangulamiento térmico. La frecuencia de esos segundos no vale para el
+  umbral, porque la carga de CPU no era la misma con y sin GPU.
 
 **0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
 tokens de contexto.
