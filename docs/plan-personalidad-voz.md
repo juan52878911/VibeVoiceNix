@@ -230,6 +230,31 @@ base: juez P(real) con IC inferior > 0; distancia de los 8 descriptores al perfi
 desviación) con IC superior < 0; ECAPA contra su audio real ≥ −0,005; UTMOS ≥ −0,02; WER sin subir más de
 0,5 puntos. Pasa si se cumple todo en Carlos y en Liliana.
 
+#### Resultado de la 3a (14-09-2026): NO PASA
+
+Condiciones forzadas de los 173 clips en 21,5 min (x1,27 del audio). Las comprobaciones previas salieron
+bien: con la condición de su fotograma la cabeza base pierde 0,626 y con una cruzada 1,117 (el forzado es
+correcto), y la media del codificador (0,626) da menos pérdida que una muestra (0,646), así que la cabeza se
+entrenó con la media. Entrenamiento de 1500 pasos en 39 min; la parte interna mejora −1,91 % en el paso 100
+y a partir de ahí empeora hasta +1,41 % en el 1500: con tan pocos datos aprende lo que puede enseguida y
+luego se sobreajusta. Se usa el paso 100.
+
+| clips apartados | n | base | adaptador | diferencia | IC 95 % | puerta |
+|---|---|---|---|---|---|---|
+| Carlos | 26 | 0,6077 | 0,5924 | **−2,5 %** | [−0,0171, −0,0135] | pasa |
+| Liliana | 7 | 0,5440 | 0,5389 | −0,9 % | [−0,0114, **+0,0023**] | no pasa |
+| Laura | 1 | 0,1044 | 0,1203 | +15,2 % | — | no evaluable |
+
+- **Carlos**, con 3 956 fotogramas de entrenamiento (8,8 min), mejora con un IC lejos de 0. **Liliana**, con
+  780 (1,7 min), apunta en la misma dirección pero su IC cruza el 0: con 7 clips no se puede afirmar.
+- Incluso donde funciona la mejora es pequeña: −2,5 % de pérdida de difusión, moviendo la condición un 29 %.
+  No se sabe si eso se oye; es lo que respondería la 3b.
+- No se pasa a la 3b: la puerta pedía Carlos y Liliana. Probar la 3b solo con Carlos sería mover la
+  portería después de ver los números; si se hace, es otro experimento con su propia puerta.
+
+Lectura: el adaptador aprende algo de la voz real con unos 9 min de audio y no con menos de 2. Para
+Liliana (y cualquier voz con poco audio) el cuello es la cantidad de datos, no el método.
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
