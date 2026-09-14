@@ -78,6 +78,8 @@ def main():
     ap.add_argument("--voces-vm", default="/run/voz-stream/voces")
     ap.add_argument("--max-apartados", type=int, default=80)
     ap.add_argument("--whisper", default="large-v3")
+    ap.add_argument("--solo-sintesis", action="store_true",
+                    help="genera los WAV en la VM y sale: la puntuación va después, sin ocupar voz-stream")
     a = ap.parse_args()
     import librosa
     import soundfile as sf
@@ -124,6 +126,10 @@ def main():
     finally:
         if instaladas:
             subprocess.run(ssh + ["rm -f " + " ".join(instaladas)], check=False)
+
+    if a.solo_sintesis:
+        print("solo síntesis: la puntuación, en otra pasada", flush=True)
+        return
 
     # ------------------------------------------------------------ jueces
     ecapa = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
