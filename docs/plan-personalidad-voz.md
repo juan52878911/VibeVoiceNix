@@ -143,6 +143,32 @@ Consecuencia: el codificador de **estilo** y la salida de **persona** sirven; el
 reentrena con el audio real de ida y vuelta etiquetado como real (`scripts/fase2_idavuelta.py`,
 `--idavuelta`), con su puerta fijada antes: AUC(ida y vuelta, clon) > 0,7 y AUC(real, ida y vuelta) < 0,75.
 
+#### Resultado del reentrenamiento (13-09-2026, fase 2b)
+
+Los 173 clips reales pasados por el códec (16,9 min de audio en 14,6 min, RTF 0,86) y etiquetados como
+reales; misma partición por clip, así que la ida y vuelta de un clip apartado también queda apartada.
+32 épocas con parada temprana (28,8 min en la VM en modo taller).
+
+| salida | fase 2 | fase 2b | puerta |
+|---|---|---|---|
+| **AUC ida y vuelta / clon** | 0,80 | **0,999** | > 0,7 · pasa |
+| **AUC real / ida y vuelta** | 0,996 | **0,628** | < 0,75 · pasa |
+| AUC real / clon | 1,000 | 1,000 | — |
+| persona | 100 % | 100 % | pasa |
+| R² tono · inclinación | 0,88 · 0,63 | 0,94 · 0,66 | |
+| R² recorrido · desviación | 0,32 · 0,30 | 0,55 · 0,54 | |
+| R² movimiento · microvariación | 0,05 · 0,16 | 0,46 · 0,46 | |
+| R² rango de energía · armonicidad | 0,27 · 0,06 | 0,37 · 0,34 | |
+
+El juez ya no se apoya en el códec (0,628 queda cerca del azar) y separa casi perfecto el audio real
+pasado por el códec del clon: oye lo que pierde la GENERACIÓN. El estilo mejora en los 8 descriptores con
+el doble de audio real. **Sirve de juez de personalidad para la fase 3.**
+
+Salvedades: el real es conversación espontánea y el clon lee; parte de lo que separa puede ser leer
+frente a conversar, que es justo lo que se quiere acercar. Validación con 33 clips reales de 3 personas
+(Juan Pablo y Daniel Felipe tienen muy poca voz para apartar clips). Pesos e informe en
+`/var/lib/taller/fase2b` de la VM, fuera del repo.
+
 ### 3 · Adaptador de estilo en la difusión
 
 Un adaptador pequeño (FiLM) sobre la condición de la cabeza de difusión, con el vector del codificador
