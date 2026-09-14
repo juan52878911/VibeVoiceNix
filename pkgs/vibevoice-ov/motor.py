@@ -52,11 +52,14 @@ OMP_PLACES=cores + OMP_PROC_BIND=close acelera PyTorch un 3% pero RALENTIZA
 esto un 118% (89 ms/llamada sin anclaje, 195 con el). El modulo NixOS lo
 desactiva cuando el motor es openvino; si ejecutas a mano, no lo pongas.
 
-Orden de carga pensado para el techo de 5 GB de RAM:
-  fp32 completo (pico ~4,1 GB) -> soltar el tts_lm de torch (-2,3 GB con su
-  embed muerto) -> int8 en language_model -> compilar los IR (+0,3 GB).
+Orden de carga pensado para el techo de 5 GB de RAM (ver _construir_parcial):
+  modelo en `meta` -> soltar LM TTS, decodificador, codificador y cabeza de
+  torch SIN haberlos leido -> leer del safetensors solo lo vivo -> int8 en
+  language_model -> compilar los IR. Antes se materializaba el fp32 entero y
+  el pico de la carga era 4,39 GB de VmHWM (medido en la VM).
 """
 import gc
+import os
 import time
 import weakref
 
@@ -222,19 +225,29 @@ class TtsLmOV(torch.nn.Module):
 
 
 class CabezaOV(torch.nn.Module):
-    """Reemplazo de VibeVoiceDiffusionHead: IR estatico [2,64]/[2]/[2,896]."""
+    """Reemplazo de VibeVoiceDiffusionHead: IR estatico [2,64]/[2]/[2,896].
+
+    Se compila en la PRIMERA llamada, no al cargar. Con la difusion en un grafo
+    (DifusionOV) solo se la llama si una peticion pide otros pasos, y compilarla
+    siempre eran 42 MB de pesos y su repack sin usarse nunca.
+    """
 
     def __init__(self, ruta_xml, hilos):
         super().__init__()
-        import openvino as ov
-        core = ov.Core()
-        self.comp = core.compile_model(ruta_xml, "CPU",
-                                       {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1,
-                                        "PERFORMANCE_HINT": "LATENCY"})
-        self.pet = self.comp.create_infer_request()
+        self._ruta, self._hilos = ruta_xml, hilos
+        self.comp = self.pet = None
         self.device = torch.device("cpu")
 
+    def _compilar(self):
+        import openvino as ov
+        self.comp = ov.Core().compile_model(self._ruta, "CPU",
+                                            {"INFERENCE_NUM_THREADS": self._hilos, "NUM_STREAMS": 1,
+                                             "PERFORMANCE_HINT": "LATENCY"})
+        self.pet = self.comp.create_infer_request()
+
     def forward(self, noisy, timesteps, condition=None):
+        if self.pet is None:
+            self._compilar()
         ini = time.perf_counter()
         res = self.pet.infer([noisy.detach().float().numpy(),
                               timesteps.detach().float().numpy(),
@@ -475,6 +488,124 @@ class AcusticoOV:
         return salida
 
 
+def _memoria_mb():
+    """(RSS, VmHWM) del proceso en MB. (0, 0) donde no hay /proc."""
+    try:
+        with open("/proc/self/status") as f:
+            campos = dict(linea.split(":", 1) for linea in f if linea.startswith(("VmRSS", "VmHWM")))
+        return int(campos["VmRSS"].split()[0]) // 1024, int(campos["VmHWM"].split()[0]) // 1024
+    except (OSError, KeyError, ValueError):
+        return 0, 0
+
+
+def _marca(paso):
+    rss, pico = _memoria_mb()
+    print(f"[carga] {paso}: {rss} MB residentes, pico {pico} MB", flush=True)
+
+
+class EmbeddingMmap(torch.nn.Module):
+    """La tabla de embeddings del LM de texto, leida del safetensors por mmap.
+
+    Son 151936 x 896 en bf16 en el fichero. from_pretrained(float32) la
+    materializaba entera en fp32: 545 MB anonimos para consultar unas decenas de
+    filas por ventana de texto. Aqui la tabla son paginas del fichero -- se
+    comparten con la cache de disco y el kernel las reclama sin swap -- y solo se
+    pasan a fp32 las filas consultadas.
+
+    ES BIT A BIT LO MISMO: bf16 -> fp32 es exacto, y consultar filas y luego
+    convertirlas da los mismos bytes que convertir la tabla y luego consultar.
+    """
+
+    def __init__(self, ruta_st, clave):
+        super().__init__()
+        import json
+        import mmap
+        import struct
+        import warnings
+        with open(ruta_st, "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            info = json.loads(fh.read(n))[clave]
+            self._mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        if info["dtype"] != "BF16":
+            raise ValueError(f"{clave}: se esperaba BF16 y el fichero trae {info['dtype']}")
+        ini, fin = info["data_offsets"]
+        with warnings.catch_warnings():
+            # frombuffer avisa de que el buffer no admite escritura: es a
+            # proposito, una tabla de consulta no se escribe
+            warnings.simplefilter("ignore", UserWarning)
+            plano = torch.frombuffer(self._mm, dtype=torch.bfloat16,
+                                     count=(fin - ini) // 2, offset=8 + n + ini)
+        self._tabla = plano.view(*info["shape"])
+        self.num_embeddings, self.embedding_dim = info["shape"]
+
+    def forward(self, ids):
+        return torch.nn.functional.embedding(ids, self._tabla).float()
+
+
+CLAVE_EMBEDDINGS = "model.language_model.embed_tokens.weight"
+
+
+def _construir_parcial(modelo_path, soltar_acustico, soltar_cabeza):
+    """El modelo torch con solo los pesos que se usan, sin materializar el resto.
+
+    from_pretrained(float32) construia el checkpoint ENTERO en fp32 (~4 GB; el
+    pico de 4,39 GB de VmHWM medido en la VM, que obligaba al swap) para soltar
+    acto seguido el LM TTS, el decodificador, el codificador y la cabeza, que
+    sustituye OpenVINO. Aqui el modelo se construye en `meta` (sin memoria), esas
+    piezas se sueltan ANTES de leer nada, y del safetensors se lee solo lo que
+    queda vivo, pasado a fp32 como hacia from_pretrained. Los embeddings del LM
+    de texto van por mmap (EmbeddingMmap).
+
+    Mismos tensores, mismos dtypes, mismos buffers: lo comprueba la huella de
+    scripts/lab_fase0.py contra la carga de antes.
+    """
+    from accelerate import init_empty_weights
+    from safetensors import safe_open
+    from vibevoice.modular.modeling_vibevoice_streaming_inference import (
+        VibeVoiceStreamingForConditionalGenerationInference as Clase,
+    )
+
+    config = Clase.config_class.from_pretrained(modelo_path)
+    # Lo que hace from_pretrained con dtype=float32 antes de construir: el
+    # config y sus subconfigs pasan a float32, y el __init__ lo lee para sus
+    # .to(dtype).
+    config.dtype = torch.float32
+    for sub in getattr(config, "sub_configs", {}):
+        if getattr(config, sub, None) is not None:
+            getattr(config, sub).dtype = torch.float32
+    with init_empty_weights():          # parametros en meta; los buffers, de verdad
+        modelo = Clase._from_config(config, dtype=torch.float32, attn_implementation="sdpa")
+    modelo.eval()
+
+    m = modelo.model
+    m.tts_language_model = None
+    if soltar_acustico:
+        m.acoustic_tokenizer.decoder = None
+        m.acoustic_tokenizer.encoder = None
+        # sin parametros, .device (transformers) revienta: ancla minima
+        m.acoustic_tokenizer._ancla = torch.nn.Parameter(torch.zeros(1))
+    if soltar_cabeza:
+        m.prediction_head = None
+
+    ruta = os.path.join(modelo_path, "model.safetensors")
+    vivos = dict(modelo.named_parameters())
+    vivos.update(modelo.named_buffers())
+    sd = {}
+    with safe_open(ruta, framework="pt") as f:
+        claves = set(f.keys())
+        for nombre in vivos:
+            if nombre in claves and nombre != CLAVE_EMBEDDINGS:
+                t = f.get_tensor(nombre)
+                sd[nombre] = t.float() if t.is_floating_point() else t
+    faltan = [n for n, t in vivos.items()
+              if t.is_meta and n not in sd and n != CLAVE_EMBEDDINGS]
+    if faltan:
+        raise RuntimeError(f"pesos vivos que no estan en el checkpoint: {faltan[:5]}")
+    modelo.load_state_dict(sd, strict=False, assign=True)
+    m.language_model.embed_tokens = EmbeddingMmap(ruta, CLAVE_EMBEDDINGS)
+    return modelo
+
+
 def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None,
            hilos_acustico=None, neg_cada=1):
     """hilos_acustico separa el presupuesto del decodificador del resto.
@@ -488,39 +619,29 @@ def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None,
 
     None = el comportamiento de antes: los mismos hilos para todo.
     """
-    from vibevoice.modular.modeling_vibevoice_streaming_inference import (
-        VibeVoiceStreamingForConditionalGenerationInference,
-    )
     from vibevoice.processor.vibevoice_streaming_processor import (
         VibeVoiceStreamingProcessor,
     )
 
     procesador = VibeVoiceStreamingProcessor.from_pretrained(modelo_path)
-    modelo = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
-        modelo_path, torch_dtype=torch.float32, device_map="cpu",
-        attn_implementation="sdpa")
-    modelo.eval()
-
-    # 1) fuera el backbone torch (y su embed muerto de 0,5 GB) ANTES de nada
-    modelo.model.tts_language_model = None
-    if ir_acustico:
-        # el decoder torch (1,4 GB fp32) y el encoder (nunca se usa) sobran
-        modelo.model.acoustic_tokenizer.decoder = None
-        modelo.model.acoustic_tokenizer.encoder = None
-        # sin parametros, .device (transformers) revienta: ancla minima
-        modelo.model.acoustic_tokenizer._ancla = torch.nn.Parameter(torch.zeros(1))
+    # 1) solo lo que no sustituye OpenVINO, y sin pasar por el fp32 entero
+    modelo = _construir_parcial(modelo_path, soltar_acustico=bool(ir_acustico),
+                                soltar_cabeza=bool(ir_cabeza))
     gc.collect()
+    _marca("pesos torch leidos")
 
     # 2) int8 dinamico en el LM de texto (como en produccion)
     torch.ao.quantization.quantize_dynamic(
         modelo.model.language_model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
     gc.collect()
+    _marca("LM de texto en int8")
 
     # 3) enchufar OpenVINO
     # El bucle se queda con lo que no se lleve el decodificador. Minimo 1: un
     # reparto mal puesto no debe dejar el camino critico sin hilos.
     hilos_bucle = max(1, hilos - hilos_acustico) if hilos_acustico else hilos
     modelo.model.tts_language_model = TtsLmOV(ir_lm, hilos_bucle, neg_cada=neg_cada)
+    _marca("LM TTS compilado")
     if ir_cabeza:
         modelo.model.prediction_head = CabezaOV(ir_cabeza, hilos_bucle)
     else:
@@ -530,6 +651,7 @@ def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None,
         acustico = AcusticoOV(ir_acustico, hilos_acustico or hilos)
         modelo.model.acoustic_tokenizer.decode = acustico.decode
         modelo._acustico_ov = acustico
+        _marca("decodificador compilado")
     gc.collect()
     return procesador, modelo
 
