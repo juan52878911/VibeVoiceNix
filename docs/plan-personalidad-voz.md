@@ -445,6 +445,34 @@ Los resultados de las semillas 23 y 42 no se suman: la confirmación se decide s
 - El único fallo es `carlos-segura__videoplayback-068__s11`. La base tenía una pausa de 2,48 s tras «De esta forma.»; `forma` la acorta y whisper transcribe desde «Y acá…» (cobertura 0,81 con mínimo 0,85). **Comprobado byte a byte**: los 6 tramos con voz de la base están idénticos y en el mismo orden dentro de `forma` (5,56 s de voz). Las palabras están; es whisper sin el contexto de la pausa larga. La base de Carlos tiene 9 de 128 clips fuera de cobertura: la medida de cobertura con whisper es inestable en fragmentos cortos.
 - **La puerta dice NO y no se reinterpreta.** Llevar `forma` a producción es una decisión del usuario sabiendo esto: la puerta con whisper no puede certificar la cobertura de una transformación que, por construcción, no cambia la voz; la garantía de contenido de `forma` es estructural (tramos con voz idénticos), y esa sería la prueba que tendría que llevar en el servicio.
 
+#### Integración en producción (14-09-2026, decidida por el usuario)
+
+`forma` va en voz-stream por petición y está **apagado por defecto** (`VIBEVOICE_FORMA=0`). La puerta de la 4c no
+pasó por un clip de cobertura; el usuario decidió integrarlo sabiendo que la garantía es estructural (los tramos con
+voz no cambian), y esa garantía la comprueba ahora la suite en cada despliegue.
+
+- **Módulo `pkgs/vibevoice-cli/pausas.py`**, solo numpy. El detector es causal (ventanas de 10 ms, −35 dB respecto al
+  máximo visto hasta ese momento) y es el mismo para medir el perfil y para conformar. Mantiene 50 ms reales a cada
+  lado de la pausa y rellena en espejo. Procesado por trozos de cualquier tamaño da exactamente lo mismo que en una
+  sola pasada.
+- **API:** `pausas: [segundos]` o `forma: true` en `/tts/stream`, en las sesiones y en el websocket; `GET /voces?detalle=1`,
+  `GET /voces/{nombre}` y `POST /voces/{nombre}/pausas`. El CLI es `scripts/perfil_pausas.py`, que admite clips
+  sueltos o una pista con anotación de dobla.
+- **VM, commit `8c34be8`:** `ws_fidelidad.py` completo en verde. El md5 sin `forma` es el de antes del despliegue
+  (`2a978a26…`). La prueba de `forma`, sobre un párrafo con 3 pausas (11,87 s → 12,05 s), confirma los 4 tramos
+  con voz idénticos y en orden, la sesión HTTP con el mismo md5 que `/tts/stream` y 422 para una voz sin perfil.
+- **dobla, rama `forma-pausas`:** cada hablante lleva el perfil medido en su propio audio del vídeo (segmentos puros
+  de al menos 3 s) y lo manda en cada petición; las uniones entre trozos usan también sus pausas. `--sin-forma` lo
+  desactiva.
+- **Perfiles de la charla de 74 min**, medidos con la pista de voces separada y la anotación:
+
+| hablante | audio puro | pausas | pausas/min | mediana |
+|---|---|---|---|---|
+| h0 | 29,5 min | 732 | 24,8 | 0,34 s |
+| h1 | 10,5 min | 163 | 15,5 | 0,33 s |
+| h2 | 56 s | 25 | 26,9 | 0,34 s (poco material) |
+| h3 | 33 s | 8 | 14,8 | 0,29 s (poco material) |
+
 ## Riesgos
 
 - **Sobreajuste a Carlos**: 76 % de los datos. Muestreo equilibrado por persona y validación por grabación.
