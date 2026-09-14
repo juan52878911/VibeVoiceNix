@@ -385,6 +385,13 @@ class AcusticoOV:
         # muere su estado sobra. Con una referencia normal lo mantendriamos vivo
         # -- a el y a sus 711 KB -- hasta la sintesis siguiente.
         self._duenno = None
+        # El estado que deja el cebado. Se calcula en el PRIMER arranque y a
+        # partir de ahi se repone sin llamar al modelo: el cebado es siempre el
+        # mismo -- estado a cero y un latente nulo --, asi que su resultado
+        # tambien. Ahorra un decode (~40 ms) al principio de cada sintesis, que
+        # es justo donde se espera al primer sonido, y el audio sale identico
+        # bit a bit (la foto es fiel, ver _foto).
+        self._cebado = None
         self.nueva_sesion()
 
     # ---- estado: leerlo, ponerlo, y cambiar de corriente ----
@@ -455,8 +462,13 @@ class AcusticoOV:
         lat = np.ascontiguousarray(lat.numpy())
         if self._cambiar_a(cache):
             # cebado: un fotograma de silencio para que la primera muestra real
-            # no salte desde la nada. Se tira la salida.
-            self._inferir(np.zeros_like(lat))
+            # no salte desde la nada. Se tira la salida. Solo se calcula una vez
+            # (ver self._cebado).
+            if self._cebado is None:
+                self._inferir(np.zeros_like(lat))
+                self._cebado = self._foto()
+            else:
+                self._poner(self._cebado)
         salida = torch.from_numpy(self._inferir(lat))
         CRONO["acustico"][0] += time.perf_counter() - ini
         CRONO["acustico"][1] += 1

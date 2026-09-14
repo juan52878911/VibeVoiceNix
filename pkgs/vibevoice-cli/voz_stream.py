@@ -82,7 +82,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import torch
@@ -3325,6 +3325,74 @@ def a_pcm16(trozo: torch.Tensor) -> bytes:
     return (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
 
+# FORMATOS COMPRIMIDOS: lo que viaja, no lo que se genera. El modelo saca 24 kHz
+# y 16 bits pase lo que pase (los fija el decodificador), y medido el 13-09-2026:
+# bajar la calidad apenas ahorra calculo -- el tramo de 12 a 24 kHz es el 7 % del
+# decodificador -- y codificar cuesta ~1 % de un nucleo. Lo que si ahorra es RED:
+#
+#   wav 24 kHz 16 bits   384 kbit/s   el de siempre, el unico sin perdidas
+#   ogg (Opus)            32 kbit/s   12x menos; es el formato de las notas de
+#                                     voz de WhatsApp y el que ya sirve voz-api
+#   mp3                   64 kbit/s   6x menos; para mandarlo como fichero de
+#                                     audio a cualquier sitio que no trague Opus
+#
+# Se codifica EN STREAMING con PyAV (libopus / libmp3lame), trozo a trozo: el
+# cliente empieza a reproducir igual que con el WAV. El Ogg va con paginas de
+# 20 ms (page_duration): con el defecto de un segundo, el primer audio llegaria
+# un segundo tarde.
+FORMATOS_AUDIO = {
+    "wav": {"media": "audio/wav", "ext": "wav"},
+    "ogg": {"media": "audio/ogg", "ext": "ogg", "contenedor": "ogg", "codec": "libopus",
+            "kbit": 32, "opciones_codec": {"application": "voip"},
+            "opciones_contenedor": {"page_duration": "20000"}},
+    "mp3": {"media": "audio/mpeg", "ext": "mp3", "contenedor": "mp3", "codec": "libmp3lame",
+            "kbit": 64, "opciones_codec": {}, "opciones_contenedor": {}},
+}
+
+
+class CodificadorAudio:
+    """PCM16 mono -> Ogg/Opus o MP3, devolviendo los bytes nuevos en cada empujon."""
+
+    def __init__(self, formato: str, ritmo: int = RITMO):
+        import io
+        import av
+        f = FORMATOS_AUDIO[formato]
+        self._av = av
+        self._buf = io.BytesIO()
+        self._leido = 0
+        self._ritmo = ritmo
+        self._pts = 0
+        self._cont = av.open(self._buf, mode="w", format=f["contenedor"],
+                             options=f["opciones_contenedor"])
+        self._flujo = self._cont.add_stream(f["codec"], rate=ritmo,
+                                            options=f["opciones_codec"])
+        self._flujo.bit_rate = f["kbit"] * 1000
+        self._flujo.layout = "mono"
+
+    def _nuevos(self) -> bytes:
+        datos = self._buf.getvalue()[self._leido:]
+        self._leido += len(datos)
+        return datos
+
+    def empujar(self, pcm16: bytes) -> bytes:
+        muestras = np.frombuffer(pcm16, dtype="<i2")
+        if len(muestras) == 0:
+            return b""
+        marco = self._av.AudioFrame.from_ndarray(muestras.reshape(1, -1), format="s16", layout="mono")
+        marco.sample_rate = self._ritmo
+        marco.pts = self._pts
+        self._pts += len(muestras)
+        for paquete in self._flujo.encode(marco):
+            self._cont.mux(paquete)
+        return self._nuevos()
+
+    def cerrar(self) -> bytes:
+        for paquete in self._flujo.encode(None):
+            self._cont.mux(paquete)
+        self._cont.close()
+        return self._nuevos()
+
+
 class PeticionTTS(BaseModel):
     texto: str = Field(..., min_length=1, max_length=8000)
     voz: str = VOZ_DEFECTO
@@ -3406,6 +3474,11 @@ class PeticionTTS(BaseModel):
     # peticion por lo mismo que cola_final: para medir el antes y el despues
     # con el mismo binario, que es como se midio.
     recorte_entrada: Optional[bool] = None
+
+    # Formato del audio que viaja (ver FORMATOS_AUDIO): wav, ogg (Opus, notas de
+    # voz de WhatsApp) o mp3. Solo cambia la codificacion de salida, nunca lo
+    # que genera el modelo.
+    formato: Literal["wav", "ogg", "mp3"] = "wav"
 
 
 class PeticionSesion(BaseModel):
@@ -3577,11 +3650,16 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
                 None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
                 pet.semilla, pet.pasos, pet.neg_cada,
             )
+            cod = CodificadorAudio(pet.formato, ritmo) if pet.formato != "wav" else None
+            salida = (lambda pcm: cod.empujar(pcm)) if cod else (lambda pcm: pcm)
             try:
-                yield cabecera_wav_flujo(ritmo)
+                if cod is None:
+                    yield cabecera_wav_flujo(ritmo)
                 if not estirando:
                     async for trozo in streamer.flujo():
-                        yield a_pcm16(trozo)  # ~133 ms de audio por trozo
+                        datos = salida(a_pcm16(trozo))  # ~133 ms de audio por trozo
+                        if datos:
+                            yield datos
                 else:
                     # A velocidad distinta de 1 se acumula la frase ENTERA y se
                     # estira de una vez. Estirar cada trozo de 133 ms por su
@@ -3595,7 +3673,9 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
                         trozos.append(trozo.detach().float().cpu().numpy().reshape(-1))
                     if trozos:
                         entero = np.concatenate(trozos)
-                        yield a_pcm16(torch.from_numpy(estirar(entero, pet.velocidad)))
+                        yield salida(a_pcm16(torch.from_numpy(estirar(entero, pet.velocidad))))
+                if cod is not None:
+                    yield cod.cerrar()
             finally:
                 # Cliente desconectado o flujo terminado: marcamos cancelado
                 # (inofensivo si ya acabo) y esperamos al hilo, para no solapar
@@ -3606,15 +3686,17 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
                 # el RSS crece peticion a peticion hasta que el OOM decide.
                 devolver_memoria()
 
+    fmt = FORMATOS_AUDIO[pet.formato]
     return StreamingResponse(
         generador(),
-        media_type="audio/wav",
+        media_type=fmt["media"],
         headers={
             # Sin Content-Length: uvicorn usa Transfer-Encoding: chunked.
             "Cache-Control": "no-store",
             "X-Ritmo-Hz": str(ritmo),
             "X-RTF-Esperado": str(RTF_MEDIDO),
-            "Content-Disposition": 'inline; filename="voz.wav"',
+            "X-Formato": pet.formato,
+            "Content-Disposition": f'inline; filename="voz.{fmt["ext"]}"',
         },
     )
 

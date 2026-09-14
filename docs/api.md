@@ -377,3 +377,35 @@ llamada a cada voz paga su carga en memoria; el resto, no.
 Las cabeceras `X-*` de `/tts` y los campos `proceso_s` / `rtf` de `/stt` salen en cada respuesta, así que
 cualquier cliente puede registrar el rendimiento real sin tocar el servidor. Es de donde salen las cifras
 de [rendimiento.md](rendimiento.md).
+
+---
+
+## `POST /tts/stream` de voz-stream (:8082) — el campo `formato`
+
+El servicio de VibeVoice genera siempre a **24 kHz y 16 bits** (lo fija el decodificador acústico), pero
+puede **enviar** el audio comprimido. Se codifica en streaming, trozo a trozo, así que el cliente
+empieza a reproducir igual de pronto que con el WAV.
+
+| `formato` | Códec | Ancho de banda | Para qué |
+|---|---|---|---|
+| `wav` *(defecto)* | PCM 24 kHz 16 bits | 384 kbit/s | sin pérdidas; lo de siempre |
+| `ogg` | Opus 32 kbit/s, perfil `voip`, páginas de 20 ms | ~32-43 kbit/s | **notas de voz de WhatsApp** y enlaces lentos (túnel, móvil) |
+| `mp3` | LAME 64 kbit/s, 24 kHz | 64 kbit/s | llega como fichero de audio adjunto; lo abre cualquier cosa |
+
+Medido el 13-09-2026 en la VM: una frase de 2 s ocupa 102 KB en WAV, 11 KB en OGG y 18 KB en MP3, y el
+primer byte llega igual de pronto en los tres (0,25-0,5 s). Codificar cuesta del orden del 1 % de un
+núcleo; **no cambia el RTF**, porque bajar la calidad de salida no quita trabajo al modelo (el tramo de 12 a
+24 kHz es el 7 % del decodificador). La respuesta lleva `Content-Type` y `X-Formato` del formato pedido.
+
+```bash
+curl -X POST http://voz:8082/tts/stream -H "Authorization: Bearer $VOZ_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"texto":"Llego en diez minutos.","voz":"juan","formato":"ogg"}' --output nota.ogg
+```
+
+O con el cliente del repo, sin dependencias:
+
+```bash
+python scripts/nota_voz.py --voz juan "Llego en diez minutos, id pidiendo."            # nota.ogg
+python scripts/nota_voz.py --voz isis --formato mp3 --salida saludo.mp3 "Feliz cumple."
+```
