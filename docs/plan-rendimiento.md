@@ -120,6 +120,21 @@ pasada de 1 token:
 t6 a 1500 posiciones se dobla de una ronda a otra y los pares se invierten: se repite con la regla de
 agregación fijada arriba. Lo que sí se repite en las cuatro filas es t3/t6 = 0,92-1,26 (≤ 1,6).
 
+**0.2 repetida (19:55-20:00, `scripts/fase0_lm.sh`, voz-stream parado y CT 100/101/102 parados):
+VÁLIDA y B2 SE CIERRA.** Medianas de 6 rondas (M), en ms por pasada:
+
+| posiciones | 6 h | 3 h | 2 h | par 2 streams | par 2 modelos | IQR t6 | t3/t6 | mejor par/(2·t6) |
+|---|---|---|---|---|---|---|---|---|
+| 500 | 16,73 | 19,07 | 22,14 | **30,95** | 37,05 | 12 % ✓ | 1,140 ✓ | **0,925 ✗** |
+| 1500 | 21,03 | 23,94 | 27,89 | **43,01** | 50,24 | 4 % ✓ | 1,138 ✓ | **1,022 ✗** |
+
+- **Por qué no gana:** una pasada a 3 hilos solo cuesta un 14 % más que a 6, pero dos a la vez no
+  caben en los 6 núcleos sin estorbarse. El par con 2 streams ahorra un 7,5 % con 500 posiciones y
+  pierde con 1500; con dos modelos compilados es peor en las dos.
+- **Qué pasa con B2:** necesitaba ≤ 0,80 en las dos longitudes y **se cierra**. Es la misma pared
+  que tumbó el solapado del decodificador: en esta CPU dos etapas de cómputo a la vez se estorban.
+- **La caché KV en sesiones largas (C4):** 500 → 1500 posiciones cuestan +4,3 ms por pasada (+26 %).
+
 **0.3 iGPU, primera pasada PRELIMINAR** (LXC 204 con `/dev/dri`, OpenVINO 2025.4.1, `intel-opencl-icd`
 22.43 de Debian 12; host sin reposo, con la VM voz desplegando; no decide la puerta):
 
