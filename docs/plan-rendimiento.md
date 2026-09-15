@@ -148,6 +148,29 @@ CPU iba +51 % más lenta con la GPU al 100 %, y eso solo lo decide el banco.
 **Si no pasa:** la iGPU vuelve al host (`vfio-pci` → `i915`), la VM 210 se queda sin `hostpci0` y C1 se
 cierra.
 
+**Diario del montaje (15-09-2026).**
+- **13:25, despliegue** de `f855136` (driver `intel-compute-runtime-legacy1`): md5 de las 8 frases
+  idéntico y `ws_fidelidad` correcto.
+- **13:31, iGPU pasada en caliente** con `fase3_igpu_host.sh pasar`: `vfio-pci` y `hostpci0` en la VM 210.
+  pve respondió en todos los pasos y AuraCRM no se tocó. En la VM, `i915` inicializa la UHD 630 y
+  OpenVINO lista `GPU`.
+- **13:33, primera ejecución de `fase3_ab.sh`: `gpu-1` NO ARRANCÓ.** El proceso murió al compilar el
+  decodificador en GPU con `free(): invalid size` y `*** longjmp causes uninitialized stack frame ***`,
+  sin nada en el dmesg del guest.
+- **No se reproduce**, en procesos separados dentro de la VM:
+  - el decodificador en GPU con OpenVINO solo (47-50 ms), tras `import torch` y tras `import numba,
+    llvmlite`;
+  - LM en CPU y decodificador en GPU en el mismo proceso, con y sin `MALLOC_ARENA_MAX=2` y
+    `OMP_NUM_THREADS=6`;
+  - `motor.cargar` completo con `VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU`;
+  - y dos arranques del servidor real con la receta exacta de `gpu-1` (modelo listo en 10,4 y 10,5 s).
+- **Lectura:** fallo intermitente del compilador de kernels de la GPU (IGC). La primera compilación tras
+  arrancar la VM es la única que se cayó. **Condición añadida al despliegue, si la fase 3 pasara:**
+  10 arranques seguidos de voz-stream con la GPU, sin ningún fallo.
+- **Ruido de host en esa primera tanda:** la base dio RTF 1,16-1,18 con el `kvm` de AuraCRM a ~236 %
+  en un pico. Las tandas alternas lo reparten entre base y GPU, pero la cifra absoluta no se compara con
+  la de otros días.
+
 ### Fase 4: C3, calidad del LM int8 frente a int4 (puerta fijada el 14-09-2026, antes de medir)
 
 `tts_lm_estado_int8.xml` nunca ha pasado por el banco exhaustivo. La pregunta es si el int4 de producción
