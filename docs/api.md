@@ -419,21 +419,32 @@ de intro («Welcome to the show», «another episode of the podcast»). Es condu
 podcasts (Microsoft lo reconoce en su FAQ). La elige el ruido inicial de la difusión en el primer fotograma
 y la mantiene el propio modelo; no la quitan la cuantización, la guía, el freno ni la rampa de arranque.
 
-Lo que la quita es fijar **el ruido de los primeros fotogramas** de cada locución con un generador aparte
-de semilla fija. El resto sigue con el ruido de la petición (`semilla`), así que no se pierde variedad
-más allá de los primeros 0,8 s y no cuesta ni una pasada extra. Medido en torch fp32 con 3 frases de
-intro × 4 voces × 6 semillas nuevas: música en 26/72 clips sin él y 0/72 con la semilla 7 en 6
-fotogramas, WER 0,057 → 0,009, ECAPA +0,000, UTMOS +0,03.
+La palanca es **el ruido de los primeros fotogramas** de cada locución, que sale de un generador aparte
+con semilla fija. El resto sigue con el ruido de la petición (`semilla`): no se pierde variedad más allá
+de los primeros 0,8 s y no cuesta ni una pasada extra.
+
+**Va apagado por defecto**, porque la semilla buena depende del motor. Medido con 3 frases de intro × 4
+voces × 6 semillas nuevas (72 clips):
+
+| Motor | Música sin él | Con la semilla 7 | Veredicto |
+|---|---|---|---|
+| torch fp32 (análisis) | 26/72 | 0/72, ECAPA +0,000 | pasa |
+| voz-stream, torch MPS fp16 | 29/72 | 0/72, ECAPA −0,012 | no pasa (tope −0,01) |
+| voz-stream, OpenVINO (producción) | 39/72 | 18/72, ECAPA −0,013 | no pasa |
+
+En OpenVINO los 18 clips son **una sola frase** en tres voces con las seis semillas: el arranque fijo
+cambia una lotería por semilla por un todo o nada por texto, y re-tirar con otra `semilla` no la quita
+(hay que cambiar el arranque).
 
 | Campo | En | Qué hace |
 |---|---|---|
 | `ruido_arranque: <int>` | `/tts/stream`, `/tts/sesion/{id}` (al crearla), `abrir` del websocket | Semilla del ruido de arranque de esa locución. |
 | `ruido_arranque: null` o `0` | ídem | Lo apaga: el audio de antes, bit a bit. |
-| *(sin mandar)* | ídem | El de la ficha `<voz>.json` (`"ruido_arranque"`) si lo lleva; si no, `VIBEVOICE_RUIDO_ARRANQUE` (7 por defecto). |
+| *(sin mandar)* | ídem | El de la ficha `<voz>.json` (`"ruido_arranque"`) si lo lleva; si no, `VIBEVOICE_RUIDO_ARRANQUE` (vacía por defecto: apagado). |
 
-- **La mejor semilla depende de la voz**: con la 1 también sale 0/72, pero una voz perdió 0,046 de ECAPA.
-  `scripts/elegir_arranque.py` prueba varias candidatas sobre frases de intro y escribe la ganadora en la
-  ficha (máximo ECAPA con cero clips con música).
+- **La semilla se elige por voz y con el motor de producción**: `scripts/elegir_arranque.py` prueba 4-6
+  candidatas contra el servidor de verdad sobre frases de intro y escribe la ganadora en la ficha (máximo
+  ECAPA con cero clips con música).
 - **En las sesiones** vale para cada `generate()` que encadenan, igual que la rampa de arranque, y su estado
   viaja con la foto de la pausa: una sesión intrusa no se lo cambia.
 - **En `/health`**, el bloque `ruido_arranque` dice el defecto, los fotogramas y qué voces llevan el suyo.

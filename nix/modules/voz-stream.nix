@@ -298,15 +298,16 @@ in
 
     ruidoArranque = lib.mkOption {
       type = lib.types.nullOr lib.types.int;
-      default = 7;
+      default = null;
       description = ''
-        Semilla del ruido de los primeros fotogramas de cada locucion. Quita
+        Semilla del ruido de los primeros fotogramas de cada locucion, contra
         la musica de fondo que el modelo inventa en intros ("Welcome to the
-        show..."): 0/72 clips con musica frente a 26/72, sin empeorar WER ni
-        identidad (medido en torch; ver docs/api.md, ruido_arranque).
+        show..."). null (el defecto) = apagado, el audio de antes bit a bit.
 
-        null = apagado, el audio de antes bit a bit. La peticion
-        (ruido_arranque) y la ficha <voz>.json mandan sobre este defecto.
+        No hay una semilla buena para todo: la 7 quito la musica en torch fp32
+        (0/72) pero en OpenVINO la dejo en 18/72, todo en una frase. Se usa por
+        voz (ficha <voz>.json, scripts/elegir_arranque.py) o por peticion
+        (ruido_arranque), que mandan sobre este defecto.
       '';
     };
   };
@@ -372,11 +373,8 @@ in
       // lib.optionalAttrs (cfg.semilla != null) {
         VIBEVOICE_SEMILLA = toString cfg.semilla;
       }
-      # Aqui null NO es "sin variable": sin ella el codigo pone 7, asi que
-      # apagarlo es mandar 0.
-      // {
-        VIBEVOICE_RUIDO_ARRANQUE =
-          if cfg.ruidoArranque == null then "0" else toString cfg.ruidoArranque;
+      // lib.optionalAttrs (cfg.ruidoArranque != null) {
+        VIBEVOICE_RUIDO_ARRANQUE = toString cfg.ruidoArranque;
       }
       // lib.optionalAttrs ov.enable {
         VIBEVOICE_OV_CODIGO = "${pkgs.vibevoiceOvCodigo}";

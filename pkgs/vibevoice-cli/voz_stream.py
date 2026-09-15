@@ -944,15 +944,22 @@ _ARRANQUE = {"frame": 0, "gen": None, "activo": None}
 # la peticion (el RNG global ni se entera de esos fotogramas). Cero pasadas
 # extra. MEDIDO en torch fp32 con 3 frases de intro x 4 voces x 6 semillas
 # nuevas (72 clips): musica AST > 0,2 en 26/72 con la base y 0/72 con la
-# semilla 7 en 6 fotogramas; WER 0,057 -> 0,009, ECAPA +0,000, UTMOS +0,03. La
-# semilla 1 tambien da 0/72 pero cuesta ECAPA -0,046 en una voz: la mejor
-# depende de la voz, y por eso la ficha <voz>.json puede llevar la suya
-# ("ruido_arranque", la elige scripts/elegir_arranque.py).
+# semilla 7 en 6 fotogramas; WER 0,057 -> 0,009, ECAPA +0,000, UTMOS +0,03.
+#
+# PERO LA SEMILLA BUENA ES DEL MOTOR, NO SOLO DE LA VOZ (15-09-2026, semillas
+# nuevas 30-35, misma puerta): con la 7, voz-stream en torch MPS fp16 da musica
+# 29 -> 0/72 pero ECAPA -0,012 (no pasa), y en OpenVINO (produccion) 39 -> 18/72:
+# los 18 son UNA frase en tres voces con las seis semillas. El ruido de arranque
+# convierte la loteria por semilla en un todo o nada por texto, asi que re-tirar
+# con otra semilla no la quita: hay que cambiar el arranque. Por eso va APAGADO
+# por defecto y se usa por peticion o por voz (la ficha <voz>.json lleva
+# "ruido_arranque", que elige scripts/elegir_arranque.py midiendo con el motor
+# de produccion).
 #
 # Orden de mando: el campo de la peticion (tambien un null explicito, que lo
-# apaga) > la ficha de la voz > VIBEVOICE_RUIDO_ARRANQUE. 0 o null = apagado, el
-# audio de antes bit a bit.
-_ruido_env = os.environ.get("VIBEVOICE_RUIDO_ARRANQUE", "7").strip()
+# apaga) > la ficha de la voz > VIBEVOICE_RUIDO_ARRANQUE (vacia por defecto).
+# 0 o null = apagado, el audio de antes bit a bit (md5 8/8 en torch y en OpenVINO).
+_ruido_env = os.environ.get("VIBEVOICE_RUIDO_ARRANQUE", "").strip()
 RUIDO_ARRANQUE_DEFECTO: Optional[int] = int(_ruido_env) if _ruido_env not in ("", "0") else None
 RUIDO_ARRANQUE_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_RUIDO_ARRANQUE_FOTOGRAMAS", "6"))
 
@@ -1022,8 +1029,9 @@ def reforzar_guia_arranque(modelo) -> None:
         print(f"[arranque] guia reforzada al empezar: cfg {CFG_ARRANQUE} con rampa "
               f"de {CFG_ARRANQUE_FOTOGRAMAS} fotogramas (la primera palabra ya no "
               f"se mastica)", flush=True)
-    print(f"[arranque] ruido de arranque: semilla {RUIDO_ARRANQUE_DEFECTO} por defecto en "
-          f"{RUIDO_ARRANQUE_FOTOGRAMAS} fotogramas (sin musica inventada)", flush=True)
+    if RUIDO_ARRANQUE_DEFECTO:
+        print(f"[arranque] ruido de arranque: semilla {RUIDO_ARRANQUE_DEFECTO} por defecto en "
+              f"{RUIDO_ARRANQUE_FOTOGRAMAS} fotogramas", flush=True)
 
 
 def demorar_eos(modelo) -> None:
@@ -3654,7 +3662,7 @@ class PeticionTTS(BaseModel):
     pausas: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
     # Semilla del ruido de los primeros fotogramas (bloque MUSICA INVENTADA):
     # quita la sintonia de fondo que el modelo inventa en intros. Sin mandarlo,
-    # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE; null o 0 lo apaga.
+    # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE (apagado); null o 0 lo apaga.
     ruido_arranque: Optional[int] = Field(None, ge=0, lt=2**31)
     # Formato del audio que viaja (ver FORMATOS_AUDIO): wav, ogg (Opus, notas de
     # voz de WhatsApp) o mp3. Solo cambia la codificacion de salida, nunca lo
