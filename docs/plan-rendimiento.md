@@ -173,6 +173,29 @@ cierra.
 - **Condición añadida al despliegue, si la fase 3 pasara:** la unidad de voz-stream (`DynamicUser`)
   tiene que llevar un `HOME` o una caché explícita para NEO, y hay que comprobar 10 arranques seguidos
   con la GPU sin fallos.
+- **Resultado (13:45-13:54, tercera ejecución, con `HOME`): C1 NO PASA y se cierra.**
+
+  | puerta | exigido | medido | |
+  |---|---|---|---|
+  | duraciones | idénticas | **idénticas en los 24 clips** | ✅ |
+  | SNR del audio frente a la base | ≥ 25 dB | **mín. 64,9 dB**, mediana 66,6 dB | ✅ |
+  | `ws_fidelidad.py` | en verde | todo correcto | ✅ |
+  | RTF | GPU ≤ 0,93 × base | base 0,9838 · 0,9311 · 0,9107 · 0,9268 (mediana **0,9289**); GPU 0,8692 · 0,8687 · 0,8749 · 0,8756 (mediana **0,8720**): **0,9387×** | ❌ |
+
+  **Reparto por fotograma** (`/crono`, ronda 2):
+
+  | | LM TTS | cabeza | decodificador |
+  |---|---|---|---|
+  | base | ~47 ms | ~16 ms | ~37 ms (CPU) |
+  | GPU | **~72 ms** | ~18 ms | ~61 ms (GPU, solapado) |
+
+  El decodificador sale de la CPU, pero el LM y la cabeza se frenan por lo mismo que medía la 0.3
+  (+51 % con la GPU al 100 %). Queda una ganancia neta del 6,1 %, bajo el 7 % exigido. El banco
+  exhaustivo no se corre, porque la puerta 4 ya no pasa. El pico de memoria sí baja (VmHWM 1950 →
+  1600 MB), pero no era la puerta.
+- **Qué queda:** la iGPU vuelve al host (`fase3_igpu_host.sh devolver`) y la VM 210 queda sin
+  `hostpci0`. `hardware.graphics` con `intel-compute-runtime-legacy1` sigue en `nix/configuration.nix`
+  sin efecto, hasta decidir si se quita.
 - **Ruido de host en esa primera tanda:** la base dio RTF 1,16-1,18 con el `kvm` de AuraCRM a ~236 %
   en un pico. Las tandas alternas lo reparten entre base y GPU, pero la cifra absoluta no se compara con
   la de otros días.
