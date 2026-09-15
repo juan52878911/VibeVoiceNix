@@ -136,6 +136,12 @@ pierde calidad frente al int8. Con 6 hilos, el int8 costaba ~0,13 de RTF.
   faster-whisper 1.2.1, ctranslate2 4.8.2, speechbrain 1.1.1, librosa 0.11.0, numpy 2.3.5) salvo
   **scipy 1.16.3** (la 1.18.0 exige Python ≥ 3.12). Las cifras de la fase 4 no se comparan con las
   del 13-09: base, int8 y control se puntúan los tres aquí, en el mismo entorno.
+- **Cambio de máquina, antes de puntuar ninguna comparación (20:53):** en el i3 los primeros 20 clips de
+  la base tardaron **29 min** (~87 s por clip, sin AVX2), así que las tres variantes serían ~17 h. No es
+  un tiempo razonable. El Mac era la alternativa escrita, pero queda para tareas cortas y la otra sesión
+  lo está usando. La puntuación pasa al **LXC 204 de pve (i7-8700T, AVX2)** con el **mismo** entorno,
+  copiado tal cual del CT 103: venv `/opt/banco`, versiones y cachés de modelos. Las tres variantes se
+  puntúan allí. La base a medias de `ascci` no entra en ninguna comparación.
 - **Base:** si 17 clips de producción de hoy (andres, semilla 101) coinciden en PCM con el corpus
   `difusion` del 13-09, ese corpus es la base; si no, se regenera entera. **Medido (20:21): 17/17
   idénticos.** Producción no ha cambiado un bit del audio desde el 13-09 (difusión en un grafo, fase 1 y
