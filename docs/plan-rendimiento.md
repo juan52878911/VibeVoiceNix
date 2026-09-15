@@ -137,7 +137,9 @@ pierde calidad frente al int8. Con 6 hilos, el int8 costaba ~0,13 de RTF.
   **scipy 1.16.3** (la 1.18.0 exige Python ≥ 3.12). Las cifras de la fase 4 no se comparan con las
   del 13-09: base, int8 y control se puntúan los tres aquí, en el mismo entorno.
 - **Base:** si 17 clips de producción de hoy (andres, semilla 101) coinciden en PCM con el corpus
-  `difusion` del 13-09, ese corpus es la base; si no, se regenera entera.
+  `difusion` del 13-09, ese corpus es la base; si no, se regenera entera. **Medido (20:21): 17/17
+  idénticos.** Producción no ha cambiado un bit del audio desde el 13-09 (difusión en un grafo, fase 1 y
+  `forma` apagado incluidos), así que el corpus `difusion` es la base.
 - **Si pasa:** B1 se queda en la configuración de la VM y `nucleos_fisicos()` deja de contar 12. La puerta estándar del banco
 (`scripts/banco_ab.py`) es la del plan: UTMOS con IC inferior ≥ −0,02; WER con IC superior ≤ +0,5
 puntos; identidad ±0,005 global y ±0,0023 por clon; tono medio y recorrido ±0,03 st; final del habla
