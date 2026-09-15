@@ -103,9 +103,10 @@ in
         # declara: pkgs.tbb es quien trae libtbb.so.12.
         extra.numba = p: [ p.tbb ];
         # La rueda de OpenVINO incluye su plugin de GPU, que enlaza
-        # libOpenCL.so.1. Aqui NO se usa -se midio que la iGPU es 2,5x mas
-        # lenta que la CPU-, pero autoPatchelf exige que la dependencia
-        # exista para dar el paquete por bueno.
+        # libOpenCL.so.1. autoPatchelf exige que la dependencia exista para dar
+        # el paquete por bueno, y ademas es por donde el decodificador llega a la
+        # iGPU cuando se pide VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU (el driver lo pone
+        # hardware.graphics en configuration.nix; plan de rendimiento, fase 3).
         extra.openvino = p: [ p.ocl-icd ];
       })
       # VibeVoice se instala desde git y su pyproject usa setuptools.build_meta,

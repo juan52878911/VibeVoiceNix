@@ -27,6 +27,15 @@
     "sr_mod"
   ];
 
+  # Runtime OpenCL para la iGPU UHD 630 (Gen9) pasada desde el host (hostpci0 en la VM 210; plan de
+  # rendimiento, fase 3). Instalarlo no cambia nada por si solo: voz-stream solo usa la GPU con
+  # VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU. El intel-compute-runtime actual ya no soporta Gen9; el
+  # legacy1 si.
+  hardware.graphics = {
+    enable = true;
+    extraPackages = [ pkgs.intel-compute-runtime-legacy1 ];
+  };
+
   # ------------------------------------------------------------------
   # Identidad y red
   # ------------------------------------------------------------------
