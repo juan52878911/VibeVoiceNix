@@ -148,6 +148,69 @@ CPU iba +51 % más lenta con la GPU al 100 %, y eso solo lo decide el banco.
 **Si no pasa:** la iGPU vuelve al host (`vfio-pci` → `i915`), la VM 210 se queda sin `hostpci0` y C1 se
 cierra.
 
+**Diario del montaje (15-09-2026).**
+- **13:25, despliegue** de `f855136` (driver `intel-compute-runtime-legacy1`): md5 de las 8 frases
+  idéntico y `ws_fidelidad` correcto.
+- **13:31, iGPU pasada en caliente** con `fase3_igpu_host.sh pasar`: `vfio-pci` y `hostpci0` en la VM 210.
+  pve respondió en todos los pasos y AuraCRM no se tocó. En la VM, `i915` inicializa la UHD 630 y
+  OpenVINO lista `GPU`.
+- **13:33, primera ejecución de `fase3_ab.sh`: `gpu-1` NO ARRANCÓ.** El proceso murió al compilar el
+  decodificador en GPU con `free(): invalid size` y `*** longjmp causes uninitialized stack frame ***`,
+  sin nada en el dmesg del guest.
+- **No se reproduce**, en procesos separados dentro de la VM:
+  - el decodificador en GPU con OpenVINO solo (47-50 ms), tras `import torch` y tras `import numba,
+    llvmlite`;
+  - LM en CPU y decodificador en GPU en el mismo proceso, con y sin `MALLOC_ARENA_MAX=2` y
+    `OMP_NUM_THREADS=6`;
+  - `motor.cargar` completo con `VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU`;
+  - y dos arranques del servidor real con la receta exacta de `gpu-1` (modelo listo en 10,4 y 10,5 s).
+- **13:40, segunda ejecución de `fase3_ab.sh`: `gpu-1` vuelve a morir en el mismo punto.** No era
+  intermitente.
+- **Causa CONFIRMADA (13:45):** `systemd-run` no pone `HOME`, y el runtime OpenCL de Intel (NEO/IGC) lo
+  necesita para su caché de kernels. El servidor de laboratorio arrancado a mano con `env -u HOME` muere
+  exactamente igual (`longjmp causes uninitialized stack frame`); con `HOME=/root` arranca siempre. Mis
+  pruebas buenas por ssh tenían `HOME`. Arreglo: `fase3_ab.sh` exporta `HOME=/root`.
+- **Condición añadida al despliegue, si la fase 3 pasara:** la unidad de voz-stream (`DynamicUser`)
+  tiene que llevar un `HOME` o una caché explícita para NEO, y hay que comprobar 10 arranques seguidos
+  con la GPU sin fallos.
+- **Resultado (13:45-13:54, tercera ejecución, con `HOME`): C1 NO PASA y se cierra.**
+
+  | puerta | exigido | medido | |
+  |---|---|---|---|
+  | duraciones | idénticas | **idénticas en los 24 clips** | ✅ |
+  | SNR del audio frente a la base | ≥ 25 dB | **mín. 64,9 dB**, mediana 66,6 dB | ✅ |
+  | `ws_fidelidad.py` | en verde | todo correcto | ✅ |
+  | RTF | GPU ≤ 0,93 × base | base 0,9838 · 0,9311 · 0,9107 · 0,9268 (mediana **0,9289**); GPU 0,8692 · 0,8687 · 0,8749 · 0,8756 (mediana **0,8720**): **0,9387×** | ❌ |
+
+  **Reparto por fotograma** (`/crono`, ronda 2):
+
+  | | LM TTS | cabeza | decodificador |
+  |---|---|---|---|
+  | base | ~47 ms | ~16 ms | ~37 ms (CPU) |
+  | GPU | **~72 ms** | ~18 ms | ~61 ms (GPU, solapado) |
+
+  El decodificador sale de la CPU, pero el LM y la cabeza se frenan por lo mismo que medía la 0.3
+  (+51 % con la GPU al 100 %). Queda una ganancia neta del 6,1 %, bajo el 7 % exigido. El banco
+  exhaustivo no se corre, porque la puerta 4 ya no pasa. El pico de memoria sí baja (VmHWM 1950 →
+  1600 MB), pero no era la puerta.
+- **Qué queda:** la iGPU vuelve al host (`fase3_igpu_host.sh devolver`) y la VM 210 queda sin
+  `hostpci0`.
+- **INCIDENTE AL DEVOLVERLA (13:55):** la iGPU volvió a `i915` y apareció `/dev/dri/renderD128`, pero
+  al volver a ligar en caliente la consola del framebuffer (`echo 1 > /sys/class/vtconsole/vtconN/bind`)
+  el kernel de pve (6.17.2-1-pve) dio un **`BUG: kernel NULL pointer dereference` en `fbcon_cursor`**,
+  tras varios `WARNING` en `fbcon_init`. Quedó `console_lock` tomado: una lectura posterior de
+  `/sys/class/vtconsole/vtcon0/bind` está en estado D y no se puede matar.
+  - **Lo que sigue funcionando:** AuraCRM (VM 200 y CT 203), la VM voz y el resto de invitados.
+  - **Riesgo:** el kernel está marcado y cualquier cosa que necesite la consola (una VT, algunos
+    cambios de modo, un reinicio o apagado limpio) puede colgarse.
+  - **Recomendación a Juan:** reiniciar pve en una ventana acordada (AuraCRM cae unos minutos). Si el
+    reinicio limpio se queda colgado, forzarlo desde el botón.
+  - **Arreglo del guion:** `devolver` ya no vuelve a ligar fbcon. `hardware.graphics` con `intel-compute-runtime-legacy1` sigue en `nix/configuration.nix`
+  sin efecto, hasta decidir si se quita.
+- **Ruido de host en esa primera tanda:** la base dio RTF 1,16-1,18 con el `kvm` de AuraCRM a ~236 %
+  en un pico. Las tandas alternas lo reparten entre base y GPU, pero la cifra absoluta no se compara con
+  la de otros días.
+
 ### Fase 4: C3, calidad del LM int8 frente a int4 (puerta fijada el 14-09-2026, antes de medir)
 
 `tts_lm_estado_int8.xml` nunca ha pasado por el banco exhaustivo. La pregunta es si el int4 de producción
