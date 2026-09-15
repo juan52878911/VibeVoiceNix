@@ -96,6 +96,21 @@ B2 queda cerrada por la 0.2. Sigue B1: decirle a la VM 210 que sus 12 vCPU son 6
      B1 ≤ la mitad del de la base (la otra promesa de B1: menos varianza).
 - **Si no pasa:** se vuelve a la configuración de antes y B1 se cierra.
 
+**Resultado (20:08-20:19, `scripts/fase2_b1.sh`): B1 NO PASA y se cierra.** Dentro de la VM, las tandas B1
+vieron de verdad 6 núcleos × 2 hilos (`Thread(s) per core: 2`, hermanos 0-1), y QEMU recibió el
+segundo `-smp`.
+
+| | base | B1 |
+|---|---|---|
+| md5 frente a la base | — | **idéntico en todo** |
+| `ws_fidelidad.py` | — | todo correcto |
+| RTF de las rondas válidas | 0,9517 · 0,8886 · 0,8978 · 0,8973 | 0,9044 · 0,9013 · 0,9079 · 0,8823 |
+| mediana / IQR | **0,8976** / 0,1 % | **0,9028** / 0,3 % |
+| puerta | — | B1/base = **1,0059** (> 0,97) y IQR sin bajar a la mitad |
+
+La VM 210 quedó sin `args`, como antes. Decirle al guest que tiene hermanos SMT no cambia cómo reparte
+OpenVINO sus 6 hilos, o no lo cambia para bien.
+
 ### Fase 4: C3, calidad del LM int8 frente a int4 (puerta fijada el 14-09-2026, antes de medir)
 
 `tts_lm_estado_int8.xml` nunca ha pasado por el banco exhaustivo. La pregunta es si el int4 de producción
