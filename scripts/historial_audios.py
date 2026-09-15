@@ -26,6 +26,10 @@ from urllib.parse import quote
 AUDIO = {".wav", ".mp3", ".ogg", ".opus", ".flac", ".m4a"}
 TIPO = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/ogg",
         ".flac": "audio/flac", ".m4a": "audio/mp4"}
+# Carpetas de AUDIO REAL o de materia prima para mejorar el modelo (referencias, datasets, ida y vuelta por el
+# codec); todo lo demas son resultados de experimentos. Se decide por el nombre de la ruta.
+DATOS = ("dataset", "referencias", "refs", "audios-charla", "apartados", "fase2-humo/ds", "fase2-humo/ida", "seleccion")
+IGNORAR = ("prueba_historial", "__pycache__")
 METRICAS = ("musica", "wer", "ecapa", "utmos", "dur", "dicho", "oido", "cond", "voz", "texto", "semilla")
 
 ESTILO = """
@@ -84,9 +88,18 @@ def celda(k, v):
     return f"<td>{html.escape(str(v))[:160]}</td>"
 
 
-def pagina_sesion(raiz: Path, sesion: Path, salida: Path):
+def ancla(rel: str) -> str:
+    return "c-" + "".join(ch if ch.isalnum() else "-" for ch in rel)
+
+
+def categoria(rel: str) -> str:
+    return "datos" if any(k in rel for k in DATOS) else "resultados"
+
+
+def pagina_sesion(raiz: Path, sesion: Path, salida: Path, resumen_global: list):
     grupos = {}
-    for dirpath, _, ficheros in os.walk(sesion):
+    for dirpath, dirs, ficheros in os.walk(sesion):
+        dirs[:] = [d for d in dirs if d not in IGNORAR and not d.startswith("_")]
         audios = sorted(f for f in ficheros if Path(f).suffix.lower() in AUDIO)
         if audios:
             grupos[Path(dirpath)] = audios
@@ -102,7 +115,10 @@ def pagina_sesion(raiz: Path, sesion: Path, salida: Path):
         rel = carpeta.relative_to(sesion).as_posix() or "."
         n_mus = sum(1 for a in audios if (med.get(a, {}).get("musica") or 0) > 0.2)
         resumen = f"{len(audios)} audios" + (f" · <span class=mus>{n_mus} con música &gt; 0,2</span>" if "musica" in cols else "")
-        partes.append(f"<details open><summary>{html.escape(rel)} <span class=s>({resumen})</span></summary><div class=tabla><table>"
+        resumen_global.append({"sesion": sesion.name, "carpeta": rel, "n": len(audios), "musica": n_mus if "musica" in cols else None,
+                               "metricas": [c for c in cols if c != "cond"], "cat": categoria(rel),
+                               "url": f"_historial/{quote(sesion.name)}.html#{ancla(rel)}"})
+        partes.append(f"<details open id='{ancla(rel)}'><summary>{html.escape(rel)} <span class=s>({resumen})</span></summary><div class=tabla><table>"
                       "<tr><th>audio</th><th>fichero</th>" + "".join(f"<th>{c}</th>" for c in cols) + "<th>transcripción</th></tr>")
         for a in audios:
             ruta = carpeta / a
@@ -130,17 +146,34 @@ def main():
     raiz = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     destino = raiz / "_historial"
     destino.mkdir(exist_ok=True)
-    filas = []
+    filas, carpetas = [], []
     for sesion in sorted((p for p in raiz.iterdir() if p.is_dir() and not p.name.startswith((".", "_"))), reverse=True):
-        n, b, g = pagina_sesion(raiz, sesion, destino / f"{sesion.name}.html")
+        n, b, g = pagina_sesion(raiz, sesion, destino / f"{sesion.name}.html", carpetas)
         filas.append((sesion.name, n, b, g))
     cuerpo = "".join(f"<tr><td><a href='_historial/{quote(s)}.html'>{html.escape(s)}</a></td><td class=n>{n}</td>"
                      f"<td class=n>{g}</td><td class=n>{tam(b)}</td></tr>" for s, n, b, g in filas)
+
+    def seccion(cat, titulo, nota):
+        sel = [c for c in carpetas if c["cat"] == cat]
+        filas_c = "".join(
+            f"<tr><td>{html.escape(c['sesion'])}</td><td><a href='{c['url']}'>{html.escape(c['carpeta'])}</a></td>"
+            f"<td class=n>{c['n']}</td><td class=n>{'' if c['musica'] is None else c['musica']}</td>"
+            f"<td class=s>{', '.join(c['metricas'])}</td></tr>" for c in sel)
+        return (f"<h2 id={cat}>{titulo} <span class=s>({sum(c['n'] for c in sel)} audios)</span></h2><p class=s>{nota}</p>"
+                f"<div class=tabla><table><tr><th>sesión</th><th>carpeta</th><th>audios</th><th>con música</th><th>medidas</th></tr>"
+                f"{filas_c}</table></div>")
+    secciones = (seccion("resultados", "Resultados de experimentos",
+                         "Clips sintetizados en bancos y A/B, con sus medidas cuando la carpeta las trae.")
+                 + seccion("datos", "Datos para mejorar el modelo",
+                           "Audio real y materia prima: referencias de clonado, datasets por persona, audio apartado e ida y vuelta por el códec."))
+    json.dump(carpetas, open(destino / "carpetas.json", "w"), ensure_ascii=False, indent=1)
     (raiz / "index.html").write_text(
         f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
         f"<title>Historial de audios VibeVoiceNix</title><style>{ESTILO}</style><main><h1>Historial de audios VibeVoiceNix</h1>"
         f"<p class=s>{sum(f[1] for f in filas)} audios en {len(filas)} sesiones · generado {time.strftime('%Y-%m-%d %H:%M')} · "
         f"solo LAN; datos de voz de identidades con consentimiento</p>"
+        f"<p><a href='#resultados'>Resultados</a> · <a href='#datos'>Datos para mejorar el modelo</a> · <a href='#sesiones'>Por sesión</a></p>"
+        f"{secciones}<h2 id=sesiones>Por sesión</h2>"
         f"<div class=tabla><table><tr><th>sesión</th><th>audios</th><th>carpetas</th><th>tamaño de audio</th></tr>{cuerpo}</table></div>"
         f"<p class=s>Los ficheros originales (scripts, JSON, clones .pt) están junto a los audios: "
         f"<code>\\\\192.168.2.65\\archivo\\vibevoice-historial</code></p></main>", encoding="utf-8")
