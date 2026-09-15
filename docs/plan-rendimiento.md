@@ -194,7 +194,18 @@ cierra.
   exhaustivo no se corre, porque la puerta 4 ya no pasa. El pico de memoria sí baja (VmHWM 1950 →
   1600 MB), pero no era la puerta.
 - **Qué queda:** la iGPU vuelve al host (`fase3_igpu_host.sh devolver`) y la VM 210 queda sin
-  `hostpci0`. `hardware.graphics` con `intel-compute-runtime-legacy1` sigue en `nix/configuration.nix`
+  `hostpci0`.
+- **INCIDENTE AL DEVOLVERLA (13:55):** la iGPU volvió a `i915` y apareció `/dev/dri/renderD128`, pero
+  al volver a ligar en caliente la consola del framebuffer (`echo 1 > /sys/class/vtconsole/vtconN/bind`)
+  el kernel de pve (6.17.2-1-pve) dio un **`BUG: kernel NULL pointer dereference` en `fbcon_cursor`**,
+  tras varios `WARNING` en `fbcon_init`. Quedó `console_lock` tomado: una lectura posterior de
+  `/sys/class/vtconsole/vtcon0/bind` está en estado D y no se puede matar.
+  - **Lo que sigue funcionando:** AuraCRM (VM 200 y CT 203), la VM voz y el resto de invitados.
+  - **Riesgo:** el kernel está marcado y cualquier cosa que necesite la consola (una VT, algunos
+    cambios de modo, un reinicio o apagado limpio) puede colgarse.
+  - **Recomendación a Juan:** reiniciar pve en una ventana acordada (AuraCRM cae unos minutos). Si el
+    reinicio limpio se queda colgado, forzarlo desde el botón.
+  - **Arreglo del guion:** `devolver` ya no vuelve a ligar fbcon. `hardware.graphics` con `intel-compute-runtime-legacy1` sigue en `nix/configuration.nix`
   sin efecto, hasta decidir si se quita.
 - **Ruido de host en esa primera tanda:** la base dio RTF 1,16-1,18 con el `kvm` de AuraCRM a ~236 %
   en un pico. Las tandas alternas lo reparten entre base y GPU, pero la cifra absoluta no se compara con

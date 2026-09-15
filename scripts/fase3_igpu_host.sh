@@ -49,7 +49,9 @@ case "${1:-}" in
     paso "arranca la VM 210 sin iGPU" "qm start 210 && qm status 210"
     paso "desliga la iGPU de vfio-pci" "echo > /sys/bus/pci/devices/$GPU/driver_override; if [ -e /sys/bus/pci/drivers/vfio-pci/$GPU ]; then echo $GPU > /sys/bus/pci/drivers/vfio-pci/unbind; fi; true"
     paso "la vuelve a ligar a i915" "timeout 60 sh -c 'echo $GPU > /sys/bus/pci/drivers/i915/bind'; lspci -nnk -s 00:02.0 | grep 'driver in use'"
-    paso "vuelve la consola del framebuffer" "for v in /sys/class/vtconsole/vtcon*; do grep -qi 'frame buffer' \$v/name && echo 1 > \$v/bind; done; true"
+    # NO se vuelve a ligar la consola del framebuffer. Hacerlo en caliente tras vfio-pci (15-09-2026, kernel
+    # 6.17.2-1-pve) dio un "BUG: kernel NULL pointer dereference" en fbcon_cursor y dejo console_lock tomado:
+    # cualquier lectura de /sys/class/vtconsole se queda en estado D. La consola vuelve sola al reiniciar pve.
     paso "devuelve el dev0 al LXC 204" "pct set 204 --dev0 /dev/dri/renderD128,mode=0666 && ls -la /dev/dri/renderD128"
     echo "[igpu] hecho: iGPU de vuelta en el host"
     "${PVE[@]}" "qm status 200; pct status 203; uptime"
