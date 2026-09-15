@@ -116,6 +116,13 @@ pierde calidad frente al int8. Con 6 hilos, el int8 costaba ~0,13 de RTF.
   cierra y `tts_lm_estado_int8` pasa a la lista de poda.
 - **Válido solo si** el control int4 del decodificador sale separado de la base, como en §7 (UTMOS con
   el IC superior < 0).
+- **Entorno de puntuación**, anotado antes de puntuar: CT 103 `banco-lotes` en `ascci` (i3-3220, sin
+  AVX2), Python 3.11, con las versiones del venv del Mac del 13-09 (torch 2.13.0 CPU, torchaudio 2.11.0,
+  faster-whisper 1.2.1, ctranslate2 4.8.2, speechbrain 1.1.1, librosa 0.11.0, numpy 2.3.5) salvo
+  **scipy 1.16.3** (la 1.18.0 exige Python ≥ 3.12). Las cifras de la fase 4 no se comparan con las
+  del 13-09: base, int8 y control se puntúan los tres aquí, en el mismo entorno.
+- **Base:** si 17 clips de producción de hoy (andres, semilla 101) coinciden en PCM con el corpus
+  `difusion` del 13-09, ese corpus es la base; si no, se regenera entera.
 - **Si pasa:** B1 se queda en la configuración de la VM y `nucleos_fisicos()` deja de contar 12. La puerta estándar del banco
 (`scripts/banco_ab.py`) es la del plan: UTMOS con IC inferior ≥ −0,02; WER con IC superior ≤ +0,5
 puntos; identidad ±0,005 global y ±0,0023 por clon; tono medio y recorrido ±0,03 st; final del habla
