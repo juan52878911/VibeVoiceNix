@@ -548,6 +548,40 @@ mmap del IR).
 </details>
 
 <details>
+<summary><b>8c · Guardar solo lo que se usa</b> — closure 8,09 → 7,02 GB e IR 2,4 GB → 562 MB, audio idéntico</summary>
+
+<br>
+
+Dos cosas ocupaban disco sin servir a nadie, y ninguna toca el bucle de inferencia:
+
+- **`hardware.graphics`.** Estaba puesto para el decodificador en la iGPU (fase 3 del plan). Esa puerta
+  no pasó (−6,1 % de RTF, se pedían −7 %), así que el sistema arrastraba un runtime OpenCL que nadie
+  abre: llvm 541 MB + mesa 265 MB + intel-graphics-compiler 260 MB. `VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU`
+  sigue en `motor.py` para una máquina que sí tenga GPU y su propio runtime.
+- **Las variantes de IR que no usa producción.** Los conversores escriben fp16, int8 e int4 de cada
+  pieza (2 445 MB) y voz-stream abre cuatro ficheros (562 MB). La opción nueva
+  `services.vibevoice.openvino.conservarVariantes = false` las borra al terminar la conversión, dejando
+  los marcadores `.hecho` en su sitio para que no se reconvierta nada.
+
+| | antes | después |
+|---|---|---|
+| closure del sistema | 8,09 GB | **7,02 GB** |
+| `/var/lib/voz/ov` | 2 445 MB | **562 MB** |
+| volumen fino en el pool | 44,05 % de 40 GB | **40,20 %** (tras `fstrim`) |
+| md5 de las 8 frases, 2 rondas antes y 2 después | — | **8/8 idénticos, «MD5 IDENTICO EN TODO»** |
+| `ws_fidelidad.py` | — | **todo correcto** |
+| VmHWM de voz-stream | 2012 MB | 2012 MB |
+
+Desplegado el 15-09-2026 (`97dfe9d`). **El defecto de `conservarVariantes` es `true`**: los bancos A/B
+puntúan contra el control int4 del decodificador y necesitan esas variantes. Lo borrado está en el NAS
+(`/tank/nfs/vibevoice/modelos/ov-2026-09-15`): se recupera copiando, no reconvirtiendo.
+
+El −1,07 GB del closure no aparece en `df` hasta que el recolector se lleve la generación anterior; esa
+generación es la vuelta atrás y se deja a propósito.
+
+</details>
+
+<details>
 <summary><b>9 · Detalles de calidad que costaron poco y se notan</b></summary>
 
 <br>
@@ -757,6 +791,7 @@ perdido.
 | **Las dos pasadas del LM (condicional y negativa del CFG) en paralelo** (14-09-2026, plan de rendimiento B2) | la negativa no depende de la condicional, y una pasada a 3 hilos cuesta solo 1,14× la de 6 | **no ganan**: medianas de 6 rondas en la VM, con voz-stream parado. El par a la vez (2 streams de OpenVINO, 3 hilos cada uno) cuesta 0,925× dos pasadas seguidas con 500 posiciones y 1,022× con 1500; con dos modelos compilados, peor. La puerta pedía ≤ 0,80 en las dos longitudes. Dos etapas de cómputo no caben juntas en 6 núcleos, la misma pared que el solapado del decodificador. Detalle en [plan-rendimiento.md](plan-rendimiento.md) |
 | **El decodificador acústico en la iGPU UHD 630** (15-09-2026, plan de rendimiento C1: passthrough en caliente a la VM, OpenVINO GPU en f32 y solapado) | el decodificador es un sumidero, en GPU tarda ~46-61 ms y deja libres ~37 ms de CPU por fotograma | **no llega**. Audio igual en la práctica (duraciones idénticas, SNR ≥ 64,9 dB, `ws_fidelidad` correcto), pero RTF 0,9289 → 0,8720, un −6,1 %, y la puerta pedía −7 %. Con la GPU trabajando, el LM TTS pasa de ~47 a ~72 ms por fotograma: el paquete de 35 W y la memoria compartida frenan a la CPU. Trampas: en f16 (el defecto de la GPU) el audio queda a 16 dB; y bajo `systemd-run` sin `HOME` el runtime OpenCL de Intel revienta al compilar (`longjmp causes uninitialized stack frame`). La iGPU vuelve al host |
 | **El LM TTS en int8 en vez de int4** (15-09-2026, plan de rendimiento C3) | el int4 podría estar perdiendo calidad y el int8 nunca había pasado por el banco | **no suena mejor**. Banco exhaustivo de 238 parejas con control válido (decodificador int4: UTMOS −0,041 [−0,048, −0,033]). UTMOS +0,031 [−0,006, +0,070] (se pedía IC inferior > 0), WER +0,06 [−1,5, +2,0] puntos (se pedía IC superior ≤ +0,5), identidad sin cambios, tono medio +0,74 st. Cuesta +9 % de RTF (0,885 → 0,964). Se queda el int4, no se prueba AWQ y el IR int8 pasa a la poda. Informe en [bancos/2026-09-15-lm-int8.md](bancos/2026-09-15-lm-int8.md) |
+| **Un segundo "voz" en el otro servidor para medir en paralelo** (15-09-2026) | `ascci` tiene sitio y CPU libre; un clon de la VM permitiría probar sin parar producción | **no arranca**: el clon (VM 104, restaurado del vzdump, IP cambiada en frío a 192.168.2.56) carga los cuatro IR y **se muere con `status=4/ILL`**. El i3-3220 es Ivy Bridge y **no tiene AVX2**, que es lo que exigen las ruedas de torch y los kernels de OpenVINO. En el homelab no hay segunda máquina donde medir voz: toda puerta que genere audio va en la VM de producción. El clon sí vale como **máquina de construcción x86_64** (`nixos-rebuild build`, `shellcheck` y tamaño del closure sin tocar producción) |
 | **Enseñar a la VM su topología SMT real** (14-09-2026, B1: `args: -smp 12,sockets=1,cores=6,threads=2`) | el guest veía 12 núcleos físicos y podía poner dos hilos de OpenVINO en hermanos SMT; explicaría la varianza de base | **no gana**: 4 tandas alternas con la VM arrancada desde cero en cada una. El guest vio de verdad 2 hilos por núcleo, md5 idéntico y RTF mediano 0,8976 → 0,9028 (+0,6 %, la puerta pedía −3 %), sin menos varianza. Se deja la topología de antes |
 | **Buscar el coste en Python** | `resto` son 11-13 ms por fotograma en `/crono` | con un muestreador de pila (cada 2 ms, 24.929 muestras en el banco de 8 frases): **el 88 % de `generate()` está dentro de `infer()`** de OpenVINO — LM 38,9 %, decodificador 35,2 %, cabeza 13,9 % —, y el 12 % de Python está repartido (conector en torch 1,7 %, solver DPM ~2 %, `sample_speech_tokens` ~2 %). No hay un punto caliente que rehacer |
 

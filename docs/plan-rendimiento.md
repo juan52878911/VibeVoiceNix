@@ -283,6 +283,40 @@ velocidad se repite en la máquina de destino.
 
 **Si falla la 1, la 2 o la 3**, se revierte el cambio que lo rompa y se documenta.
 
+#### Resultado (15-09-2026): **PASA**. Commit `97dfe9d`, desplegado en la VM voz.
+
+| Puerta | Exigido | Medido |
+|---|---|---|
+| md5 de las 8 frases | idéntico antes y después | **8/8 idénticos en las 4 rondas** (2 antes, 2 después); `banco_md5.py comparar` dice «MD5 IDENTICO EN TODO» |
+| `ws_fidelidad.py` | en verde | `codigo 0`, «todo correcto» (eventos, autenticación, forma, pausas, sesión == `/tts/stream`) |
+| `/health` | los 4 IR de producción | `tts_lm_estado_int4` · `cabeza_int8` · `decoder_mm_int8` · `difusion_p6_int8` |
+| Memoria | sin empeorar | VmHWM 2012 MB antes y después; VmSwap 0 |
+| RTF (informativo, no era puerta) | — | base 0,98/1,01 · después 1,03/0,97; el cambio no toca el bucle |
+
+| Espacio | Antes | Después | Ahorro |
+|---|---|---|---|
+| Closure del sistema | 8,09 GB | **7,02 GB** | −1,07 GB (exactamente lo estimado para `hardware.graphics`) |
+| `/var/lib/voz/ov` | 2 445 MB | **562 MB** | −1 883 MB |
+| Disco de la VM (`df /`) | 17 GB, 46 % | 16 GB, 42 % | el −1,07 GB del closure no baja hasta que el recolector se lleve la generación anterior (semanal); la generación vieja se queda a propósito, es la vuelta atrás |
+| Volumen fino en el pool | 44,05 % de 40 GB | **40,20 %** | `fstrim` devolvió 3,3 GiB; el pool baja del 74,64 % al 73,64 % |
+
+Las variantes borradas (fp16 e int4 de cada pieza) están en el NAS, `/tank/nfs/vibevoice/modelos/ov-2026-09-15`:
+volver a tenerlas es copiarlas, no reconvertir. Los marcadores `.hecho` siguen puestos, así que el conversor
+no repite nada. **Los bancos A/B que usan el control int4 del decodificador necesitan esas variantes**: hay
+que copiarlas de vuelta antes de puntuar, o puntuar en otra máquina.
+
+#### Incidencia: el clon de `ascci` NO puede ejecutar voz-stream
+
+Para no solaparse con la VM de producción se restauró el vzdump de la VM 210 como **VM 104 `voz-clon`** en
+`ascci` (IP cambiada a 192.168.2.56 montando el disco en frío, porque crear un puente aparte estaba
+denegado). Arranca, compila los cuatro IR y **se muere con `status=4/ILL`**: el i3-3220 de `ascci` es Ivy
+Bridge y **no tiene AVX2**, que es lo que exigen las ruedas de torch y los kernels de OpenVINO.
+
+Consecuencia, para no volver a intentarlo: **en el homelab no hay una segunda máquina donde medir voz**.
+Toda puerta que pase por generar audio va en la VM de producción (o en EC2). El clon sí sirve, y se usó para
+esto, como **máquina de construcción x86_64**: `nixos-rebuild build --flake ...#voz` allí compiló el sistema
+entero (incluido el `shellcheck` del guion de conversión) y midió el closure sin tocar producción.
+
 ## Resultados
 
 ### Fase 0 (14-09-2026, VM voz recién reiniciada, voz-stream parado)
