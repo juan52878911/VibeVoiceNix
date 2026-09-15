@@ -287,6 +287,33 @@ fase 1 (18:00:42-18:11:10, 608 s):
 - **Conclusión:** la varianza de base la pone **el límite de potencia, no la temperatura**. Cualquier
   consumidor nuevo (iGPU, más hilos) sale de esos 35 W.
 
+### Fase 4: C3, LM int8 frente a int4 — el int8 NO suena mejor, C3 se cierra (15-09-2026, 00:10)
+
+- **Corpus:** generado en la VM (`scripts/fase4_c3_vm.sh`). La base es el corpus `difusion` del 13-09,
+  17/17 idéntico en PCM a producción de hoy.
+- **Puntuación:** `banco_ab.py` en el LXC 204 de pve, 3 h 5 min para las tres variantes. El informe
+  completo está en [bancos/2026-09-15-lm-int8.md](bancos/2026-09-15-lm-int8.md).
+
+**Validez del banco:** el control (decodificador int4) da UTMOS **−0,041 [−0,048, −0,033]**, con el IC
+superior < 0. **El banco vale.** Reproduce el control del 13-09 (−0,043) con otro entorno y otra
+máquina.
+
+| puerta del int8 frente al int4 | exigido | medido | |
+|---|---|---|---|
+| UTMOS | media ≥ +0,02 **e** IC inferior > 0 | +0,031 [**−0,006**, +0,070] | ✗ |
+| WER | IC superior ≤ +0,5 puntos | +0,058 [−1,514, **+2,007**] (3,21 → 3,27 %) | ✗ |
+| identidad global y por clon | sin bajar más de 0,0023 | global +0,007; andres +0,019 · isis +0,011 · juan −0,0008 · santiago +0,012 | ✓ |
+
+- **Veredicto:** el int8 no suena mejor que el int4, así que **el int4 de producción se queda, no se
+  prueba AWQ y `tts_lm_estado_int8` pasa a la lista de poda**.
+- **Coste que se ahorra:** con el int8, el RTF de la mediana del banco pasaría de 0,885 a 0,964 (+9 %).
+- **Por qué no valen las medidas de forma de onda:** SNR −2,6 dB, MCD 104 dB y 189 de 238 clips
+  desplazados no dicen nada aquí. El LM decide el camino de la locución, así que con otro redondeo
+  el clip es otra lectura igual de válida (206/238 transcripciones idénticas). Mandan WER, UTMOS e
+  identidad, como con la difusión en un grafo.
+- **Lo único con IC fuera del 0:** el tono medio sube **+0,74 st [+0,51, +0,97]**, en todas las voces.
+  No es mejor ni peor; es otro timbre de lectura, y no compensa ni el RTF ni el WER.
+
 ### Fase 1: A1 + A2 + A4 — PASA (14-09-2026, 18:00-18:11)
 
 `scripts/fase1_ab.sh` en la VM voz: cuatro procesos nuevos alternos en 127.0.0.1:8092, con el entorno,

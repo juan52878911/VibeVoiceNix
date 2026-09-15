@@ -8,8 +8,9 @@
 #   decoder_mm_int8, tts_lm_estado_int4, cabeza_int8, difusion_p6_int8   produccion
 #   decoder_mm_int4                                                      control del banco A/B
 #   decoder_mm_fp16                                                      iGPU (C1) y referencia de SNR
-#   tts_lm_estado_int8                                                   banco int8 frente a int4 (C3)
 #   tts_lm_estado_fp16, cabeza_fp16                                      fuentes que relee comprimir()
+# tts_lm_estado_int8 se conservaba para el banco C3; C3 se cerró el 15-09-2026 (el int8 no suena mejor,
+# docs/plan-rendimiento.md), así que ahora está en la lista de lo que sobra.
 # Los marcadores .convertir_*.hecho NO se tocan: el oneshot (nix/modules/vibevoice-ov.nix) ya no
 # genera decoder_estado_* (su paso es convertir_decoder:2 = decoder_mm_*), y cabeza_int4 y
 # difusion_p6_fp16 no los usa ninguna ruta de voz-stream.nix.
@@ -26,6 +27,7 @@ SOBRAN=(
   decoder_estado_int4.bin decoder_estado_int4.xml
   cabeza_int4.bin cabeza_int4.xml
   difusion_p6_fp16.bin difusion_p6_fp16.xml
+  tts_lm_estado_int8.bin tts_lm_estado_int8.xml
 )
 
 # Seguro: nada de la lista puede estar en uso por el servicio
