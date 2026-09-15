@@ -78,6 +78,24 @@ let
         touch "$salida"
       done
 
+      ${lib.optionalString (!cfg.conservarVariantes) ''
+        # Solo lo que usa voz-stream. Los conversores escriben fp16 + int8 + int4
+        # de cada pieza (~2,4 GB) y produccion usa cuatro ficheros (~630 MB). Los
+        # marcadores .hecho se quedan: no se vuelve a convertir nada. Si cambia una
+        # precision, borrar el marcador de ese paso para que la regenere.
+        usados=" tts_lm_estado_${cfg.precisionLM} cabeza_${cfg.precisionCabeza} decoder_mm_${cfg.precisionAcustico} difusion_p${toString vv.pasosDifusion}_int8 "
+        for ir in "$destino"/*.xml; do
+          [ -e "$ir" ] || continue
+          base="$(basename "$ir" .xml)"
+          case "$usados" in
+            *" $base "*) ;;
+            *)
+              echo "[ov] se borra $base: voz-stream no lo usa"
+              rm -f "$destino/$base.xml" "$destino/$base.bin"
+              ;;
+          esac
+        done
+      ''}
       echo "[ov] IR listos en $destino"
       # Un bucle sobre el glob y no `ls`: writeShellApplication pasa shellcheck
       # y SC2012 lo rechaza.
@@ -150,6 +168,19 @@ in
 
         El fp16 esta solo como vara de medir: es el mas lento Y el que mas
         memoria pide, en una maquina que ya va justa.
+      '';
+    };
+
+    conservarVariantes = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        true (el defecto): se quedan todos los IR que escriben los conversores
+        (fp16, int8 e int4 de cada pieza, ~2,4 GB), que es lo que usan los bancos
+        A/B y los controles. false: al terminar la conversion se borran los que
+        voz-stream no usa y quedan solo precisionLM, precisionCabeza,
+        precisionAcustico y la difusion de los pasos configurados (~630 MB).
+        Lo borrado se regenera quitando el marcador .hecho del paso.
       '';
     };
 
