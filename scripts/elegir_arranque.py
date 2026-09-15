@@ -7,9 +7,10 @@
 
 POR QUÉ
 voz-stream fija el ruido de los primeros fotogramas de cada locución (`ruido_arranque`, bloque MÚSICA INVENTADA
-de voz_stream.py) para que el modelo no ponga una sintonía de fondo en textos de intro. Con la semilla 7 salió
-0/72 clips con música y ECAPA +0,000; con la 1 también 0/72, pero una voz perdió 0,046 de identidad. La mejor
-semilla depende de la voz, y esto la mide.
+de voz_stream.py) para que el modelo no ponga una sintonía de fondo en textos de intro. En torch fp32 la semilla 7
+dio 0/72 clips con música y ECAPA +0,000, pero en OpenVINO (producción) 18/72: la semilla buena depende del MOTOR
+y de la voz (15-09-2026, en OpenVINO con Avril: 7 -> 0/12 y ECAPA 0,519; 3 -> 0/12 y 0,565; 11 -> 5/12). Por eso se
+mide contra el servidor de producción, voz a voz, y el servicio lo trae apagado por defecto.
 
 QUÉ HACE
   1. Sintetiza con voz-stream las FRASES_INTRO (las que más música disparaban) con varias semillas de síntesis,
