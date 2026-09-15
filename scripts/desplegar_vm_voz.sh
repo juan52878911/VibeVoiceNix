@@ -2,6 +2,7 @@
 # Despliega HEAD en la VM voz y verifica que el audio no cambia.
 #
 #   bash scripts/desplegar_vm_voz.sh < /dev/null            # desde el Mac, en la rama a desplegar
+#   BASE=/root/lab/fase5/base.json bash scripts/desplegar_vm_voz.sh < /dev/null
 #
 # 1. Comprueba que no corre nada de otra sesión (fase*, ws_fidelidad, evaluar_clones, benchmark_app).
 # 2. `git archive HEAD` a /root/despliegue-rend y `nixos-rebuild switch --flake path:...#voz` en la VM
@@ -9,14 +10,16 @@
 # 3. Verifica:
 #    - voz-stream activo, con el motor.py de HEAD;
 #    - VmHWM tras arrancar;
-#    - md5 de las 8 frases de banco_md5.py igual al de la base del A/B de la fase 1
-#      (/root/lab/fase1/base-1.json);
+#    - md5 de las 8 frases de banco_md5.py igual al de BASE (por defecto la base del A/B
+#      de la fase 1, /root/lab/fase1/base-1.json; la VM se reconstruyo el 15-09 y esa base
+#      se perdio con ella, asi que cada tanda nueva pasa la suya);
 #    - ws_fidelidad.py completo.
 set -euo pipefail
 
 VM=root@192.168.2.54
 SSHV=(ssh -i "$HOME/.ssh/oracle_a1" -o IdentitiesOnly=yes)
 DESTINO=/root/despliegue-rend
+BASE=${BASE:-/root/lab/fase1/base-1.json}
 REV=$(git rev-parse --short HEAD)
 MOTOR_SHA=$(git show HEAD:pkgs/vibevoice-ov/motor.py | shasum -a 256 | cut -d' ' -f1)
 [ -z "$(git status --porcelain -- pkgs nix flake.nix flake.lock)" ] || { echo "hay cambios sin commit en pkgs/nix: aborto"; exit 1; }
@@ -31,7 +34,7 @@ git archive --format=tar HEAD | "${SSHV[@]}" "$VM" "rm -rf $DESTINO && mkdir -p 
 
 # Sin -n: el heredoc ES la entrada de este ssh (con -n llegaria /dev/null y no se ejecutaria nada).
 # El guion entero se lanza con < /dev/null, asi que ningun otro ssh se come esta entrada.
-"${SSHV[@]}" "$VM" "MOTOR_SHA=$MOTOR_SHA bash -s" <<'EOF'
+"${SSHV[@]}" "$VM" "MOTOR_SHA=$MOTOR_SHA BASE=$BASE bash -s" <<'EOF'
 set -uo pipefail
 for _ in $(seq 1 120); do
   curl -fsS -m 3 http://127.0.0.1:8082/health >/dev/null 2>&1 && break
@@ -46,8 +49,9 @@ journalctl -u voz-stream -b --no-pager | grep -E '\[carga\]|modelo listo|\[arran
 PY=$(tr '\0' '\n' < /proc/$P/cmdline | head -1)
 export VOZ_TOKEN=$(tr '\0' '\n' < /proc/$P/environ | sed -n 's/^VOZ_TOKEN=//p')
 cd /root/lab
-$PY cli/banco_md5.py --url http://127.0.0.1:8082 --etiqueta desplegado --rondas 2 --pid "$P" --salida fase1/desplegado.json
-$PY cli/banco_md5.py comparar fase1/base-1.json fase1/desplegado.json
-$PY cli/ws_fidelidad.py --url http://127.0.0.1:8082 --token "$VOZ_TOKEN" > fase1/ws_desplegado.log 2>&1
-echo "ws_fidelidad codigo $?"; tail -3 fase1/ws_desplegado.log
+salida=$(dirname "$BASE")/desplegado.json
+$PY cli/banco_md5.py --url http://127.0.0.1:8082 --etiqueta desplegado --rondas 2 --pid "$P" --salida "$salida"
+$PY cli/banco_md5.py comparar "$BASE" "$salida"
+$PY cli/ws_fidelidad.py --url http://127.0.0.1:8082 --token "$VOZ_TOKEN" > "$(dirname "$BASE")/ws_desplegado.log" 2>&1
+echo "ws_fidelidad codigo $?"; tail -3 "$(dirname "$BASE")/ws_desplegado.log"
 EOF
