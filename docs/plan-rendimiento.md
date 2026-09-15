@@ -75,7 +75,27 @@ Se conservan `decoder_mm_int8` (producción), `decoder_mm_int4` (control del ban
 
 ## Fases 2-4
 
-Se fijan aquí antes de medir cada una, según lo que dé la fase 0. La puerta estándar del banco
+Se fijan aquí antes de medir cada una, según lo que dé la fase 0.
+
+### Fase 2: B1, topología real de la VM voz (puerta fijada el 14-09-2026, antes de medir)
+
+B2 queda cerrada por la 0.2. Sigue B1: decirle a la VM 210 que sus 12 vCPU son 6 núcleos × 2 hilos
+(hoy el guest ve 12 núcleos físicos).
+- **Hipótesis:** OpenVINO repartiría sus 6 hilos en núcleos distintos en vez de en hermanos SMT, con
+  menos varianza y quizá mejor RTF.
+- **Protocolo:** 4 tandas alternas, base → B1 → base → B1. Cada una arranca la VM desde cero con la
+  topología de esa tanda, espera a que `voz-stream-sin-swap` termine y corre `banco_md5.py` a
+  3 rondas. La ronda 0 no cuenta.
+- **Condiciones de host:** CT 100/101/102 parados y AuraCRM (VM 200 + CT 203) en marcha, igual en
+  todas las tandas.
+- **Puerta, todas a la vez:**
+  1. md5 idéntico a la base en todas las rondas;
+  2. `ws_fidelidad.py` completo en verde con B1;
+  3. **RTF**: mediana de las rondas válidas de B1 ≤ **0,97 ×** la de la base (un 3 % mínimo, por
+     encima del ruido medido entre tandas de la fase 1, del 0,6 %), **o** el IQR relativo del RTF de
+     B1 ≤ la mitad del de la base (la otra promesa de B1: menos varianza).
+- **Si no pasa:** se vuelve a la configuración de antes y B1 se cierra.
+- **Si pasa:** B1 se queda en la configuración de la VM y `nucleos_fisicos()` deja de contar 12. La puerta estándar del banco
 (`scripts/banco_ab.py`) es la del plan: UTMOS con IC inferior ≥ −0,02; WER con IC superior ≤ +0,5
 puntos; identidad ±0,005 global y ±0,0023 por clon; tono medio y recorrido ±0,03 st; final del habla
 ±20 ms; control int4 del decodificador incluido.
@@ -175,6 +195,26 @@ VÁLIDA y B2 SE CIERRA.** Medianas de 6 rondas (M), en ms por pasada:
   recorrido intercuartílico de los ms por llamada de la carga de CPU en la ventana sin GPU es ≤ 25 %
   de su mediana (la misma regla que la 0.2). Si no vale, se anota y se repite con el host en reposo.
   Umbral sin cambios: caída de frecuencia ≤ 15 %.
+- **Segunda pasada (20:00, con CT 100/101/102 parados y AuraCRM, es decir VM 200 y CT 203, en marcha): VÁLIDA y
+  CUMPLE.**
+  - **Validez:** IQR de la carga de CPU sin GPU = **19 %** de su mediana (≤ 25 %).
+  - **Umbral:** la frecuencia media cae un **12,1 %** (2194 → 1928 MHz; con medianas, 2591 → 2336), ≤ 15 %.
+  - **Lo que el umbral no mide:** la misma carga de CPU (decodificador int8 a 6 hilos en la VM) pasa de
+    **79,8 a 121,2 ms** de mediana por llamada con la GPU encendida, un **+51 %**, y su IQR sube del
+    19 % al 66 %.
+  - **La iGPU bajo esa carga:** 99,7 ms de mediana (cuartiles 64,7 / 114,2).
+  - **Potencia:** el paquete solo marca 13,5-14,5 W, así que la frenada no la pone el PL1. Parece que
+    los hilos de la VM y el trabajo de la GPU se esperan entre sí.
+
+- **Primer umbral con el host en reposo (20:05, dos pasadas):** decodificador int8 en f32 en GPU
+  **46,8 y 46,3 ms** de mediana (p90 49,5 / 48,8), ≤ 90 ms.
+- **0.3 COMPLETA: cumple los dos umbrales, así que C1 queda abierta.** Nada se decide sin el banco de la
+  fase 3, que necesita pasar la iGPU a la VM (ventana del host, a decidir por Juan). La difusión y el
+  LM no compilan en GPU con el runtime 22.43, así que **C2 se cierra** con ese runtime.
+
+  **Lectura (E):** si el decodificador (~41 ms de 110) sale de la CPU pero el resto se frena la mitad,
+  el fotograma queda en ~(110 − 41) × 1,5 ≈ 104 ms. La ganancia neta sería de un ~5 % o nula. Solo el
+  banco de la fase 3 lo diría.
 - **Host durante esa pasada (M, sin carga controlada, 900 s):** la iGPU tira de **9,9 W** de uncore de
   media cuando trabaja (pico 12,5 W). El paquete sube a 34,7 W, justo el PL1 de 35 W, frente a 22,6 W
   sin GPU. Máximo 86 °C, sin estrangulamiento térmico. La frecuencia de esos segundos no vale para el
