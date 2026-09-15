@@ -24,7 +24,7 @@ rm -rf "$SALIDA"
 mkdir -p "$SALIDA"
 cd "$LAB" || exit 1
 
-if pgrep -fa 'fase[0-9]_|ws_fidelidad|evaluar_clones|benchmark_app|ablacion' | grep -v -e pgrep -e fase3_ab; then
+if pgrep -fa 'fase[0-9]_|ws_fidelidad|evaluar_clones|benchmark_app|ablacion|musica|arranque' | grep -v -e pgrep -e fase3_ab; then
   echo "[gpu] hay otra carga en la VM: no se toca nada"; exit 1
 fi
 [ -e /dev/dri/renderD128 ] || { echo "[gpu] no hay /dev/dri/renderD128 en la VM: la iGPU no esta pasada"; exit 1; }

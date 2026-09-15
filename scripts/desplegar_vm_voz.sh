@@ -21,7 +21,7 @@ REV=$(git rev-parse --short HEAD)
 MOTOR_SHA=$(git show HEAD:pkgs/vibevoice-ov/motor.py | shasum -a 256 | cut -d' ' -f1)
 [ -z "$(git status --porcelain -- pkgs nix flake.nix flake.lock)" ] || { echo "hay cambios sin commit en pkgs/nix: aborto"; exit 1; }
 
-if "${SSHV[@]}" -n "$VM" 'pgrep -fa "fase[0-9]_|ws_fidelidad|evaluar_clones|benchmark_app|nixos-rebuild" | grep -v pgrep'; then
+if "${SSHV[@]}" -n "$VM" 'pgrep -fa "fase[0-9]_|ws_fidelidad|evaluar_clones|benchmark_app|nixos-rebuild|musica|arranque|ablacion" | grep -v pgrep'; then
   echo "hay otra carga en la VM: aborto"; exit 1
 fi
 
