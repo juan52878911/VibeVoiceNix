@@ -412,6 +412,40 @@ python scripts/nota_voz.py --voz isis --formato mp3 --salida saludo.mp3 "Feliz c
 
 ---
 
+## Música inventada en voz-stream (:8082): `ruido_arranque`
+
+VibeVoice-Realtime a veces pone **una sintonía de fondo que nadie pidió**, sobre todo en inglés y con textos
+de intro («Welcome to the show», «another episode of the podcast»). Es conducta aprendida del corpus de
+podcasts (Microsoft lo reconoce en su FAQ). La elige el ruido inicial de la difusión en el primer fotograma
+y la mantiene el propio modelo; no la quitan la cuantización, la guía, el freno ni la rampa de arranque.
+
+Lo que la quita es fijar **el ruido de los primeros fotogramas** de cada locución con un generador aparte
+de semilla fija. El resto sigue con el ruido de la petición (`semilla`), así que no se pierde variedad
+más allá de los primeros 0,8 s y no cuesta ni una pasada extra. Medido en torch fp32 con 3 frases de
+intro × 4 voces × 6 semillas nuevas: música en 26/72 clips sin él y 0/72 con la semilla 7 en 6
+fotogramas, WER 0,057 → 0,009, ECAPA +0,000, UTMOS +0,03.
+
+| Campo | En | Qué hace |
+|---|---|---|
+| `ruido_arranque: <int>` | `/tts/stream`, `/tts/sesion/{id}` (al crearla), `abrir` del websocket | Semilla del ruido de arranque de esa locución. |
+| `ruido_arranque: null` o `0` | ídem | Lo apaga: el audio de antes, bit a bit. |
+| *(sin mandar)* | ídem | El de la ficha `<voz>.json` (`"ruido_arranque"`) si lo lleva; si no, `VIBEVOICE_RUIDO_ARRANQUE` (7 por defecto). |
+
+- **La mejor semilla depende de la voz**: con la 1 también sale 0/72, pero una voz perdió 0,046 de ECAPA.
+  `scripts/elegir_arranque.py` prueba varias candidatas sobre frases de intro y escribe la ganadora en la
+  ficha (máximo ECAPA con cero clips con música).
+- **En las sesiones** vale para cada `generate()` que encadenan, igual que la rampa de arranque, y su estado
+  viaja con la foto de la pausa: una sesión intrusa no se lo cambia.
+- **En `/health`**, el bloque `ruido_arranque` dice el defecto, los fotogramas y qué voces llevan el suyo.
+
+```bash
+curl -X POST http://voz:8082/tts/stream -H "Authorization: Bearer $VOZ_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"texto":"Welcome to the show.","voz":"avril","semilla":3,"ruido_arranque":7}' --output intro.wav
+```
+
+---
+
 ## Pausas de la persona en voz-stream (:8082): `forma`, `pausas` y la ficha de cada voz
 
 Cada pausa que el modelo ya hace pasa a durar lo que duran las pausas **reales** de esa persona. **No toca

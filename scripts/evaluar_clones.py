@@ -78,6 +78,9 @@ def main():
     ap.add_argument("--voces-vm", default="/run/voz-stream/voces")
     ap.add_argument("--max-apartados", type=int, default=80)
     ap.add_argument("--whisper", default="large-v3")
+    ap.add_argument("--ruido-arranque", type=int, default=None,
+                    help="ruido_arranque de la sintesis (0 = apagado); sin darlo, el de voz-stream. La semilla por "
+                         "voz la elige scripts/elegir_arranque.py una vez escogido el clon")
     ap.add_argument("--solo-sintesis", action="store_true",
                     help="genera los WAV en la VM y sale: la puntuación va después, sin ocupar voz-stream")
     a = ap.parse_args()
@@ -97,7 +100,8 @@ def main():
     # ------------------------------------------------------------ síntesis en la VM
     def pedir(texto, voz):
         cuerpo = json.dumps({"texto": texto, "voz": voz, "cfg_scale": 3.0, "semilla": SEMILLA_SINTESIS,
-                             "pasos": 6, "formato": "wav"}).encode()
+                             "pasos": 6, "formato": "wav",
+                             **({"ruido_arranque": a.ruido_arranque or None} if a.ruido_arranque is not None else {})}).encode()
         pet = urllib.request.Request(f"{a.url}/tts/stream", data=cuerpo, method="POST",
                                      headers={"Content-Type": "application/json",
                                               "Authorization": f"Bearer {a.token}"})

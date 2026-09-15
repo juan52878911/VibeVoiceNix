@@ -847,27 +847,25 @@ def frenar_guia(modelo, freno: float = None) -> None:
     import types
 
     fi = FRENO_GUIA if freno is None else freno
-    if fi <= 0:
-        return
 
     @torch.no_grad()
     def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
         bucle = _DIFUSION["bucle"]
-        if bucle is not None and bucle.pasos == self.ddpm_inference_steps:
+        if bucle is not None and fi > 0 and bucle.pasos == self.ddpm_inference_steps:
             # EL MISMO BUCLE EN UNA LLAMADA (convertir_difusion.py): los pasos de
             # la cabeza, la guia, este freno y el solver. El ruido sale del mismo
             # torch.randn y con la misma forma, asi que la semilla consume igual.
             # En torch fp32 el bucle convertido da diferencia 0,0 frente a este;
             # en int8, 67,9 dB. 19,8 -> 13,9 ms por fotograma, medido en la VM.
             condition = torch.cat([condition, neg_condition], dim=0)
-            speech = torch.randn(condition.shape[0],
-                                 self.config.acoustic_vae_dim).to(condition)
+            speech = _ruido_difusion(condition.shape[0],
+                                     self.config.acoustic_vae_dim).to(condition)
             return bucle(condition, speech, cfg_scale, fi)
         self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
         condition = torch.cat([condition, neg_condition], dim=0).to(
             self.model.prediction_head.device)
-        speech = torch.randn(condition.shape[0],
-                             self.config.acoustic_vae_dim).to(condition)
+        speech = _ruido_difusion(condition.shape[0],
+                                 self.config.acoustic_vae_dim).to(condition)
         for t in self.model.noise_scheduler.timesteps:
             half = speech[: len(speech) // 2]
             combined = torch.cat([half, half], dim=0)
@@ -878,17 +876,22 @@ def frenar_guia(modelo, freno: float = None) -> None:
             half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
             # ---- el freno: la energia del eps guiado vuelve a la de la
             # rama condicional, y se mezcla segun `fi` ----
-            std_cond = cond_eps.std(dim=-1, keepdim=True)
-            std_guiado = half_eps.std(dim=-1, keepdim=True)
-            half_eps = (fi * (half_eps * (std_cond / (std_guiado + 1e-8)))
-                        + (1.0 - fi) * half_eps)
+            if fi > 0:
+                std_cond = cond_eps.std(dim=-1, keepdim=True)
+                std_guiado = half_eps.std(dim=-1, keepdim=True)
+                half_eps = (fi * (half_eps * (std_cond / (std_guiado + 1e-8)))
+                            + (1.0 - fi) * half_eps)
             eps = torch.cat([half_eps, half_eps], dim=0)
             speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
         return speech[: len(speech) // 2]
 
+    # Con fi <= 0 tambien se instala: sin las lineas del freno es la copia de
+    # upstream operacion por operacion, y hace falta para que el ruido de
+    # arranque (bloque MUSICA INVENTADA) llegue a este camino.
     modelo.sample_speech_tokens = types.MethodType(sample_speech_tokens, modelo)
-    print(f"[arranque] freno de guia {fi} (una locucion larga ya no se "
-          f"desboca de volumen)", flush=True)
+    if fi > 0:
+        print(f"[arranque] freno de guia {fi} (una locucion larga ya no se "
+              f"desboca de volumen)", flush=True)
 
 
 # La guia reforzada del ARRANQUE. El primer sonido de una locucion se decide
@@ -920,7 +923,60 @@ CFG_ARRANQUE_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_CFG_ARRANQUE_FOTOGRAMAS"
 # habia hecho menos de CFG_ARRANQUE_FOTOGRAMAS, con la rampa de 4.5 en mitad
 # de una frase. Al estar aqui, foto_generacion/reponer_generacion se lo llevan
 # y lo traen con el resto del estado de la sesion.
-_ARRANQUE = {"frame": 0}
+#
+# "gen" es el generador del ruido de arranque de esa generate() (None = apagado)
+# y "activo" el que usa el fotograma en curso: lo pone muestrear_reforzado y lo
+# lee _ruido_difusion. Tambien viajan en la foto de la sesion.
+_ARRANQUE = {"frame": 0, "gen": None, "activo": None}
+
+
+# MUSICA INVENTADA: EL RUIDO DE ARRANQUE
+# El modelo a veces pone una sintonia de fondo que nadie pidio (en ingles, con
+# textos de "intro de episodio": "Welcome to the show..."). Es conducta aprendida
+# del corpus de podcasts, y Microsoft la reconoce en su FAQ. La dispara el
+# registro del texto, la ELIGE el ruido inicial de la difusion en el fotograma 0
+# y la mantiene la realimentacion del LM. No la quitan la cuantizacion, la guia,
+# el freno ni la rampa (medido; nota de Obsidian
+# causa-musica-inventada-2026-09-15).
+#
+# La palanca es el ruido de los primeros fotogramas: salen de un generador de
+# CPU propio con semilla fija, y el resto de la locucion sigue con el ruido de
+# la peticion (el RNG global ni se entera de esos fotogramas). Cero pasadas
+# extra. MEDIDO en torch fp32 con 3 frases de intro x 4 voces x 6 semillas
+# nuevas (72 clips): musica AST > 0,2 en 26/72 con la base y 0/72 con la
+# semilla 7 en 6 fotogramas; WER 0,057 -> 0,009, ECAPA +0,000, UTMOS +0,03. La
+# semilla 1 tambien da 0/72 pero cuesta ECAPA -0,046 en una voz: la mejor
+# depende de la voz, y por eso la ficha <voz>.json puede llevar la suya
+# ("ruido_arranque", la elige scripts/elegir_arranque.py).
+#
+# Orden de mando: el campo de la peticion (tambien un null explicito, que lo
+# apaga) > la ficha de la voz > VIBEVOICE_RUIDO_ARRANQUE. 0 o null = apagado, el
+# audio de antes bit a bit.
+_ruido_env = os.environ.get("VIBEVOICE_RUIDO_ARRANQUE", "7").strip()
+RUIDO_ARRANQUE_DEFECTO: Optional[int] = int(_ruido_env) if _ruido_env not in ("", "0") else None
+RUIDO_ARRANQUE_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_RUIDO_ARRANQUE_FOTOGRAMAS", "6"))
+
+
+def _ruido_difusion(filas: int, dim: int) -> torch.Tensor:
+    """El ruido del que parte la difusion de un fotograma: el del arranque si
+    toca, el del RNG global (el de la peticion) si no."""
+    gen = _ARRANQUE["activo"]
+    if gen is None:
+        return torch.randn(filas, dim)
+    return torch.randn(filas, dim, generator=gen)
+
+
+def resolver_ruido_arranque(pet, voz: str) -> Optional[int]:
+    """Semilla del ruido de arranque de esta locucion, o None si va apagado."""
+    if "ruido_arranque" in pet.model_fields_set:
+        valor = pet.ruido_arranque
+    else:
+        ficha = ficha_voz(voz) or {}
+        valor = ficha["ruido_arranque"] if "ruido_arranque" in ficha else RUIDO_ARRANQUE_DEFECTO
+    try:
+        return int(valor) if valor else None
+    except (TypeError, ValueError):
+        raise HTTPException(422, f"ruido_arranque no valido en la ficha de '{voz}': {valor!r}")
 
 
 def reforzar_guia_arranque(modelo) -> None:
@@ -935,19 +991,24 @@ def reforzar_guia_arranque(modelo) -> None:
     a mitad lo fotografia antes de soltar el candado y lo repone al volver
     (SesionViva._pausar/_reanudar), asi que la generate() que se cuele en la
     pausa no le cambia en que punto de su arranque iba."""
-    if CFG_ARRANQUE <= 0 or CFG_ARRANQUE_FOTOGRAMAS <= 0:
-        return
+    # Se instala siempre: el contador tambien lo usa el ruido de arranque, que
+    # va por peticion. Con la rampa apagada solo cuenta.
+    rampa = CFG_ARRANQUE > 0 and CFG_ARRANQUE_FOTOGRAMAS > 0
     muestrear = modelo.sample_speech_tokens
     generar = modelo.generate
 
-    def generate_reiniciado(*a, **kw):
+    def generate_reiniciado(*a, ruido_arranque=None, **kw):
         _ARRANQUE["frame"] = 0
+        _ARRANQUE["activo"] = None
+        _ARRANQUE["gen"] = (torch.Generator(device="cpu").manual_seed(int(ruido_arranque))
+                            if ruido_arranque and RUIDO_ARRANQUE_FOTOGRAMAS > 0 else None)
         return generar(*a, **kw)
 
     def muestrear_reforzado(condition, neg_condition, cfg_scale=3.0):
         k = _ARRANQUE["frame"]
         _ARRANQUE["frame"] = k + 1
-        if k < CFG_ARRANQUE_FOTOGRAMAS and CFG_ARRANQUE > cfg_scale:
+        _ARRANQUE["activo"] = _ARRANQUE["gen"] if k < RUIDO_ARRANQUE_FOTOGRAMAS else None
+        if rampa and k < CFG_ARRANQUE_FOTOGRAMAS and CFG_ARRANQUE > cfg_scale:
             # Rampa lineal: fotograma 0 con CFG_ARRANQUE, y de vuelta al
             # pedido al agotar la ventana. Sin escalon: el freno de guia ya
             # normaliza la energia, pero la prosodia agradece la suavidad.
@@ -957,9 +1018,12 @@ def reforzar_guia_arranque(modelo) -> None:
 
     modelo.generate = generate_reiniciado
     modelo.sample_speech_tokens = muestrear_reforzado
-    print(f"[arranque] guia reforzada al empezar: cfg {CFG_ARRANQUE} con rampa "
-          f"de {CFG_ARRANQUE_FOTOGRAMAS} fotogramas (la primera palabra ya no "
-          f"se mastica)", flush=True)
+    if rampa:
+        print(f"[arranque] guia reforzada al empezar: cfg {CFG_ARRANQUE} con rampa "
+              f"de {CFG_ARRANQUE_FOTOGRAMAS} fotogramas (la primera palabra ya no "
+              f"se mastica)", flush=True)
+    print(f"[arranque] ruido de arranque: semilla {RUIDO_ARRANQUE_DEFECTO} por defecto en "
+          f"{RUIDO_ARRANQUE_FOTOGRAMAS} fotogramas (sin musica inventada)", flush=True)
 
 
 def demorar_eos(modelo) -> None:
@@ -1793,7 +1857,7 @@ def _ajustar_neg_cada(cada: Optional[int]) -> None:
 
 
 def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None,
-                neg_cada=None):
+                neg_cada=None, ruido_arranque=None):
     """Cuerpo sincrono de la sintesis; corre en un hilo del executor."""
     procesador = _estado["procesador"]
     solapado = _estado.get("solapado")
@@ -1833,6 +1897,7 @@ def _sintetizar(texto, voz, cfg_scale, streamer, semilla=None, pasos=None,
                     return_speech=False,
                     all_prefilled_outputs=copy.deepcopy(base),
                     audio_streamer=streamer,
+                    ruido_arranque=ruido_arranque,
                 )
             CRONO_TUBERIA["generate"] += time.perf_counter() - reloj
             CRONO_TUBERIA["generaciones"] += 1
@@ -2395,7 +2460,8 @@ def remate_cero() -> None:
 # para que anadir un estado nuevo obligue a decidir si va aqui:
 #
 #   - el RNG global de torch: el ruido de la difusion (el unico sorteo)
-#   - _ARRANQUE: en que fotograma de su arranque va la rampa de cfg
+#   - _ARRANQUE: en que fotograma de su arranque va la rampa de cfg, y el
+#     generador del ruido de arranque (su estado, que consume por fotograma)
 #   - _REMATE: pico del ultimo fotograma y cuenta de fotogramas del bloque
 #   - los pasos de difusion: set_ddpm_inference_steps es del modelo, y
 #     sample_speech_tokens lo lee en CADA latente
@@ -2415,8 +2481,10 @@ def remate_cero() -> None:
 # esto generaliza aquello a todo lo demas.
 def foto_generacion() -> dict:
     """Lo que hay que llevarse al soltar el candado. ANTES de soltarlo."""
+    gen = _ARRANQUE["gen"]
     return {"rng": torch.get_rng_state(),
             "arranque": _ARRANQUE["frame"],
+            "gen_arranque": gen.get_state() if gen is not None else None,
             "remate": dict(_REMATE)}
 
 
@@ -2426,6 +2494,12 @@ def reponer_generacion(foto: dict, pasos, neg_cada) -> None:
     _ajustar_pasos(pasos)
     _ajustar_neg_cada(neg_cada)
     _ARRANQUE["frame"] = foto["arranque"]
+    _ARRANQUE["activo"] = None
+    if foto["gen_arranque"] is None:
+        _ARRANQUE["gen"] = None
+    else:
+        _ARRANQUE["gen"] = torch.Generator(device="cpu")
+        _ARRANQUE["gen"].set_state(foto["gen_arranque"])
     _REMATE.update(foto["remate"])
 
 
@@ -2972,8 +3046,11 @@ class SesionViva:
 
     def __init__(self, nombre, voz, cfg_scale, semilla, pasos, lazo,
                  respiro=True, cola_final=None, neg_cada=None,
-                 recorte_entrada=None, pausas=None):
+                 recorte_entrada=None, pausas=None, ruido_arranque=None):
         self.nombre = nombre
+        # Semilla del ruido de arranque (bloque MUSICA INVENTADA) o None. Vale
+        # para cada generate() de la sesion, como la rampa.
+        self.ruido_arranque = ruido_arranque
         # Distribucion de pausas de la persona (bloque FORMA) o None. Cada
         # generate() monta su propio conformador, igual que su cola.
         self.pausas = pausas
@@ -3367,6 +3444,7 @@ class SesionViva:
                     return_speech=False,
                     all_prefilled_outputs=copy.deepcopy(base),
                     audio_streamer=destino,
+                    ruido_arranque=self.ruido_arranque,
                 )
         finally:
             # ANTES de soltar el candado: si generate() salio por excepcion --
@@ -3574,6 +3652,10 @@ class PeticionTTS(BaseModel):
     # None = VIBEVOICE_FORMA. Solo se mira al crear la locucion.
     forma: Optional[bool] = None
     pausas: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
+    # Semilla del ruido de los primeros fotogramas (bloque MUSICA INVENTADA):
+    # quita la sintonia de fondo que el modelo inventa en intros. Sin mandarlo,
+    # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE; null o 0 lo apaga.
+    ruido_arranque: Optional[int] = Field(None, ge=0, lt=2**31)
     # Formato del audio que viaja (ver FORMATOS_AUDIO): wav, ogg (Opus, notas de
     # voz de WhatsApp) o mp3. Solo cambia la codificacion de salida, nunca lo
     # que genera el modelo.
@@ -3608,6 +3690,10 @@ class PeticionSesion(BaseModel):
     # None = VIBEVOICE_FORMA. Solo se mira al crear la locucion.
     forma: Optional[bool] = None
     pausas: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
+    # Semilla del ruido de los primeros fotogramas (bloque MUSICA INVENTADA):
+    # solo al CREAR; quita la sintonia de fondo que el modelo inventa en intros. Sin mandarlo,
+    # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE; null o 0 lo apaga.
+    ruido_arranque: Optional[int] = Field(None, ge=0, lt=2**31)
     # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
     fin: bool = False
 
@@ -3658,6 +3744,13 @@ def health() -> dict:
         # El aire de ANTES de la primera palabra, que tampoco se emite. Igual
         # que cola_final, va por las dos vias.
         "recorte_entrada": RECORTE_ENTRADA,
+        # El ruido fijo de los primeros fotogramas (bloque MUSICA INVENTADA):
+        # defecto del servicio y las voces cuya ficha lleva el suyo.
+        "ruido_arranque": {"defecto": RUIDO_ARRANQUE_DEFECTO,
+                           "fotogramas": RUIDO_ARRANQUE_FOTOGRAMAS,
+                           "voces": {p.stem: (ficha_voz(p.stem) or {}).get("ruido_arranque")
+                                     for p in sorted(VOCES_DIR.glob("*.json"))
+                                     if "ruido_arranque" in (ficha_voz(p.stem) or {})}},
         # Las pausas de la persona (bloque FORMA): por peticion, apagado si no se pide.
         "forma": {"defecto": FORMA_DEFECTO, "detector": PAUSAS.VERSION,
                   "voces_con_perfil": sorted(
@@ -3805,6 +3898,7 @@ def voz_pausas(nombre: str, pet: PeticionPausas, _=Depends(autorizar)):
 async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingResponse:
     prefijo_voz(pet.voz)  # valida ANTES de enviar cabeceras, para dar un 404 limpio
     dist_pausas = distribucion_pausas(pet.voz, pet.forma, pet.pausas)
+    ruido = resolver_ruido_arranque(pet, pet.voz)
     if dist_pausas and abs(pet.velocidad - 1.0) > 1e-3:
         # Medido en la fase 4b: estirar ademas de conformar baja UTMOS 0,14-0,25.
         raise HTTPException(422, "forma y velocidad no se combinan: pide una u otra")
@@ -3825,7 +3919,7 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
                 None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
-                pet.semilla, pet.pasos, pet.neg_cada,
+                pet.semilla, pet.pasos, pet.neg_cada, ruido,
             )
             cod = CodificadorAudio(pet.formato, ritmo) if pet.formato != "wav" else None
             salida = (lambda pcm: cod.empujar(pcm)) if cod else (lambda pcm: pcm)
@@ -3928,7 +4022,8 @@ async def sesion_texto(nombre: str, pet: PeticionSesion,
                        respiro=pet.respiro, cola_final=pet.cola_final,
                        neg_cada=pet.neg_cada,
                        recorte_entrada=pet.recorte_entrada,
-                       pausas=dist_pausas)
+                       pausas=dist_pausas,
+                       ruido_arranque=resolver_ruido_arranque(pet, pet.voz or VOZ_DEFECTO))
         _SESIONES[nombre] = s
     elif pet.voz is not None and pet.voz != s.voz:
         raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
@@ -4106,6 +4201,10 @@ class AbrirSesionWS(BaseModel):
     # None = VIBEVOICE_FORMA. Solo se mira al crear la locucion.
     forma: Optional[bool] = None
     pausas: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
+    # Semilla del ruido de los primeros fotogramas (bloque MUSICA INVENTADA):
+    # quita la sintonia de fondo que el modelo inventa en intros. Sin mandarlo,
+    # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE; null o 0 lo apaga.
+    ruido_arranque: Optional[int] = Field(None, ge=0, lt=2**31)
     # Aceptado solo para poder dar un error claro; ver el bloque VELOCIDAD.
     velocidad: float = Field(1.0, ge=0.85, le=1.20)
 
@@ -4322,6 +4421,7 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
         try:
             prefijo_voz(cfg.voz)   # valida antes de montar nada
             dist_pausas = distribucion_pausas(cfg.voz, cfg.forma, cfg.pausas)
+            ruido = resolver_ruido_arranque(cfg, cfg.voz)
         except HTTPException as e:
             await evento(tipo="error", texto=str(e.detail))
             return
@@ -4334,12 +4434,13 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
                        lazo, respiro=cfg.respiro, cola_final=cfg.cola_final,
                        neg_cada=cfg.neg_cada,
                        recorte_entrada=cfg.recorte_entrada,
-                       pausas=dist_pausas)
+                       pausas=dist_pausas, ruido_arranque=ruido)
         # El audio ya sale por aqui: que GET /tts/sesion/{id}/audio no lo robe.
         s.escuchando = True
         _SESIONES[nombre] = s
         await evento(tipo="abierta", sesion=nombre, voz=cfg.voz,
                      cfg_scale=cfg.cfg_scale, semilla=cfg.semilla,
+                     ruido_arranque=ruido,
                      pasos=cfg.pasos if cfg.pasos is not None else PASOS,
                      ritmo=RITMO, formato="pcm_s16le_mono",
                      rtf_esperado=RTF_MEDIDO, s=transcurrido())

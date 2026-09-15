@@ -295,6 +295,20 @@ in
         opcion existir.
       '';
     };
+
+    ruidoArranque = lib.mkOption {
+      type = lib.types.nullOr lib.types.int;
+      default = 7;
+      description = ''
+        Semilla del ruido de los primeros fotogramas de cada locucion. Quita
+        la musica de fondo que el modelo inventa en intros ("Welcome to the
+        show..."): 0/72 clips con musica frente a 26/72, sin empeorar WER ni
+        identidad (medido en torch; ver docs/api.md, ruido_arranque).
+
+        null = apagado, el audio de antes bit a bit. La peticion
+        (ruido_arranque) y la ficha <voz>.json mandan sobre este defecto.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -357,6 +371,12 @@ in
       # hay un numero.
       // lib.optionalAttrs (cfg.semilla != null) {
         VIBEVOICE_SEMILLA = toString cfg.semilla;
+      }
+      # Aqui null NO es "sin variable": sin ella el codigo pone 7, asi que
+      # apagarlo es mandar 0.
+      // {
+        VIBEVOICE_RUIDO_ARRANQUE =
+          if cfg.ruidoArranque == null then "0" else toString cfg.ruidoArranque;
       }
       // lib.optionalAttrs ov.enable {
         VIBEVOICE_OV_CODIGO = "${pkgs.vibevoiceOvCodigo}";
