@@ -844,3 +844,24 @@ Como es un experimento **posterior a ver los datos**, va aparte: se añade a los
 igual o mayor que la mediana, con las semillas de clonado 1-5. Se aplica el mismo criterio de elección de
 arriba. Con Avril se evalúan juntas las cuatro variantes; con Sebastián solo se añaden estos cinco candidatos a
 los que ya había.
+
+### Resultado (14-09-2026)
+
+Síntesis con voz-stream en la VM y puntuación contra el centroide ECAPA de los segmentos apartados: 8 frases por
+candidato (4 en español y 4 en inglés), semilla de síntesis 11.
+
+| voz | elegido | identidad (es / en) | WER es / en (máx.) | UTMOS | mejor candidato del banco de dobla |
+|---|---|---|---|---|---|
+| Avril | **r60, semilla 4** (8 clips, 65 s, techo 0,933) | **0,634** (0,696 / 0,571) | 2,6 / 2,8 (11,1 %) | 1,54 | semilla 4: 0,502 (0,658 / 0,346), UTMOS 1,83 |
+| Sebastián | **limpia, semilla 4** (5 clips, 40 s, techo 0,834) | **0,594** (0,699 / 0,488) | 1,6 / 0,0 (6,2 %) | 2,01 | semilla 5: 0,582 (0,651 / 0,513), UTMOS 2,10 |
+
+- **No hay una regla única.** A Avril, con menos audio (14,9 min) y un banco flojo (techo 0,67), la referencia
+  consistente de 60 s le sube la identidad 0,13, sobre todo en inglés (0,571 frente a 0,30-0,40 del banco), a cambio
+  de UTMOS −0,3. A Sebastián, la referencia de 60 s le rompe el inglés (hasta 44 % de WER), y la limpia supera al
+  banco solo por 0,012, que con 8 frases está dentro del ruido y además es la variante añadida a posteriori.
+- **El techo no predice por sí solo.** La elección tiene que salir de la síntesis medida contra audio apartado, que es
+  lo que hace `evaluar_clones.py`.
+- **UTMOS no está en el criterio** y conviene mirarlo: el clon de Avril elegido es el menos natural de sus candidatos
+  válidos. Si la naturalidad importa más que la identidad, la alternativa es r30 con semilla 5 (0,546, UTMOS 1,68).
+- **Para dobla:** el banco recorta la referencia a `--ref-max 30` s, así que la de 60 s de Avril no cabría sin subirlo
+  para esa identidad.
