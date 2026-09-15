@@ -146,6 +146,20 @@ agregación fijada arriba. Lo que sí se repite en las cuatro filas es t3/t6 = 0
   bajo los 90 ms. En f16 se descarta: 16 dB. Esto cumple la primera mitad del umbral, **preliminar**
   mientras no se repita con el host en reposo.
 - **Falta** la segunda mitad del umbral, la frecuencia de la CPU con la GPU al 100 %.
+- **Prueba controlada de frecuencia, primera pasada (19:00, `scripts/fase0_igpu_frecuencia.sh`): NO
+  VÁLIDA.** Salió una caída de frecuencia del 38 % (2582 → 1600 MHz) y la carga de CPU pasó de 83,7 a
+  135,3 ms por llamada (+62 %). Pero la condición de la prueba, la misma carga de CPU, no se dio:
+  - **carga inestable sin la GPU:** esa llamada va de 35 a 92 ms segundo a segundo;
+  - **paquete lejos del PL1:** 9-25 W;
+  - **frecuencia a saltos:** entre 800 y 3860 MHz;
+  - **host compartido:** tras el reinicio corrían CT 101 minecraft, CT 102 gym y CT 203 docker-sandbox,
+    parados antes del reinicio, con carga media de 6,5.
+
+  La VM no recibía tiempo de CPU. **C1 y C2 quedan sin decidir; no se cierran ni se abren con esto.**
+- **Regla de validez para repetirla**, fijada ahora y antes de repetir: la prueba vale solo si el
+  recorrido intercuartílico de los ms por llamada de la carga de CPU en la ventana sin GPU es ≤ 25 %
+  de su mediana (la misma regla que la 0.2). Si no vale, se anota y se repite con el host en reposo.
+  Umbral sin cambios: caída de frecuencia ≤ 15 %.
 - **Host durante esa pasada (M, sin carga controlada, 900 s):** la iGPU tira de **9,9 W** de uncore de
   media cuando trabaja (pico 12,5 W). El paquete sube a 34,7 W, justo el PL1 de 35 W, frente a 22,6 W
   sin GPU. Máximo 86 °C, sin estrangulamiento térmico. La frecuencia de esos segundos no vale para el
