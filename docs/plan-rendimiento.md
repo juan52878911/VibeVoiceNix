@@ -95,6 +95,27 @@ B2 queda cerrada por la 0.2. Sigue B1: decirle a la VM 210 que sus 12 vCPU son 6
      encima del ruido medido entre tandas de la fase 1, del 0,6 %), **o** el IQR relativo del RTF de
      B1 ≤ la mitad del de la base (la otra promesa de B1: menos varianza).
 - **Si no pasa:** se vuelve a la configuración de antes y B1 se cierra.
+
+### Fase 4: C3, calidad del LM int8 frente a int4 (puerta fijada el 14-09-2026, antes de medir)
+
+`tts_lm_estado_int8.xml` nunca ha pasado por el banco exhaustivo. La pregunta es si el int4 de producción
+pierde calidad frente al int8. Con 6 hilos, el int8 costaba ~0,13 de RTF.
+- **Corpus:** `scripts/banco_ab.py` completo, igual que en §7 y §8 de optimizacion.md: 7 voces (4
+  clones + 3 de serie) × 17 frases × 2 semillas, cfg 3,5, generado por un proceso de voz-stream con
+  `VIBEVOICE_IR_LM` apuntando al int8, frente a producción (int4). Control incluido: el decodificador
+  int4, un cambio de timbre conocido que el banco tiene que separar.
+- **Puntuación:** whisper large-v3, UTMOS, ECAPA y F0, en el nodo `ascci` si su CPU lo permite en un
+  tiempo razonable; si no, en el Mac.
+- **Se considera que el int8 SUENA MEJOR si**, frente al int4, se cumple a la vez:
+  1. UTMOS con la diferencia media ≥ +0,02 y el IC 95 % inferior > 0;
+  2. WER sin empeorar: IC superior ≤ +0,5 puntos;
+  3. identidad, global y por clon, sin bajar más de 0,0023.
+- **Si el int8 suena mejor:** se prueba int4 con AWQ y estimación de escala (`nncf`, con datos de
+  latentes reales), con el mismo banco y la misma puerta contra el int4 de hoy.
+- **Si no suena mejor** (UTMOS con el IC conteniendo el 0, o por debajo): el int4 se queda, C3 se
+  cierra y `tts_lm_estado_int8` pasa a la lista de poda.
+- **Válido solo si** el control int4 del decodificador sale separado de la base, como en §7 (UTMOS con
+  el IC superior < 0).
 - **Si pasa:** B1 se queda en la configuración de la VM y `nucleos_fisicos()` deja de contar 12. La puerta estándar del banco
 (`scripts/banco_ab.py`) es la del plan: UTMOS con IC inferior ≥ −0,02; WER con IC superior ≤ +0,5
 puntos; identidad ±0,005 global y ±0,0023 por clon; tono medio y recorrido ±0,03 st; final del habla
