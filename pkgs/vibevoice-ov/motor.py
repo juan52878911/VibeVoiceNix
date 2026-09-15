@@ -353,7 +353,7 @@ class AcusticoOV:
     latente nulo. Cuesta un decode (52 ms) por sintesis, no por fotograma.
     """
 
-    def __init__(self, ruta_xml, hilos):
+    def __init__(self, ruta_xml, hilos, dispositivo="CPU"):
         import re
         import openvino as ov
         from decoder_manual import formas_estado_lista
@@ -377,9 +377,15 @@ class AcusticoOV:
         #
         # Lo que cuesta: copiar las colas que devuelve cada llamada (711 KB).
         self._explicito = not any(op.get_type_name() == "ReadValue" for op in modelo.get_ops())
-        self.comp = core.compile_model(modelo, "CPU",
-                                       {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1,
-                                        "PERFORMANCE_HINT": "LATENCY"})
+        if dispositivo == "CPU":
+            config = {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1, "PERFORMANCE_HINT": "LATENCY"}
+        else:
+            # EN GPU, f32 SIEMPRE. La iGPU calcula en f16 por defecto, y medido en la UHD 630 con este
+            # mismo IR int8 eso deja el audio a 16 dB del de CPU; en f32 queda a 53-58 dB, o sea, el
+            # mismo decodificador (docs/plan-rendimiento.md, 0.3).
+            config = {"PERFORMANCE_HINT": "LATENCY", "INFERENCE_PRECISION_HINT": "f32"}
+        self.dispositivo = dispositivo
+        self.comp = core.compile_model(modelo, dispositivo, config)
         self.pet = self.comp.create_infer_request()
         if self._explicito:
             self._nombres_est = ["est.%d.in" % i for i in range(len(formas))]
@@ -637,9 +643,16 @@ def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None,
     _marca("LM de texto en int8")
 
     # 3) enchufar OpenVINO
+    # Donde corre el decodificador: CPU (el defecto) o GPU (VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU, la iGPU
+    # pasada a la VM; plan de rendimiento, fase 3).
+    dispositivo_acustico = os.environ.get("VIBEVOICE_ACUSTICO_DISPOSITIVO", "CPU").strip().upper() or "CPU"
     # El bucle se queda con lo que no se lleve el decodificador. Minimo 1: un
-    # reparto mal puesto no debe dejar el camino critico sin hilos.
-    hilos_bucle = max(1, hilos - hilos_acustico) if hilos_acustico else hilos
+    # reparto mal puesto no debe dejar el camino critico sin hilos. Si el
+    # decodificador va en GPU no se lleva ningun hilo de CPU, aunque vaya solapado.
+    if hilos_acustico and dispositivo_acustico == "CPU":
+        hilos_bucle = max(1, hilos - hilos_acustico)
+    else:
+        hilos_bucle = hilos
     modelo.model.tts_language_model = TtsLmOV(ir_lm, hilos_bucle, neg_cada=neg_cada)
     _marca("LM TTS compilado")
     if ir_cabeza:
@@ -648,10 +661,10 @@ def cargar(modelo_path, hilos, ir_lm, ir_cabeza, ir_acustico=None,
         torch.ao.quantization.quantize_dynamic(
             modelo.model.prediction_head, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
     if ir_acustico:
-        acustico = AcusticoOV(ir_acustico, hilos_acustico or hilos)
+        acustico = AcusticoOV(ir_acustico, hilos_acustico or hilos, dispositivo_acustico)
         modelo.model.acoustic_tokenizer.decode = acustico.decode
         modelo._acustico_ov = acustico
-        _marca("decodificador compilado")
+        _marca(f"decodificador compilado ({dispositivo_acustico})")
     gc.collect()
     return procesador, modelo
 

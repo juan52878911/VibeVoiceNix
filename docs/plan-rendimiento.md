@@ -111,6 +111,43 @@ segundo `-smp`.
 La VM 210 quedó sin `args`, como antes. Decirle al guest que tiene hermanos SMT no cambia cómo reparte
 OpenVINO sus 6 hilos, o no lo cambia para bien.
 
+### Fase 3: C1, el decodificador en la iGPU (puerta fijada el 15-09-2026, antes de medir)
+
+Juan da la fase 3. La 0.3 cumplió sus dos umbrales (46 ms en GPU, frecuencia −12 %), pero la misma carga de
+CPU iba +51 % más lenta con la GPU al 100 %, y eso solo lo decide el banco.
+
+**Montaje.**
+1. **La iGPU a la VM:** se desliga de `i915` en el host **en caliente** (`unbind` + `vfio-pci`), sin
+   reiniciar pve. AuraCRM no se para. Si hiciera falta reiniciar el host, se para y se pregunta a Juan.
+   Después, `hostpci0: 0000:00:02.0` en la VM 210.
+2. **En NixOS:** runtime OpenCL de Gen9 (`intel-compute-runtime-legacy1` o equivalente).
+3. **En `motor.AcusticoOV`:** dispositivo configurable por entorno, siempre con
+   `INFERENCE_PRECISION_HINT=f32` (el f16 da 16 dB y está descartado). El decodificador va en su propio
+   hilo con cola FIFO (el solapado ya existente), para que la CPU siga con LM y difusión mientras la GPU
+   decodifica.
+4. **El IR:** `decoder_mm_int8` (en GPU con f32 da 53-58 dB frente a CPU). El fp16 queda fuera: 106 ms
+   por fotograma en f32.
+
+**Puerta, todas a la vez.** Variante = decodificador en GPU asíncrono; base = producción.
+1. **Numérica del sumidero** (`banco_md5.py`, 8 frases con semilla 101): mismas duraciones exactas que la
+   base en todos los clips. El decodificador no realimenta, así que un largo distinto sería un fallo. Y
+   SNR del audio frente a la base ≥ **25 dB** en todos los clips.
+2. **`ws_fidelidad.py` completo** en verde. Se exige lo que no depende del md5 (eventos, concurrencia,
+   limpieza, errores, autenticación), y en las pruebas de md5 que la variante sea coherente consigo
+   misma (sesión = stream = websocket).
+3. **Banco exhaustivo** (`banco_ab.py`, 238 parejas, control int4 incluido) con la puerta estándar:
+   - UTMOS con el IC inferior ≥ −0,02;
+   - WER con el IC superior ≤ +0,5 puntos;
+   - identidad ±0,005 global y ±0,0023 por clon;
+   - tono medio y recorrido ±0,03 st;
+   - final del habla ±20 ms.
+4. **RTF**, que es el motivo de la fase: tandas alternas base → GPU → base → GPU (`banco_md5.py`, 3
+   rondas, la 0 no cuenta). Pasa si la mediana GPU ≤ **0,93 ×** la base (un 7 % mínimo, por encima del
+   ruido medido y a la altura de lo que la 0.3 deja esperar), con RAPL y temperatura registrados.
+
+**Si no pasa:** la iGPU vuelve al host (`vfio-pci` → `i915`), la VM 210 se queda sin `hostpci0` y C1 se
+cierra.
+
 ### Fase 4: C3, calidad del LM int8 frente a int4 (puerta fijada el 14-09-2026, antes de medir)
 
 `tts_lm_estado_int8.xml` nunca ha pasado por el banco exhaustivo. La pregunta es si el int4 de producción
