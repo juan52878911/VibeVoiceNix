@@ -13,6 +13,10 @@
 # 4). ws_fidelidad.py completo contra la primera tanda gpu. Para voz-stream y lo devuelve al salir.
 set -uo pipefail
 export PATH=/run/current-system/sw/bin:$PATH
+# systemd-run tampoco pone HOME, y el runtime OpenCL de Intel (NEO/IGC) lo necesita para su cache de kernels:
+# sin HOME el proceso muere al compilar el decodificador en GPU con "longjmp causes uninitialized stack
+# frame" (medido el 15-09-2026: dos veces bajo systemd-run, y reproducido a mano con env -u HOME).
+export HOME=/root
 for orden in pgrep systemctl sleep curl awk sha256sum swapoff; do
   command -v "$orden" >/dev/null || { echo "[gpu] falta $orden: aborto"; exit 1; }
 done

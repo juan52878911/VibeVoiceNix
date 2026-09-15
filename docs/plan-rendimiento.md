@@ -164,9 +164,15 @@ cierra.
     `OMP_NUM_THREADS=6`;
   - `motor.cargar` completo con `VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU`;
   - y dos arranques del servidor real con la receta exacta de `gpu-1` (modelo listo en 10,4 y 10,5 s).
-- **Lectura:** fallo intermitente del compilador de kernels de la GPU (IGC). La primera compilación tras
-  arrancar la VM es la única que se cayó. **Condición añadida al despliegue, si la fase 3 pasara:**
-  10 arranques seguidos de voz-stream con la GPU, sin ningún fallo.
+- **13:40, segunda ejecución de `fase3_ab.sh`: `gpu-1` vuelve a morir en el mismo punto.** No era
+  intermitente.
+- **Causa CONFIRMADA (13:45):** `systemd-run` no pone `HOME`, y el runtime OpenCL de Intel (NEO/IGC) lo
+  necesita para su caché de kernels. El servidor de laboratorio arrancado a mano con `env -u HOME` muere
+  exactamente igual (`longjmp causes uninitialized stack frame`); con `HOME=/root` arranca siempre. Mis
+  pruebas buenas por ssh tenían `HOME`. Arreglo: `fase3_ab.sh` exporta `HOME=/root`.
+- **Condición añadida al despliegue, si la fase 3 pasara:** la unidad de voz-stream (`DynamicUser`)
+  tiene que llevar un `HOME` o una caché explícita para NEO, y hay que comprobar 10 arranques seguidos
+  con la GPU sin fallos.
 - **Ruido de host en esa primera tanda:** la base dio RTF 1,16-1,18 con el `kvm` de AuraCRM a ~236 %
   en un pico. Las tandas alternas lo reparten entre base y GPU, pero la cifra absoluta no se compara con
   la de otros días.
