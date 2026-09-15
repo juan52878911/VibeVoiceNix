@@ -131,6 +131,12 @@
     # genera los grafos (~15 min, pico de 4,6 GB de RAM); despues arranca solo.
     openvino.enable = true;
 
+    # Los conversores escriben fp16, int8 e int4 de cada pieza (2,4 GB) y esta
+    # maquina usa cuatro ficheros (~630 MB). Lo demas se borra al convertir: esta
+    # copiado en el NAS (/tank/nfs/vibevoice/modelos) y se regenera quitando el
+    # marcador .hecho del paso.
+    openvino.conservarVariantes = false;
+
     # 6 Y NO LA AUTODETECCION. Aqui la autodeteccion se equivoca, y no por un
     # fallo suyo: el hipervisor presenta las 12 vCPU con `core id` distinto y
     # sin `physical id`, asi que dentro de la VM parecen 12 nucleos fisicos y

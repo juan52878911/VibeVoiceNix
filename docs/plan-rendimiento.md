@@ -253,6 +253,36 @@ puntos; identidad ±0,005 global y ±0,0023 por clon; tono medio y recorrido ±0
 
 ---
 
+## Fase 5: recursos para EC2 (puertas fijadas el 15-09-2026, antes de medir)
+
+El destino es una instancia EC2 que tiene que ser lo más pequeña y barata posible sin perder calidad.
+Las pruebas van en un **clon de la VM voz** (VM 104 `voz-clon` en `ascci`, restaurado del vzdump del NAS,
+IP 192.168.2.56), para no tocar la VM de producción de pve.
+
+**Aviso de validez:** el i3-3220 de `ascci` **no tiene AVX2**. En el clon valen las puertas **bit a bit**
+(md5, `ws_fidelidad`) y las de **espacio y memoria**; **el RTF medido allí no vale** y cualquier puerta de
+velocidad se repite en la máquina de destino.
+
+### 5.1 Disco
+
+| Palanca | Qué hace | Ahorro esperado |
+|---|---|---|
+| `fstrim` en la VM | devuelve al pool los bloques ya libres | (M) 22 GiB dentro; el disco baja del 53,1 % al 44,1 % de 40 GB |
+| quitar `hardware.graphics` | el runtime OpenCL sobra desde que C1 no pasó | (E) ~1,07 GB de closure (llvm 541 + mesa 265 + IGC 260 MB) |
+| `conservarVariantes = false` | el conversor borra los IR que voz-stream no usa | (E) 2,4 GB → ~630 MB en `/var/lib/voz/ov` |
+
+**Puerta (todas a la vez), medida en el clon:**
+1. **md5 idéntico** en las 8 frases de `banco_md5.py` con semilla 101, antes y después de los cambios,
+   en la misma máquina (entre máquinas distintas el md5 no tiene por qué coincidir: otra CPU, otros
+   kernels).
+2. **`ws_fidelidad.py` completo** en verde después.
+3. **`/health`** anuncia los mismos IR de producción (LM int4, cabeza int8, decodificador int8,
+   difusión p6 int8) y el servicio arranca sin avisos de IR ausentes.
+4. **Espacio:** se anota el closure del sistema, el tamaño de `/var/lib/voz/ov` y el disco de la VM en
+   el pool, antes y después.
+
+**Si falla la 1, la 2 o la 3**, se revierte el cambio que lo rompa y se documenta.
+
 ## Resultados
 
 ### Fase 0 (14-09-2026, VM voz recién reiniciada, voz-stream parado)
