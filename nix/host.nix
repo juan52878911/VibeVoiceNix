@@ -30,8 +30,14 @@
     # Tunel hacia el edge de Oracle. La clave privada NO esta aqui: vive en
     # /var/lib/wireguard/privada con permisos 600, fuera del store.
     # Publica de esta VM: xOQrGF/NjbD9UmWHwqkjGG4oWaA8p+yKlZq+QVtyTjQ=
+    # APAGADO desde el 15-09-2026: la VM se reconstruyo tras un qmdestroy y la clave
+    # privada (/var/lib/wireguard/privada) se perdio con el disco. Con networkd, la
+    # clave va como credencial de systemd-networkd y, si el fichero no existe,
+    # networkd no arranca: la VM se queda SIN RED en la LAN (comprobado en el
+    # journal: "Failed to set up credentials"). Para volver a encenderlo: generar
+    # la clave en la VM (`wg genkey`), dar la publica nueva al edge y poner true.
     tunel = {
-      enable = true;
+      enable = false;
       ip = "10.10.10.5/24";
       clavePublicaEdge = "0zKhpcPb5eQkU0DgABE8pjYRwTs9UcyNXPbeQ94s/C0=";
       endpoint = "149.130.186.157:51820";
