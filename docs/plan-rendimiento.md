@@ -542,3 +542,41 @@ atribuye al cambio.
 
 **0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
 tokens de contexto.
+
+---
+
+## Balance del plan (15-09-2026): cerrado
+
+De los tres objetivos, dos se consiguieron y uno no dio nada. Se deja escrito para no volver a
+plantearlo desde cero.
+
+| Objetivo | Resultado |
+|---|---|
+| **RAM** | **PASA.** VmHWM 4387 → 2012 MB (−54 %), arranque 22-25 → 13 s, 0 de swap |
+| **Disco** | **PASA.** VM 19 → 16 GB · `/var/lib/voz/ov` 3,6 GB → 562 MB · closure 7,54 → 7,02 GB |
+| **RTF** | **NO PASA: cero.** Las cinco palancas (B1, B2, C1, C2, C3) se midieron contra puertas fijadas antes y ninguna llegó |
+
+Que la mitad del plan fuera RTF y no diera nada no es falta de trabajo: la máquina está en su límite de
+potencia (PL1 de 35 W, 438 de 608 s del banco a ≥ 34 W) y el bucle ya estaba bien optimizado. Cada
+callejón costó una medición completa, que es justo lo que permite cerrarlo y no volver.
+
+### Lo que queda del plan original, y por qué no se hace
+
+| Palanca | Qué daría | Por qué no |
+|---|---|---|
+| **B3, `CACHE_DIR`** | −13 s de arranque | cuesta +0,6 GB de disco: va en contra del objetivo, y el RTF no se mueve |
+| **C5, LM de texto en OpenVINO** | ≤ 2 ms por fotograma (~1,5 % de RTF) | cambia la numérica, así que exige el banco de 3 h. No compensa |
+| **C4, ventana deslizante del contexto** | algo en narraciones largas (el LM pasa de 13,7 a 18-21 ms entre 400 y 1400 tokens, M) | cambia **lo que el modelo se oye a sí mismo**: riesgo de calidad puro. El plan ya la dejó la última |
+
+### Lo que queda fuera del plan, y sí tiene recorrido
+
+| Palanca | Ahorro | Qué falta |
+|---|---|---|
+| **VM de 5120 a 4096 MB** | −1 GB en el host, que es lo sobresuscrito | estaba bloqueada por el pico de 4,6 GB del conversor de IR. **Se desbloquea** desde que los IR son un artefacto del NAS: la VM los copia en vez de convertirlos (ver [ec2-y-coste.md](ec2-y-coste.md) §6) |
+| **Recoger la basura del store** | el store son 11 GB y el closure vivo 7,02 → **~4 GB** (E) | cuesta la vuelta atrás del último despliegue: conviene esperar unos días |
+| **whisper `ggml-small-q8_0`** | −250 MB de RAM y −215 MB de disco | puerta de WER sobre los 8 audios del banco. **No vale exigir transcripciones idénticas** como en A5: el modelo es otro |
+| **Cachés del Mac** | ~17 GB: `~/.cache/vibevoice-nix` 4,8 · HuggingFace 5,2 · imágenes Docker sin usar 6 · caché de build 1,45 (M) | decisión de Juan. Ojo con la primera: se borra sola de vez en cuando y rehacerla cuesta `preparar_modelo.py` |
+| **Coste por carácter** | es el eje con recorrido de verdad | otro plan: [ec2-y-coste.md](ec2-y-coste.md) |
+
+**Nota:** `/var/lib/taller` y `/root/.cache/vibevoice-nix` **ya no existen en la VM**. Se fueron con la
+reconstrucción del 15-09, junto con las voces propias; no los borró ninguna poda.
