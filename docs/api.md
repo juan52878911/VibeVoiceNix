@@ -423,8 +423,11 @@ La palanca es **el ruido de los primeros fotogramas** de cada locución, que sal
 con semilla fija. El resto sigue con el ruido de la petición (`semilla`): no se pierde variedad más allá
 de los primeros 0,8 s y no cuesta ni una pasada extra.
 
-**Va apagado por defecto**, porque la semilla buena depende del motor. Medido con 3 frases de intro × 4
-voces × 6 semillas nuevas (72 clips):
+**El defecto es la semilla 1** (16-09-2026), elegida tras barrer 13 candidatas en OpenVINO y validarla con
+semillas nuevas: música 32 → 0/72 clips, WER −1,4 puntos y UTMOS +0,27, a cambio de 0,016 de identidad —
+por debajo de la puerta que nos habíamos puesto (0,01), y se adopta igual porque la música se oye y esa
+caída no es significativa. La semilla buena depende del motor y de la voz, así que la ficha de cada voz
+manda sobre el defecto. Medido antes con 3 frases de intro × 4 voces × 6 semillas nuevas (72 clips):
 
 | Motor | Música sin él | Con la semilla 7 | Veredicto |
 |---|---|---|---|
@@ -440,7 +443,7 @@ cambia una lotería por semilla por un todo o nada por texto, y re-tirar con otr
 |---|---|---|
 | `ruido_arranque: <int>` | `/tts/stream`, `/tts/sesion/{id}` (al crearla), `abrir` del websocket | Semilla del ruido de arranque de esa locución. |
 | `ruido_arranque: null` o `0` | ídem | Lo apaga: el audio de antes, bit a bit. |
-| *(sin mandar)* | ídem | El de la ficha `<voz>.json` (`"ruido_arranque"`) si lo lleva; si no, `VIBEVOICE_RUIDO_ARRANQUE` (vacía por defecto: apagado). |
+| *(sin mandar)* | ídem | El de la ficha `<voz>.json` (`"ruido_arranque"`) si lo lleva; si no, `VIBEVOICE_RUIDO_ARRANQUE` (**1** por defecto). |
 
 - **La semilla se elige por voz y con el motor de producción**: `scripts/elegir_arranque.py` prueba 4-6
   candidatas contra el servidor de verdad sobre frases de intro y escribe la ganadora en la ficha (máximo

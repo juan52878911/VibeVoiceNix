@@ -951,15 +951,21 @@ _ARRANQUE = {"frame": 0, "gen": None, "activo": None}
 # 29 -> 0/72 pero ECAPA -0,012 (no pasa), y en OpenVINO (produccion) 39 -> 18/72:
 # los 18 son UNA frase en tres voces con las seis semillas. El ruido de arranque
 # convierte la loteria por semilla en un todo o nada por texto, asi que re-tirar
-# con otra semilla no la quita: hay que cambiar el arranque. Por eso va APAGADO
-# por defecto y se usa por peticion o por voz (la ficha <voz>.json lleva
-# "ruido_arranque", que elige scripts/elegir_arranque.py midiendo con el motor
-# de produccion).
+# con otra semilla no la quita: hay que cambiar el arranque.
+#
+# EL DEFECTO ES LA 1, por decision de Juan (16-09-2026). Barrido de 13 candidatas
+# en OpenVINO y validacion con semillas nuevas 50-55 (72 clips pareados): musica
+# 32 -> 0/72, WER -1,4 puntos, UTMOS +0,27 y ECAPA -0,016. La puerta pedia no
+# bajar mas de 0,01 de identidad, asi que NO la paso; se adopta igual porque la
+# musica se oye y la caida no es significativa (IC [-0,038, +0,005]). Si otra
+# semilla gana en identidad para una voz concreta, va en su ficha <voz>.json
+# ("ruido_arranque", la elige scripts/elegir_arranque.py contra el motor de
+# produccion) y manda sobre este defecto.
 #
 # Orden de mando: el campo de la peticion (tambien un null explicito, que lo
 # apaga) > la ficha de la voz > VIBEVOICE_RUIDO_ARRANQUE (vacia por defecto).
 # 0 o null = apagado, el audio de antes bit a bit (md5 8/8 en torch y en OpenVINO).
-_ruido_env = os.environ.get("VIBEVOICE_RUIDO_ARRANQUE", "").strip()
+_ruido_env = os.environ.get("VIBEVOICE_RUIDO_ARRANQUE", "1").strip()
 RUIDO_ARRANQUE_DEFECTO: Optional[int] = int(_ruido_env) if _ruido_env not in ("", "0") else None
 RUIDO_ARRANQUE_FOTOGRAMAS = int(os.environ.get("VIBEVOICE_RUIDO_ARRANQUE_FOTOGRAMAS", "6"))
 
@@ -3662,7 +3668,7 @@ class PeticionTTS(BaseModel):
     pausas: Optional[list[float]] = Field(None, min_length=1, max_length=5000)
     # Semilla del ruido de los primeros fotogramas (bloque MUSICA INVENTADA):
     # quita la sintonia de fondo que el modelo inventa en intros. Sin mandarlo,
-    # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE (apagado); null o 0 lo apaga.
+    # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE (1 por defecto); null o 0 lo apaga.
     ruido_arranque: Optional[int] = Field(None, ge=0, lt=2**31)
     # Formato del audio que viaja (ver FORMATOS_AUDIO): wav, ogg (Opus, notas de
     # voz de WhatsApp) o mp3. Solo cambia la codificacion de salida, nunca lo

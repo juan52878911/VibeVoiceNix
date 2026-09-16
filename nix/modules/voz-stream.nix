@@ -298,16 +298,24 @@ in
 
     ruidoArranque = lib.mkOption {
       type = lib.types.nullOr lib.types.int;
-      default = null;
+      default = 1;
       description = ''
         Semilla del ruido de los primeros fotogramas de cada locucion, contra
         la musica de fondo que el modelo inventa en intros ("Welcome to the
-        show..."). null (el defecto) = apagado, el audio de antes bit a bit.
+        show..."). null = apagado, el audio de antes bit a bit.
 
-        No hay una semilla buena para todo: la 7 quito la musica en torch fp32
-        (0/72) pero en OpenVINO la dejo en 18/72, todo en una frase. Se usa por
-        voz (ficha <voz>.json, scripts/elegir_arranque.py) o por peticion
-        (ruido_arranque), que mandan sobre este defecto.
+        La 1 es el defecto por decision de Juan (16-09-2026). MEDIDO en
+        OpenVINO con semillas nuevas, 72 clips pareados: musica 32 -> 0/72,
+        WER -1,4 puntos y UTMOS +0,27, a cambio de 0,016 de identidad. La
+        puerta pedia no bajar de 0,01, asi que NO la paso: se adopta igual
+        porque la musica inventada se oye y la caida de identidad no es
+        significativa (IC [-0,038, +0,005]).
+
+        La semilla buena depende del MOTOR y de la VOZ: la 7, ganadora en
+        torch fp32 (0/72), deja 18/72 en OpenVINO. Por eso la ficha
+        <voz>.json puede llevar la suya -- la elige
+        scripts/elegir_arranque.py midiendo contra el motor de produccion --
+        y manda sobre este defecto; la peticion manda sobre las dos.
       '';
     };
   };

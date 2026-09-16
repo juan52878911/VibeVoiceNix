@@ -219,7 +219,7 @@ Módulo: [`nix/modules/voz-stream.nix`](../nix/modules/voz-stream.nix).
 | `solaparDecodificador` | `bool` | `true` con torch, **`false` con OpenVINO** | Corre el decodificador acústico **a la vez** que el bucle: −21 % de RTF en torch; con OpenVINO empeora y viene apagado. |
 | `hilosDecodificador` | `int` | `0` | Hilos para el decodificador solapado. 0 = la mitad de `hilos`. |
 | `semilla` | `nullOr int` | `null` | Semilla del ruido cuando el cliente no manda ninguna. `null` = sorteo por petición; un número hace el servicio determinista por defecto. `/health` la anuncia como `semilla_defecto`. **La VM `voz` lleva `101`**, la que ganó el banco de 18 semillas (0 % de WER frente al 40,7 % de la peor; tabla en [plan-determinismo-calidad.md](plan-determinismo-calidad.md)). |
-| `ruidoArranque` | `nullOr int` | `null` | Semilla del ruido de los primeros fotogramas de cada locución, contra la música de fondo que el modelo inventa en intros. `null` = apagado, el audio de antes bit a bit. No hay una semilla buena para todos los motores (la 7: 0/72 en torch fp32, 18/72 en OpenVINO; ver `ruido_arranque` en [api.md](api.md)); se usa por voz o por petición, que mandan sobre este defecto. |
+| `ruidoArranque` | `nullOr int` | `1` | Semilla del ruido de los primeros fotogramas de cada locución, contra la música de fondo que el modelo inventa en intros. **La 1 es el defecto desde el 16-09-2026**: en OpenVINO deja la música en 0/72 clips (32/72 sin ella), con −1,4 puntos de WER y +0,27 de UTMOS, a cambio de 0,016 de identidad. `null` = apagado, el audio de antes bit a bit. La semilla buena depende del motor y de la voz; la de la ficha `<voz>.json` manda sobre este defecto (ver `ruido_arranque` en [api.md](api.md)). |
 | `motor` | `enum` | `"vibevoice"` | Qué modelo hay detrás de :8082: `vibevoice` (lo medido) o `qwen3tts` (Qwen3-TTS-0.6B-Base con el motor C). Mismo contrato HTTP. |
 | `qwen3tts.cuantizacion` | `enum` | `"int8"` | `int8` o `int4` en el motor C. |
 | `qwen3tts.hilos` | `int` | `0` | Hilos del motor C. 0 = todos. |
@@ -420,7 +420,7 @@ para depurar.
 | `VIBEVOICE_HILOS_DECODER` | hilos del decodificador solapado; `0` = la mitad |
 | `VIBEVOICE_SEMILLA` | semilla por defecto del ruido; vacía = sorteo por petición. Es `services.voz-stream.semilla` |
 | `VIBEVOICE_FORMA` | `0` por defecto. Pausas de la persona (`forma`): cada pausa del modelo dura lo que las reales de esa voz, sin tocar ninguna muestra con voz; `1` lo activa para las peticiones que no digan nada, con el perfil de la ficha `<voz>.json`. Por petición: `forma` o `pausas` (ver docs/api.md) |
-| `VIBEVOICE_RUIDO_ARRANQUE` | vacía por defecto (apagado); `0` también lo apaga. Semilla del ruido de arranque (música inventada). Es `services.voz-stream.ruidoArranque`; por petición, `ruido_arranque` |
+| `VIBEVOICE_RUIDO_ARRANQUE` | `1` por defecto; vacía o `0` lo apaga. Semilla del ruido de arranque (música inventada). Es `services.voz-stream.ruidoArranque`; por petición, `ruido_arranque` |
 | `VIBEVOICE_RUIDO_ARRANQUE_FOTOGRAMAS` | `6` por defecto: cuántos fotogramas (133 ms cada uno) salen del ruido de arranque |
 | `VIBEVOICE_RECORTE_ENTRADA` | `0` devuelve el aire de antes de la primera palabra (0,27-0,40 s). También por petición, con `recorte_entrada` |
 
