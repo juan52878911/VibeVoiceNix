@@ -172,7 +172,8 @@ def tono(xb, xc):
 
 # ------------------------------------------------------------------ jueces pesados
 class Jueces:
-    def __init__(self, whisper):
+    def __init__(self, whisper, idioma="es"):
+        self.idioma = idioma
         import torch
         from faster_whisper import WhisperModel
         from speechbrain.inference.speaker import EncoderClassifier
@@ -189,7 +190,7 @@ class Jueces:
         print(f"jueces cargados en {time.time() - t:.0f} s (whisper {whisper})", flush=True)
 
     def transcribir(self, ruta):
-        segs, _ = self.whisper.transcribe(str(ruta), language="es", beam_size=5,
+        segs, _ = self.whisper.transcribe(str(ruta), language=self.idioma, beam_size=5,
                                           word_timestamps=True, vad_filter=False,
                                           condition_on_previous_text=False, temperature=0.0)
         texto, palabras = [], []
@@ -372,6 +373,8 @@ def main():
     ap.add_argument("--base", required=True)
     ap.add_argument("--contra", nargs="+", default=[])
     ap.add_argument("--whisper", default="large-v3")
+    ap.add_argument("--idioma", default="es",
+                    help="idioma del corpus para whisper (en para un doblaje al ingles)")
     ap.add_argument("--salida", default=None, help="carpeta del informe (por defecto, junto a --base)")
     ap.add_argument("--solo", action="store_true",
                     help="solo analiza --base y deja su cache (whisper, huella, UTMOS): para ir "
@@ -379,7 +382,7 @@ def main():
     a = ap.parse_args()
     salida = Path(a.salida or Path(a.base).parent / "informe")
     salida.mkdir(parents=True, exist_ok=True)
-    jueces = Jueces(a.whisper)
+    jueces = Jueces(a.whisper, a.idioma)
     if a.solo:
         datos, _, _ = analizar_variante(Path(a.base).name, a.base, jueces, salida)
         print(f"{Path(a.base).name}: {len(datos)} clips analizados en {salida}")
