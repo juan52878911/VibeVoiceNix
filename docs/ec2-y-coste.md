@@ -72,13 +72,20 @@ Graviton es un núcleo. Más hilos que núcleos empeora (M: 12 hilos +24 % en el
 
 | Instancia | Núcleos / RAM | OD $/h | Spot $/h | Nota |
 |---|---|---|---|---|
-| c7i.xlarge | 2 / 8 GiB | 0,179 | 0,068 | la decide la puerta P3 |
-| c7i.2xlarge | 4 / 16 GiB | 0,357 | 0,202 | **RTF 0,99 (M)** con el stack anterior |
-| c8g.xlarge (Graviton4) | 4 / 8 GiB | 0,160 | 0,081 | 4 núcleos al precio de 2 de Intel |
-| c7a.xlarge (Zen 4) | ¿4? / 8 GiB | 0,205 | 0,087 | comprobar con `lscpu` si vCPU = núcleo |
+| c7i.xlarge | 2 / 8 GiB | 0,179 | 0,070 | sin dato: 3 interrupciones de spot seguidas el 16-09 |
+| c7i.2xlarge | 4 / 16 GiB | 0,357 | 0,194 | **RTF 0,987 bf16 / 1,259 f32 (M, 16-09)** |
+| c8i.xlarge (Granite Rapids) | 2 / 8 GiB | 0,187 | 0,087 | RTF 1,230 bf16 (M) |
+| c7a.xlarge (Zen 4) | **4** / 8 GiB (1 hilo por núcleo, M) | 0,205 | 0,088 | RTF 0,766 bf16 (M) |
+| **c8a.xlarge (Zen 5)** | **4** / 8 GiB | 0,216 | 0,087 | **RTF 0,498 bf16 / 0,638 f32 (M)**: la óptima por $ |
+| c8a.2xlarge (Zen 5) | 8 / 16 GiB | 0,432 | 0,184 | RTF 0,404 bf16 (M, 7 hilos) |
+| c8g.xlarge (Graviton4) | 4 / 8 GiB | 0,160 | 0,081 | sin medir: necesita imagen arm64 |
 | g4dn / g6 (GPU) | — | 0,526 / 0,805 | — | **no**: los IR de OpenVINO no corren en NVIDIA; el camino de GPU es torch fp16 sin cuantizar, o sea otro audio. Con una locución a la vez, una T4 tendría que dar RTF < 0,25 para empatar. Cuota de la cuenta en 0 |
 
 Precios de us-east-1 del 15-09-2026, de terceros (Vantage); el spot cambia cada hora.
+Spot y RTF de la tabla: banco del 16-09-2026 en AWS Batch con la imagen de dobla (mediana spot 24 h;
+10 frases, 3 rondas, cuenta la 3ª). Informe completo y datos crudos en el repo `dobla`,
+`docs/benchmark-instancias-ec2.md`. El motor pica **2,2 GB** (VmHWM) en todas: 8 GiB sobran.
+Las tres AMD dan audio idéntico bit a bit entre sí en bf16; Intel da otro distinto por generación.
 
 **Si el trabajo es por lotes** (dobla: nadie espera mirando), el RTF deja de ser restricción de producto
 y pasa a ser solo coste. Entonces se elige por **$/cómputo en spot**, no por latencia, y la puerta P3 de
@@ -87,6 +94,12 @@ RTF ≤ 0,90 solo aplica al asistente en vivo.
 ---
 
 ## 4. La trampa número uno: bf16 silencioso
+
+> **Confirmado el 16-09-2026 (M):** OpenVINO 2025.4.1 da `INFERENCE_PRECISION_HINT = bfloat16` por
+> defecto y compila los 9 IR en bf16 tanto en c7i.2xlarge (AMX) como en c8a.xlarge (AVX512_BF16 sin
+> AMX). dobla en AWS ha corrido siempre en bf16. Forzando f32 (envolviendo `Core.compile_model`), el
+> RTF sube +28 % en las dos, y las mismas 10 frases cambian de duración (c7i 70,7 s bf16 → 59,7 s f32;
+> c8a 69,5 → 64,4 s). Falta el `banco_ab.py` que decida bf16 frente a f32.
 
 En Sapphire Rapids y en Zen 4/5, **el plugin de CPU de OpenVINO pasa a bf16 por su cuenta** cuando la
 máquina tiene AVX512_BF16 o AMX, salvo que se le ponga `INFERENCE_PRECISION_HINT=f32`. `motor.py` solo
