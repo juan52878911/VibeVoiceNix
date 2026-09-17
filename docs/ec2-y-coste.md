@@ -99,7 +99,15 @@ RTF ≤ 0,90 solo aplica al asistente en vivo.
 > defecto y compila los 9 IR en bf16 tanto en c7i.2xlarge (AMX) como en c8a.xlarge (AVX512_BF16 sin
 > AMX). dobla en AWS ha corrido siempre en bf16. Forzando f32 (envolviendo `Core.compile_model`), el
 > RTF sube +28 % en las dos, y las mismas 10 frases cambian de duración (c7i 70,7 s bf16 → 59,7 s f32;
-> c8a 69,5 → 64,4 s). Falta el `banco_ab.py` que decida bf16 frente a f32.
+> c8a 69,5 → 64,4 s).
+>
+> **Decidido el 17-09-2026 (M):** `banco_ab.py` en m8a.xlarge, 48 parejas (carlos, avril × 12 frases × 2
+> semillas), base f32, control int4 válido (UTMOS −0,020 [−0,032, −0,009]). **bf16 no pasa**: UTMOS
+> +0,013 [−0,033, +0,060] (IC inf < −0,02), WER +0,66 [−1,24, +2,68] pts (IC sup > +0,5), identidad
+> +0,014 [+0,002, +0,026], final del habla ±100 ms de IC. No se hunde, pero no demuestra equivalencia.
+> dobla corre en f32 desde entonces con `VIBEVOICE_OV_PRECISION=f32` (commit 478bd54 lo hace elegible;
+> sin la variable, lo que decida OpenVINO). f32 cuesta +24 % de RTF: 0,707 frente a 0,571 en ese banco.
+> Informe en el repo `dobla`, `docs/banco-precision-2026-09-17/`.
 
 En Sapphire Rapids y en Zen 4/5, **el plugin de CPU de OpenVINO pasa a bf16 por su cuenta** cuando la
 máquina tiene AVX512_BF16 o AMX, salvo que se le ponga `INFERENCE_PRECISION_HINT=f32`. `motor.py` solo
