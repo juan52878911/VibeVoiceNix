@@ -84,7 +84,7 @@ Graviton es un núcleo. Más hilos que núcleos empeora (M: 12 hilos +24 % en el
 Precios de us-east-1 del 15-09-2026, de terceros (Vantage); el spot cambia cada hora.
 Spot y RTF de la tabla: banco del 16-09-2026 en AWS Batch con la imagen de dobla (mediana spot 24 h;
 10 frases, 3 rondas, cuenta la 3ª). Informe completo y datos crudos en el repo `dobla`,
-`docs/benchmark-instancias-ec2.md`. El motor pica **2,2 GB** (VmHWM) en todas: 8 GiB sobran.
+`docs/benchmark-instancias-ec2.md`. El motor pica **2,2 GB** (VmHWM) en todas, pero el job completo de dobla muere por OOM en 8 GiB al clonar con el motor ya residente: dobla usa **m8a.xlarge** (misma CPU que la c8a, 16 GiB).
 Las tres AMD dan audio idéntico bit a bit entre sí en bf16; Intel da otro distinto por generación.
 
 **Si el trabajo es por lotes** (dobla: nadie espera mirando), el RTF deja de ser restricción de producto
