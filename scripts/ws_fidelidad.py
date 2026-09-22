@@ -96,10 +96,15 @@ def pedir(url, token, cuerpo=None, metodo=None, tiempo=600):
     return urllib.request.urlopen(pet, timeout=tiempo)
 
 
+DEFECTO = object()   # ruido de arranque sin mandar: el del servidor
+
+
 def http_stream(url, token, texto, voz, cfg, semilla, pasos, neg_cada=None,
-                pausas=None):
+                pausas=None, ruido=DEFECTO):
     """/tts/stream de una vez. Se le quitan los 44 bytes de cabecera WAV."""
     cuerpo = {"texto": texto, "voz": voz, "cfg_scale": cfg, "semilla": semilla}
+    if ruido is not DEFECTO:
+        cuerpo["ruido_arranque"] = ruido
     if pausas is not None:
         cuerpo["pausas"] = pausas
     if pasos is not None:
@@ -110,11 +115,13 @@ def http_stream(url, token, texto, voz, cfg, semilla, pasos, neg_cada=None,
 
 
 def http_sesion(url, token, nombre, frases, voz, cfg, semilla, pasos,
-                respiro=False, pausas=None):
+                respiro=False, pausas=None, ruido=DEFECTO):
     """Sesion HTTP: se meten todas las frases y se escucha el WAV continuo."""
     import threading
     base = {"voz": voz, "cfg_scale": cfg, "semilla": semilla,
             "respiro": respiro}
+    if ruido is not DEFECTO:
+        base["ruido_arranque"] = ruido
     if pausas is not None:
         base["pausas"] = pausas
     if pasos is not None:
@@ -882,11 +889,15 @@ def main():
         texto = ("Bueno, buenos dias a todos. Hoy vamos a hablar de la operacion del "
                  "banco, de los documentos y de los tiempos de respuesta. Primero, el "
                  "proceso actual. Despues, lo que cambia con la plataforma nueva.")
-        base = http_stream(a.url, a.token, texto, a.voz, a.cfg, a.semilla, a.pasos)
+        # Con el ruido de arranque apagado: con el defecto (1) este parrafo sale
+        # sin ninguna pausa en sp-Spk3_man y semilla 11 (MEDIDO 21-09: 0 pausas
+        # con 1, 3 apagado) y la prueba no probaria nada. Lo que se prueba aqui
+        # es el conformado, no el arranque.
+        base = http_stream(a.url, a.token, texto, a.voz, a.cfg, a.semilla, a.pasos, ruido=None)
         conf = http_stream(a.url, a.token, texto, a.voz, a.cfg, a.semilla, a.pasos,
-                           pausas=dist)
+                           pausas=dist, ruido=None)
         ses = http_sesion(a.url, a.token, f"forma-{a.semilla}", [texto], a.voz,
-                          a.cfg, a.semilla, a.pasos, pausas=dist)
+                          a.cfg, a.semilla, a.pasos, pausas=dist, ruido=None)
         a_float = lambda b: np.frombuffer(b, "<i2").astype(np.float32) / 32768
         ok, detalle = PZ.tramos_identicos(a_float(base), a_float(conf))
         n_pausas = len(PZ.rachas(a_float(base)))
