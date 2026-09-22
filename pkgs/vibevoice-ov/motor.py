@@ -87,6 +87,25 @@ def _referencia(obj):
         return lambda o=obj: o
 
 
+
+def config_cpu(hilos):
+    """Config de compilacion en CPU, con la PRECISION elegible por entorno.
+
+    VIBEVOICE_OV_PRECISION = f32 | bf16 | (vacio: lo que decida OpenVINO).
+    OpenVINO 2025.4.1 compila en bfloat16 POR SU CUENTA en CPUs con AMX o
+    AVX512_BF16 (MEDIDO 2026-09-16 en c7i.2xlarge y c8a.xlarge de AWS: los 9
+    IR salen en bf16), y en AVX2 -- la VM de casa -- en f32. bf16 cambia el
+    audio (las mismas 10 frases duran 70,7 s en bf16 y 59,7 s en f32 en la
+    c7i) y es ~28 % mas rapido. El defecto no cambia hasta que un banco de
+    calidad decida; con esta variable se puede fijar en cada despliegue."""
+    config = {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1, "PERFORMANCE_HINT": "LATENCY"}
+    precision = os.environ.get("VIBEVOICE_OV_PRECISION", "").strip().lower()
+    if precision:
+        if precision not in ("f32", "bf16"):
+            raise ValueError(f"VIBEVOICE_OV_PRECISION={precision!r}: usa f32 o bf16")
+        config["INFERENCE_PRECISION_HINT"] = precision
+    return config
+
 class SalidaLM:
     __slots__ = ("last_hidden_state", "past_key_values", "attentions")
 
@@ -158,9 +177,7 @@ class TtsLmOV(torch.nn.Module):
         import openvino as ov
         self._ov = ov
         core = ov.Core()
-        self.comp = core.compile_model(ruta_xml, "CPU",
-                                       {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1,
-                                        "PERFORMANCE_HINT": "LATENCY"})
+        self.comp = core.compile_model(ruta_xml, "CPU", config_cpu(hilos))
         self.n_capas = n_capas
         self.neg_cada = max(1, int(neg_cada))
         self.device = torch.device("cpu")
@@ -240,9 +257,7 @@ class CabezaOV(torch.nn.Module):
 
     def _compilar(self):
         import openvino as ov
-        self.comp = ov.Core().compile_model(self._ruta, "CPU",
-                                            {"INFERENCE_NUM_THREADS": self._hilos, "NUM_STREAMS": 1,
-                                             "PERFORMANCE_HINT": "LATENCY"})
+        self.comp = ov.Core().compile_model(self._ruta, "CPU", config_cpu(self._hilos))
         self.pet = self.comp.create_infer_request()
 
     def forward(self, noisy, timesteps, condition=None):
@@ -272,9 +287,7 @@ class DifusionOV:
         import re
         import openvino as ov
         core = ov.Core()
-        self.comp = core.compile_model(ruta_xml, "CPU",
-                                       {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1,
-                                        "PERFORMANCE_HINT": "LATENCY"})
+        self.comp = core.compile_model(ruta_xml, "CPU", config_cpu(hilos))
         self.pet = self.comp.create_infer_request()
         m = re.search(r"_p(\d+)_", ruta_xml)
         self.pasos = int(m.group(1)) if m else None
@@ -378,7 +391,7 @@ class AcusticoOV:
         # Lo que cuesta: copiar las colas que devuelve cada llamada (711 KB).
         self._explicito = not any(op.get_type_name() == "ReadValue" for op in modelo.get_ops())
         if dispositivo == "CPU":
-            config = {"INFERENCE_NUM_THREADS": hilos, "NUM_STREAMS": 1, "PERFORMANCE_HINT": "LATENCY"}
+            config = config_cpu(hilos)
         else:
             # EN GPU, f32 SIEMPRE. La iGPU calcula en f16 por defecto, y medido en la UHD 630 con este
             # mismo IR int8 eso deja el audio a 16 dB del de CPU; en f32 queda a 53-58 dB, o sea, el

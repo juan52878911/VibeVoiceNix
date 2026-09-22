@@ -148,6 +148,69 @@ CPU iba +51 % más lenta con la GPU al 100 %, y eso solo lo decide el banco.
 **Si no pasa:** la iGPU vuelve al host (`vfio-pci` → `i915`), la VM 210 se queda sin `hostpci0` y C1 se
 cierra.
 
+**Diario del montaje (15-09-2026).**
+- **13:25, despliegue** de `f855136` (driver `intel-compute-runtime-legacy1`): md5 de las 8 frases
+  idéntico y `ws_fidelidad` correcto.
+- **13:31, iGPU pasada en caliente** con `fase3_igpu_host.sh pasar`: `vfio-pci` y `hostpci0` en la VM 210.
+  pve respondió en todos los pasos y AuraCRM no se tocó. En la VM, `i915` inicializa la UHD 630 y
+  OpenVINO lista `GPU`.
+- **13:33, primera ejecución de `fase3_ab.sh`: `gpu-1` NO ARRANCÓ.** El proceso murió al compilar el
+  decodificador en GPU con `free(): invalid size` y `*** longjmp causes uninitialized stack frame ***`,
+  sin nada en el dmesg del guest.
+- **No se reproduce**, en procesos separados dentro de la VM:
+  - el decodificador en GPU con OpenVINO solo (47-50 ms), tras `import torch` y tras `import numba,
+    llvmlite`;
+  - LM en CPU y decodificador en GPU en el mismo proceso, con y sin `MALLOC_ARENA_MAX=2` y
+    `OMP_NUM_THREADS=6`;
+  - `motor.cargar` completo con `VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU`;
+  - y dos arranques del servidor real con la receta exacta de `gpu-1` (modelo listo en 10,4 y 10,5 s).
+- **13:40, segunda ejecución de `fase3_ab.sh`: `gpu-1` vuelve a morir en el mismo punto.** No era
+  intermitente.
+- **Causa CONFIRMADA (13:45):** `systemd-run` no pone `HOME`, y el runtime OpenCL de Intel (NEO/IGC) lo
+  necesita para su caché de kernels. El servidor de laboratorio arrancado a mano con `env -u HOME` muere
+  exactamente igual (`longjmp causes uninitialized stack frame`); con `HOME=/root` arranca siempre. Mis
+  pruebas buenas por ssh tenían `HOME`. Arreglo: `fase3_ab.sh` exporta `HOME=/root`.
+- **Condición añadida al despliegue, si la fase 3 pasara:** la unidad de voz-stream (`DynamicUser`)
+  tiene que llevar un `HOME` o una caché explícita para NEO, y hay que comprobar 10 arranques seguidos
+  con la GPU sin fallos.
+- **Resultado (13:45-13:54, tercera ejecución, con `HOME`): C1 NO PASA y se cierra.**
+
+  | puerta | exigido | medido | |
+  |---|---|---|---|
+  | duraciones | idénticas | **idénticas en los 24 clips** | ✅ |
+  | SNR del audio frente a la base | ≥ 25 dB | **mín. 64,9 dB**, mediana 66,6 dB | ✅ |
+  | `ws_fidelidad.py` | en verde | todo correcto | ✅ |
+  | RTF | GPU ≤ 0,93 × base | base 0,9838 · 0,9311 · 0,9107 · 0,9268 (mediana **0,9289**); GPU 0,8692 · 0,8687 · 0,8749 · 0,8756 (mediana **0,8720**): **0,9387×** | ❌ |
+
+  **Reparto por fotograma** (`/crono`, ronda 2):
+
+  | | LM TTS | cabeza | decodificador |
+  |---|---|---|---|
+  | base | ~47 ms | ~16 ms | ~37 ms (CPU) |
+  | GPU | **~72 ms** | ~18 ms | ~61 ms (GPU, solapado) |
+
+  El decodificador sale de la CPU, pero el LM y la cabeza se frenan por lo mismo que medía la 0.3
+  (+51 % con la GPU al 100 %). Queda una ganancia neta del 6,1 %, bajo el 7 % exigido. El banco
+  exhaustivo no se corre, porque la puerta 4 ya no pasa. El pico de memoria sí baja (VmHWM 1950 →
+  1600 MB), pero no era la puerta.
+- **Qué queda:** la iGPU vuelve al host (`fase3_igpu_host.sh devolver`) y la VM 210 queda sin
+  `hostpci0`.
+- **INCIDENTE AL DEVOLVERLA (13:55):** la iGPU volvió a `i915` y apareció `/dev/dri/renderD128`, pero
+  al volver a ligar en caliente la consola del framebuffer (`echo 1 > /sys/class/vtconsole/vtconN/bind`)
+  el kernel de pve (6.17.2-1-pve) dio un **`BUG: kernel NULL pointer dereference` en `fbcon_cursor`**,
+  tras varios `WARNING` en `fbcon_init`. Quedó `console_lock` tomado: una lectura posterior de
+  `/sys/class/vtconsole/vtcon0/bind` está en estado D y no se puede matar.
+  - **Lo que sigue funcionando:** AuraCRM (VM 200 y CT 203), la VM voz y el resto de invitados.
+  - **Riesgo:** el kernel está marcado y cualquier cosa que necesite la consola (una VT, algunos
+    cambios de modo, un reinicio o apagado limpio) puede colgarse.
+  - **Recomendación a Juan:** reiniciar pve en una ventana acordada (AuraCRM cae unos minutos). Si el
+    reinicio limpio se queda colgado, forzarlo desde el botón.
+  - **Arreglo del guion:** `devolver` ya no vuelve a ligar fbcon. `hardware.graphics` con `intel-compute-runtime-legacy1` sigue en `nix/configuration.nix`
+  sin efecto, hasta decidir si se quita.
+- **Ruido de host en esa primera tanda:** la base dio RTF 1,16-1,18 con el `kvm` de AuraCRM a ~236 %
+  en un pico. Las tandas alternas lo reparten entre base y GPU, pero la cifra absoluta no se compara con
+  la de otros días.
+
 ### Fase 4: C3, calidad del LM int8 frente a int4 (puerta fijada el 14-09-2026, antes de medir)
 
 `tts_lm_estado_int8.xml` nunca ha pasado por el banco exhaustivo. La pregunta es si el int4 de producción
@@ -189,6 +252,70 @@ puntos; identidad ±0,005 global y ±0,0023 por clon; tono medio y recorrido ±0
 ±20 ms; control int4 del decodificador incluido.
 
 ---
+
+## Fase 5: recursos para EC2 (puertas fijadas el 15-09-2026, antes de medir)
+
+El destino es una instancia EC2 que tiene que ser lo más pequeña y barata posible sin perder calidad.
+Las pruebas van en un **clon de la VM voz** (VM 104 `voz-clon` en `ascci`, restaurado del vzdump del NAS,
+IP 192.168.2.56), para no tocar la VM de producción de pve.
+
+**Aviso de validez:** el i3-3220 de `ascci` **no tiene AVX2**. En el clon valen las puertas **bit a bit**
+(md5, `ws_fidelidad`) y las de **espacio y memoria**; **el RTF medido allí no vale** y cualquier puerta de
+velocidad se repite en la máquina de destino.
+
+### 5.1 Disco
+
+| Palanca | Qué hace | Ahorro esperado |
+|---|---|---|
+| `fstrim` en la VM | devuelve al pool los bloques ya libres | (M) 22 GiB dentro; el disco baja del 53,1 % al 44,1 % de 40 GB |
+| quitar `hardware.graphics` | el runtime OpenCL sobra desde que C1 no pasó | (E) ~1,07 GB de closure (llvm 541 + mesa 265 + IGC 260 MB) |
+| `conservarVariantes = false` | el conversor borra los IR que voz-stream no usa | (E) 2,4 GB → ~630 MB en `/var/lib/voz/ov` |
+
+**Puerta (todas a la vez), medida en el clon:**
+1. **md5 idéntico** en las 8 frases de `banco_md5.py` con semilla 101, antes y después de los cambios,
+   en la misma máquina (entre máquinas distintas el md5 no tiene por qué coincidir: otra CPU, otros
+   kernels).
+2. **`ws_fidelidad.py` completo** en verde después.
+3. **`/health`** anuncia los mismos IR de producción (LM int4, cabeza int8, decodificador int8,
+   difusión p6 int8) y el servicio arranca sin avisos de IR ausentes.
+4. **Espacio:** se anota el closure del sistema, el tamaño de `/var/lib/voz/ov` y el disco de la VM en
+   el pool, antes y después.
+
+**Si falla la 1, la 2 o la 3**, se revierte el cambio que lo rompa y se documenta.
+
+#### Resultado (15-09-2026): **PASA**. Commit `97dfe9d`, desplegado en la VM voz.
+
+| Puerta | Exigido | Medido |
+|---|---|---|
+| md5 de las 8 frases | idéntico antes y después | **8/8 idénticos en las 4 rondas** (2 antes, 2 después); `banco_md5.py comparar` dice «MD5 IDENTICO EN TODO» |
+| `ws_fidelidad.py` | en verde | `codigo 0`, «todo correcto» (eventos, autenticación, forma, pausas, sesión == `/tts/stream`) |
+| `/health` | los 4 IR de producción | `tts_lm_estado_int4` · `cabeza_int8` · `decoder_mm_int8` · `difusion_p6_int8` |
+| Memoria | sin empeorar | VmHWM 2012 MB antes y después; VmSwap 0 |
+| RTF (informativo, no era puerta) | — | base 0,98/1,01 · después 1,03/0,97; el cambio no toca el bucle |
+
+| Espacio | Antes | Después | Ahorro |
+|---|---|---|---|
+| Closure del sistema | 8,09 GB | **7,02 GB** | −1,07 GB (exactamente lo estimado para `hardware.graphics`) |
+| `/var/lib/voz/ov` | 2 445 MB | **562 MB** | −1 883 MB |
+| Disco de la VM (`df /`) | 17 GB, 46 % | 16 GB, 42 % | el −1,07 GB del closure no baja hasta que el recolector se lleve la generación anterior (semanal); la generación vieja se queda a propósito, es la vuelta atrás |
+| Volumen fino en el pool | 44,05 % de 40 GB | **40,20 %** | `fstrim` devolvió 3,3 GiB; el pool baja del 74,64 % al 73,64 % |
+
+Las variantes borradas (fp16 e int4 de cada pieza) están en el NAS, `/tank/nfs/vibevoice/modelos/ov-2026-09-15`:
+volver a tenerlas es copiarlas, no reconvertir. Los marcadores `.hecho` siguen puestos, así que el conversor
+no repite nada. **Los bancos A/B que usan el control int4 del decodificador necesitan esas variantes**: hay
+que copiarlas de vuelta antes de puntuar, o puntuar en otra máquina.
+
+#### Incidencia: el clon de `ascci` NO puede ejecutar voz-stream
+
+Para no solaparse con la VM de producción se restauró el vzdump de la VM 210 como **VM 104 `voz-clon`** en
+`ascci` (IP cambiada a 192.168.2.56 montando el disco en frío, porque crear un puente aparte estaba
+denegado). Arranca, compila los cuatro IR y **se muere con `status=4/ILL`**: el i3-3220 de `ascci` es Ivy
+Bridge y **no tiene AVX2**, que es lo que exigen las ruedas de torch y los kernels de OpenVINO.
+
+Consecuencia, para no volver a intentarlo: **en el homelab no hay una segunda máquina donde medir voz**.
+Toda puerta que pase por generar audio va en la VM de producción (o en EC2). El clon sí sirve, y se usó para
+esto, como **máquina de construcción x86_64**: `nixos-rebuild build --flake ...#voz` allí compiló el sistema
+entero (incluido el `shellcheck` del guion de conversión) y midió el closure sin tocar producción.
 
 ## Resultados
 
@@ -415,3 +542,41 @@ atribuye al cambio.
 
 **0.2b LM de texto (M)**, 4 capas torch int8, ventana de 5 tokens: 8,5 / 8,1 / 9,2 ms con 50 / 200 / 500
 tokens de contexto.
+
+---
+
+## Balance del plan (15-09-2026): cerrado
+
+De los tres objetivos, dos se consiguieron y uno no dio nada. Se deja escrito para no volver a
+plantearlo desde cero.
+
+| Objetivo | Resultado |
+|---|---|
+| **RAM** | **PASA.** VmHWM 4387 → 2012 MB (−54 %), arranque 22-25 → 13 s, 0 de swap |
+| **Disco** | **PASA.** VM 19 → 16 GB · `/var/lib/voz/ov` 3,6 GB → 562 MB · closure 7,54 → 7,02 GB |
+| **RTF** | **NO PASA: cero.** Las cinco palancas (B1, B2, C1, C2, C3) se midieron contra puertas fijadas antes y ninguna llegó |
+
+Que la mitad del plan fuera RTF y no diera nada no es falta de trabajo: la máquina está en su límite de
+potencia (PL1 de 35 W, 438 de 608 s del banco a ≥ 34 W) y el bucle ya estaba bien optimizado. Cada
+callejón costó una medición completa, que es justo lo que permite cerrarlo y no volver.
+
+### Lo que queda del plan original, y por qué no se hace
+
+| Palanca | Qué daría | Por qué no |
+|---|---|---|
+| **B3, `CACHE_DIR`** | −13 s de arranque | cuesta +0,6 GB de disco: va en contra del objetivo, y el RTF no se mueve |
+| **C5, LM de texto en OpenVINO** | ≤ 2 ms por fotograma (~1,5 % de RTF) | cambia la numérica, así que exige el banco de 3 h. No compensa |
+| **C4, ventana deslizante del contexto** | algo en narraciones largas (el LM pasa de 13,7 a 18-21 ms entre 400 y 1400 tokens, M) | cambia **lo que el modelo se oye a sí mismo**: riesgo de calidad puro. El plan ya la dejó la última |
+
+### Lo que queda fuera del plan, y sí tiene recorrido
+
+| Palanca | Ahorro | Qué falta |
+|---|---|---|
+| **VM de 5120 a 4096 MB** | −1 GB en el host, que es lo sobresuscrito | estaba bloqueada por el pico de 4,6 GB del conversor de IR. **Se desbloquea** desde que los IR son un artefacto del NAS: la VM los copia en vez de convertirlos (ver [ec2-y-coste.md](ec2-y-coste.md) §6) |
+| **Recoger la basura del store** | el store son 11 GB y el closure vivo 7,02 → **~4 GB** (E) | cuesta la vuelta atrás del último despliegue: conviene esperar unos días |
+| **whisper `ggml-small-q8_0`** | −250 MB de RAM y −215 MB de disco | puerta de WER sobre los 8 audios del banco. **No vale exigir transcripciones idénticas** como en A5: el modelo es otro |
+| **Cachés del Mac** | ~17 GB: `~/.cache/vibevoice-nix` 4,8 · HuggingFace 5,2 · imágenes Docker sin usar 6 · caché de build 1,45 (M) | decisión de Juan. Ojo con la primera: se borra sola de vez en cuando y rehacerla cuesta `preparar_modelo.py` |
+| **Coste por carácter** | es el eje con recorrido de verdad | otro plan: [ec2-y-coste.md](ec2-y-coste.md) |
+
+**Nota:** `/var/lib/taller` y `/root/.cache/vibevoice-nix` **ya no existen en la VM**. Se fueron con la
+reconstrucción del 15-09, junto con las voces propias; no los borró ninguna poda.

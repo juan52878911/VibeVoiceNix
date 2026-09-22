@@ -27,14 +27,10 @@
     "sr_mod"
   ];
 
-  # Runtime OpenCL para la iGPU UHD 630 (Gen9) pasada desde el host (hostpci0 en la VM 210; plan de
-  # rendimiento, fase 3). Instalarlo no cambia nada por si solo: voz-stream solo usa la GPU con
-  # VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU. El intel-compute-runtime actual ya no soporta Gen9; el
-  # legacy1 si.
-  hardware.graphics = {
-    enable = true;
-    extraPackages = [ pkgs.intel-compute-runtime-legacy1 ];
-  };
+  # Sin hardware.graphics a proposito. El decodificador en la iGPU (plan de rendimiento, fase 3) no paso
+  # su puerta (-6,1 % de RTF, se pedian -7 %), y el runtime OpenCL arrastraba ~1,07 GB al sistema
+  # (llvm 541 MB + mesa 265 MB + intel-graphics-compiler 260 MB). VIBEVOICE_ACUSTICO_DISPOSITIVO=GPU
+  # sigue en motor.py para una maquina con GPU y su propio runtime.
 
   # ------------------------------------------------------------------
   # Identidad y red
@@ -134,6 +130,12 @@
     # Motor OpenVINO: RTF 1,09 frente a 2,19 de PyTorch. La primera activacion
     # genera los grafos (~15 min, pico de 4,6 GB de RAM); despues arranca solo.
     openvino.enable = true;
+
+    # Los conversores escriben fp16, int8 e int4 de cada pieza (2,4 GB) y esta
+    # maquina usa cuatro ficheros (~630 MB). Lo demas se borra al convertir: esta
+    # copiado en el NAS (/tank/nfs/vibevoice/modelos) y se regenera quitando el
+    # marcador .hecho del paso.
+    openvino.conservarVariantes = false;
 
     # 6 Y NO LA AUTODETECCION. Aqui la autodeteccion se equivoca, y no por un
     # fallo suyo: el hipervisor presenta las 12 vCPU con `core id` distinto y
