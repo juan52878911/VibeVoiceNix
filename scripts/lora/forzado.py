@@ -76,9 +76,9 @@ def latentes(modelo, x, dispositivo, muestrear=True):
         return ((z + m.speech_bias_factor) * m.speech_scaling_factor)[0, :n].float()
 
 
-def pasada(modelo, tok, ej, programa, frac_negativa=0.15, peso_fin=0.1):
-    """Una pasada forzada. ej: {'ref_lat': [N,64], 'ref_txt': str, 'lat': [T,64], 'txt': str}.
-    Devuelve (perdida total, desglose)."""
+def estados(modelo, tok, ej):
+    """Las dos ramas forzadas de un ejemplo: (lat [T,64], cond [T,896], cond_neg [T,896], h, idx), o None.
+    Son las mismas operaciones que validó la puerta 0; las usan pasada() y la destilacion de la guia."""
     m = modelo.model
     d = next(modelo.parameters()).device
     ref_ids = tok.encode(ej["ref_txt"], add_special_tokens=False)
@@ -86,7 +86,7 @@ def pasada(modelo, tok, ej, programa, frac_negativa=0.15, peso_fin=0.1):
     lat_ref, lat = ej["ref_lat"].to(d), ej["lat"].to(d)
     orden = disposicion(len(txt_ids), lat.shape[0])
     if orden is None:
-        return None, None
+        return None
     # 1. lm sobre [texto de referencia ; texto a decir], de corrido (causal, igual que su cache)
     ids = torch.tensor([ref_ids + txt_ids], device=d)
     h_lm = modelo.forward_lm(input_ids=ids, attention_mask=torch.ones_like(ids), return_dict=True).last_hidden_state[0]
@@ -118,6 +118,19 @@ def pasada(modelo, tok, ej, programa, frac_negativa=0.15, peso_fin=0.1):
     h_n = m.tts_language_model(inputs_embeds=emb_n, attention_mask=torch.ones(1, T + 1, device=d),
                                return_dict=True).last_hidden_state[0]
     cond_neg = h_n[:T]                                    # posicion anterior a cada latente
+    return lat, cond, cond_neg, h, idx
+
+
+def pasada(modelo, tok, ej, programa, frac_negativa=0.15, peso_fin=0.1):
+    """Una pasada forzada. ej: {'ref_lat': [N,64], 'ref_txt': str, 'lat': [T,64], 'txt': str}.
+    Devuelve (perdida total, desglose)."""
+    d = next(modelo.parameters()).device
+    m = modelo.model
+    r = estados(modelo, tok, ej)
+    if r is None:
+        return None, None
+    lat, cond, cond_neg, h, idx = r
+    T = lat.shape[0]
     # 4. difusion (positiva en todos los fotogramas, negativa en una fraccion)
     t = torch.randint(0, programa.n, (T,), device=d)
     eps = torch.randn_like(lat)

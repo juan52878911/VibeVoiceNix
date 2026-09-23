@@ -30,6 +30,32 @@ import lora as LR  # noqa: E402
 from validar_forzado import prefijo  # noqa: E402
 
 
+def instalar_freno(modelo, fi):
+    """sample_speech_tokens con el freno de guia de produccion (voz_stream.frenar_guia), operacion por
+    operacion; con fi=0 es la de upstream. Con una cabeza destilada se evalua con cfg 1: la guia es
+    la condicion positiva sola y el freno no hace nada (std(g) = std(vc))."""
+    import types
+
+    @torch.no_grad()
+    def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
+        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
+        condition = torch.cat([condition, neg_condition], dim=0).to(self.model.prediction_head.device)
+        speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
+        for t in self.model.noise_scheduler.timesteps:
+            half = speech[: len(speech) // 2]
+            combined = torch.cat([half, half], dim=0)
+            eps = self.model.prediction_head(combined, t.repeat(combined.shape[0]).to(combined), condition=condition)
+            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            if fi > 0:
+                half_eps = (fi * (half_eps * (cond_eps.std(dim=-1, keepdim=True) / (half_eps.std(dim=-1, keepdim=True) + 1e-8)))
+                            + (1.0 - fi) * half_eps)
+            eps = torch.cat([half_eps, half_eps], dim=0)
+            speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
+        return speech[: len(speech) // 2]
+    modelo.sample_speech_tokens = types.MethodType(sample_speech_tokens, modelo)
+
+
 def generar(modelo, proc, pref, texto, semilla, cfg=3.0):
     entradas = proc.process_input_with_cached_prompt(
         text=texto.strip() + "\n", cached_prompt=copy.deepcopy(pref),
@@ -57,6 +83,9 @@ def main():
     ap.add_argument("--semillas", default="11,101")
     ap.add_argument("--pasos", type=int, default=6, help="pasos de difusion (produccion: 6)")
     ap.add_argument("--idiomas", default=None)
+    ap.add_argument("--cabeza", default=None, help="state_dict de prediction_head (destilar_guia.py)")
+    ap.add_argument("--cfg", type=float, default=3.0)
+    ap.add_argument("--freno", type=float, default=0.0, help="freno de guia de produccion (0,75); 0 = upstream")
     ap.add_argument("--modelo", default=str(Path.home() / ".cache/vibevoice-nix/modelo"))
     ap.add_argument("--cache", default=str(Path.home() / ".cache/vibevoice-nix"))
     a = ap.parse_args()
@@ -71,6 +100,10 @@ def main():
         n, _ = LR.cargar(modelo, a.lora)
         LR.fundir(modelo)
         print(f"[eval] LoRA {a.lora}: {n} tensores fundidos", flush=True)
+    if a.cabeza:
+        modelo.model.prediction_head.load_state_dict(torch.load(a.cabeza, map_location="cpu"))
+        print(f"[eval] cabeza destilada {a.cabeza}, cfg {a.cfg}", flush=True)
+    instalar_freno(modelo, a.freno)
     modelo.eval()
     modelo.set_ddpm_inference_steps(num_steps=a.pasos)
     tok = proc.tokenizer
@@ -105,7 +138,7 @@ def main():
                 nombre = f"{ident}__{clave}__s{s}"
                 w = sal / "wav" / f"{nombre}.wav"
                 if not w.exists():
-                    x = generar(modelo, proc, pref, texto, s)
+                    x = generar(modelo, proc, pref, texto, s, a.cfg)
                     if x is None:
                         continue
                     sf.write(str(w), x, 24000, subtype="PCM_16")
