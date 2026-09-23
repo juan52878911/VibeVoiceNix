@@ -1054,6 +1054,7 @@ def reforzar_guia_arranque(modelo) -> None:
 
     def generate_reiniciado(*a, ruido_arranque=None, **kw):
         saltar_negativa(False)
+        _ARRANQUE["historia"] = []
         _ARRANQUE["frame"] = 0
         _ARRANQUE["activo"] = None
         _ARRANQUE["gen"] = (torch.Generator(device="cpu").manual_seed(int(ruido_arranque))
@@ -1069,15 +1070,26 @@ def reforzar_guia_arranque(modelo) -> None:
             # la pasada negativa que sigue a este fotograma alimenta al SIGUIENTE: se salta si ese ya
             # va por la guia destilada
             saltar_negativa(k + 1 >= guia_desde)
-            if k >= guia_desde:
-                return guia(condition, _ruido_difusion(condition.shape[0], modelo.config.acoustic_vae_dim))
+            hist = _ARRANQUE.setdefault("historia", [])
+            if k >= guia_desde and len(hist) >= max(1, guia.memoria):
+                h = None
+                if guia.memoria:
+                    # memoria acustica (guia2): los k ultimos latentes generados y la media de todos
+                    h = torch.cat([torch.stack(hist[-guia.memoria:]).reshape(1, -1),
+                                   torch.stack(hist).mean(0, keepdim=True)], 1)
+                sal = guia(condition, _ruido_difusion(condition.shape[0], modelo.config.acoustic_vae_dim), h)
+                hist.append(sal[0].detach())
+                return sal
         if rampa and k < CFG_ARRANQUE_FOTOGRAMAS and CFG_ARRANQUE > cfg_scale:
             # Rampa lineal: fotograma 0 con CFG_ARRANQUE, y de vuelta al
             # pedido al agotar la ventana. Sin escalon: el freno de guia ya
             # normaliza la energia, pero la prosodia agradece la suavidad.
             peso = (CFG_ARRANQUE_FOTOGRAMAS - k) / CFG_ARRANQUE_FOTOGRAMAS
             cfg_scale = cfg_scale + (CFG_ARRANQUE - cfg_scale) * peso
-        return muestrear(condition, neg_condition, cfg_scale)
+        sal = muestrear(condition, neg_condition, cfg_scale)
+        if _DIFUSION["guia"] is not None:
+            _ARRANQUE.setdefault("historia", []).append(sal[0].detach())
+        return sal
 
     modelo.generate = generate_reiniciado
     modelo.sample_speech_tokens = muestrear_reforzado
@@ -2548,6 +2560,8 @@ def foto_generacion() -> dict:
     gen = _ARRANQUE["gen"]
     return {"rng": torch.get_rng_state(),
             "arranque": _ARRANQUE["frame"],
+            # la memoria de la guia destilada (guia2) es de ESTA locucion
+            "historia": list(_ARRANQUE.get("historia", [])),
             "gen_arranque": gen.get_state() if gen is not None else None,
             "remate": dict(_REMATE)}
 
@@ -2558,6 +2572,7 @@ def reponer_generacion(foto: dict, pasos, neg_cada) -> None:
     _ajustar_pasos(pasos)
     _ajustar_neg_cada(neg_cada)
     _ARRANQUE["frame"] = foto["arranque"]
+    _ARRANQUE["historia"] = list(foto.get("historia", []))
     _ARRANQUE["activo"] = None
     if foto["gen_arranque"] is None:
         _ARRANQUE["gen"] = None

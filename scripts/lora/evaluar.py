@@ -30,15 +30,42 @@ import lora as LR  # noqa: E402
 from validar_forzado import prefijo  # noqa: E402
 
 
-def instalar_freno(modelo, fi):
+def instalar_freno(modelo, fi, alumno=None, desde=6):
     """sample_speech_tokens con el freno de guia de produccion (voz_stream.frenar_guia), operacion por
-    operacion; con fi=0 es la de upstream. Con una cabeza destilada se evalua con cfg 1: la guia es
-    la condicion positiva sola y el freno no hace nada (std(g) = std(vc))."""
+    operacion; con fi=0 es la de upstream. Con `alumno` (destilar_guia.py) hace lo que haria produccion:
+    el maestro (dos ramas, cfg y freno) en los `desde` primeros fotogramas de cada generate() -- la rampa
+    de arranque -- y a partir de ahi el alumno con la condicion positiva sola (y, si tiene memoria, los
+    latentes que ya genero)."""
     import types
+    estado = {"k": 0, "hist": []}
+    generar_orig = modelo.generate
+
+    def generate(*a, **kw):
+        estado["k"], estado["hist"] = 0, []
+        return generar_orig(*a, **kw)
+    modelo.generate = generate
+
+    def historia(dispositivo):
+        if not alumno.k:
+            return None
+        h = estado["hist"]
+        ult = torch.stack(h[-alumno.k:])                              # [k, 64]
+        return torch.cat([ult.reshape(1, -1), torch.stack(h).mean(0, keepdim=True)], 1).to(dispositivo)
 
     @torch.no_grad()
     def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
+        k = estado["k"]
+        estado["k"] = k + 1
         self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
+        if alumno is not None and k >= desde and len(estado["hist"]) >= max(1, alumno.k):
+            c = condition.to(self.model.prediction_head.device)
+            speech = torch.randn(c.shape[0], self.config.acoustic_vae_dim).to(c)
+            hi = historia(c.device)
+            for t in self.model.noise_scheduler.timesteps:
+                v = alumno(speech, t.repeat(speech.shape[0]).to(speech), c, hi)
+                speech = self.model.noise_scheduler.step(v, t, speech).prev_sample
+            estado["hist"].append(speech[0].detach())
+            return speech
         condition = torch.cat([condition, neg_condition], dim=0).to(self.model.prediction_head.device)
         speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
         for t in self.model.noise_scheduler.timesteps:
@@ -52,8 +79,25 @@ def instalar_freno(modelo, fi):
                             + (1.0 - fi) * half_eps)
             eps = torch.cat([half_eps, half_eps], dim=0)
             speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
-        return speech[: len(speech) // 2]
+        out = speech[: len(speech) // 2]
+        estado["hist"].append(out[0].detach())
+        return out
     modelo.sample_speech_tokens = types.MethodType(sample_speech_tokens, modelo)
+
+
+def cargar_alumno(modelo, ruta):
+    """El alumno de destilar_guia.py: cabeza sola (guia1) o cabeza con memoria (guia2)."""
+    from destilar_guia import AlumnoMemoria
+    e = torch.load(ruta, map_location="cpu")
+    cabeza = copy.deepcopy(modelo.model.prediction_head)
+    if isinstance(e, dict) and "memoria" in e:
+        al = AlumnoMemoria(cabeza, e["memoria"])
+        al.load_state_dict(e["estado"])
+    else:
+        cabeza.load_state_dict(e)
+        al = AlumnoMemoria(cabeza, 0)
+        al.proy = None
+    return al.to(next(modelo.parameters()).device).eval()
 
 
 def generar(modelo, proc, pref, texto, semilla, cfg=3.0):
@@ -86,6 +130,7 @@ def main():
     ap.add_argument("--cabeza", default=None, help="state_dict de prediction_head (destilar_guia.py)")
     ap.add_argument("--cfg", type=float, default=3.0)
     ap.add_argument("--freno", type=float, default=0.0, help="freno de guia de produccion (0,75); 0 = upstream")
+    ap.add_argument("--desde", type=int, default=6, help="fotogramas del maestro antes del alumno (la rampa)")
     ap.add_argument("--modelo", default=str(Path.home() / ".cache/vibevoice-nix/modelo"))
     ap.add_argument("--cache", default=str(Path.home() / ".cache/vibevoice-nix"))
     a = ap.parse_args()
@@ -100,10 +145,12 @@ def main():
         n, _ = LR.cargar(modelo, a.lora)
         LR.fundir(modelo)
         print(f"[eval] LoRA {a.lora}: {n} tensores fundidos", flush=True)
+    alumno = None
     if a.cabeza:
-        modelo.model.prediction_head.load_state_dict(torch.load(a.cabeza, map_location="cpu"))
-        print(f"[eval] cabeza destilada {a.cabeza}, cfg {a.cfg}", flush=True)
-    instalar_freno(modelo, a.freno)
+        alumno = cargar_alumno(modelo, a.cabeza)
+        print(f"[eval] alumno {a.cabeza} (memoria {alumno.k}) desde el fotograma {a.desde}; maestro cfg {a.cfg} antes",
+              flush=True)
+    instalar_freno(modelo, a.freno, alumno, a.desde)
     modelo.eval()
     modelo.set_ddpm_inference_steps(num_steps=a.pasos)
     tok = proc.tokenizer

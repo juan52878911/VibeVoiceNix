@@ -326,11 +326,16 @@ class DifusionGuiaOV:
         self.pet = self.comp.create_infer_request()
         m = re.search(r"_p(\d+)_", ruta_xml)
         self.pasos = int(m.group(1)) if m else None
+        # con memoria (guia2) el grafo tiene una tercera entrada: la historia [1, (k+1)*64]
+        self.memoria = (int(self.comp.inputs[2].get_partial_shape()[1].get_length()) // 64 - 1
+                        if len(self.comp.inputs) > 2 else 0)
 
-    def __call__(self, condition, speech):
+    def __call__(self, condition, speech, historia=None):
         ini = time.perf_counter()
-        res = self.pet.infer([condition.detach().float().numpy(), speech.detach().float().numpy()],
-                             share_inputs=True, share_outputs=True)
+        entradas = [condition.detach().float().numpy(), speech.detach().float().numpy()]
+        if self.memoria:
+            entradas.append(historia.detach().float().numpy())
+        res = self.pet.infer(entradas, share_inputs=True, share_outputs=True)
         salida = torch.from_numpy(np.array(res[self.comp.output(0)]))
         CRONO["cabeza"][0] += time.perf_counter() - ini
         CRONO["cabeza"][1] += 1

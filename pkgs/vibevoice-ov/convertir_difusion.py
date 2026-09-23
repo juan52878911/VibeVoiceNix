@@ -70,13 +70,17 @@ class BucleDifusion(torch.nn.Module):
 
 
 class BucleGuia(torch.nn.Module):
-    """El bucle con la cabeza destilada: una fila, sin guia ni freno."""
+    """El bucle con la cabeza destilada: una fila, sin guia ni freno. Con memoria (guia2) recibe ademas la
+    historia [1, (k+1)*64] (los k ultimos latentes generados y la media de todos) y la suma, proyectada, a
+    la condicion una vez por fotograma."""
 
-    def __init__(self, cabeza, cfg, pasos):
+    def __init__(self, cabeza, cfg, pasos, proy=None):
         super().__init__()
-        self.cabeza, self.cfg, self.pasos = cabeza, cfg, pasos
+        self.cabeza, self.cfg, self.pasos, self.proy = cabeza, cfg, pasos, proy
 
-    def forward(self, condition, speech):
+    def forward(self, condition, speech, historia=None):
+        if self.proy is not None:
+            condition = condition + self.proy(historia)
         sched = planificador(self.cfg)
         sched.set_timesteps(self.pasos)
         for t in sched.timesteps:
@@ -92,9 +96,18 @@ def main():
     cfg = json.load(open(f"{MODELO}/config.json"))["diffusion_head_config"]
     cabeza = convertir_cabeza.cargar_cabeza()
     if CABEZA_GUIA:
-        cabeza.load_state_dict(torch.load(CABEZA_GUIA, map_location="cpu"))
-        bucle = BucleGuia(cabeza, cfg, PASOS).eval()
-        ej = (torch.randn(1, 896), torch.randn(1, 64))
+        e = torch.load(CABEZA_GUIA, map_location="cpu")
+        if isinstance(e, dict) and "memoria" in e:
+            k = e["memoria"]
+            proy = torch.nn.Sequential(torch.nn.Linear((k + 1) * 64, 896), torch.nn.SiLU(), torch.nn.Linear(896, 896))
+            cabeza.load_state_dict({n[len("cabeza."):]: v for n, v in e["estado"].items() if n.startswith("cabeza.")})
+            proy.load_state_dict({n[len("proy."):]: v for n, v in e["estado"].items() if n.startswith("proy.")})
+            bucle = BucleGuia(cabeza, cfg, PASOS, proy).eval()
+            ej = (torch.randn(1, 896), torch.randn(1, 64), torch.randn(1, (k + 1) * 64))
+        else:
+            cabeza.load_state_dict(e)
+            bucle = BucleGuia(cabeza, cfg, PASOS).eval()
+            ej = (torch.randn(1, 896), torch.randn(1, 64))
         base = f"{SALIDA}/difusion_guia_p{PASOS}"
     else:
         bucle = BucleDifusion(cabeza, cfg, PASOS).eval()

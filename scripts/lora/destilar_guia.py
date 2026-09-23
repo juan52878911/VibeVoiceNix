@@ -36,6 +36,41 @@ sys.path.insert(0, str(AQUI))
 sys.path.insert(0, str(AQUI.parent))
 
 
+class AlumnoMemoria(torch.nn.Module):
+    """La cabeza destilada con MEMORIA ACUSTICA (guia2). La rama negativa del CFG solo ve el habla ya
+    generada (empieza en <|image_pad|>, sin texto ni prefijo de voz): es lo que la guia usa para sostener
+    la voz, y sin ella la identidad cayo -0,045 (guia1). Aqui el alumno recibe gratis un resumen de esa
+    historia: los k ultimos latentes que el mismo genero y la media de todos los anteriores, proyectados
+    sobre la condicion (la ultima capa empieza a cero: al empezar es la cabeza tal cual).
+    En produccion esos latentes ya estan: los devuelve la difusion fotograma a fotograma."""
+
+    def __init__(self, cabeza, k, dim_lat=64, dim_cond=896):
+        super().__init__()
+        self.cabeza, self.k = cabeza, k
+        self.proy = torch.nn.Sequential(torch.nn.Linear((k + 1) * dim_lat, dim_cond), torch.nn.SiLU(),
+                                        torch.nn.Linear(dim_cond, dim_cond))
+        torch.nn.init.zeros_(self.proy[2].weight)
+        torch.nn.init.zeros_(self.proy[2].bias)
+
+    def forward(self, x, t, condition, historia=None):
+        if historia is not None:
+            condition = condition + self.proy(historia)
+        return self.cabeza(x, t, condition=condition)
+
+
+def historias(lat, k):
+    """Por fotograma j >= k de UN ejemplo: [lat[j-k..j-1] aplanado, media(lat[:j])] -> [T-k, (k+1)*64]."""
+    T = lat.shape[0]
+    if T <= k:
+        return None
+    ventanas = lat.unfold(0, k, 1)[: T - k]                     # [T-k, 64, k]: ventana que acaba en j-1
+    ventanas = ventanas.permute(0, 2, 1).reshape(T - k, -1)
+    acum = torch.cumsum(lat, 0)
+    j = torch.arange(k, T, device=lat.device)
+    media = acum[j - 1] / j[:, None].float()
+    return torch.cat([ventanas, media], 1)
+
+
 def guiado(cabeza, x, t, c, cn, cfg, freno):
     """La salida guiada de produccion (voz_stream.frenar_guia): CFG y freno de energia."""
     v = cabeza(torch.cat([x, x]), torch.cat([t, t]), condition=torch.cat([c, cn]))
@@ -71,6 +106,10 @@ def main():
     ap.add_argument("--pasos-solver", type=int, default=6)
     ap.add_argument("--cada", type=int, default=250)
     ap.add_argument("--semilla", type=int, default=0)
+    ap.add_argument("--memoria", type=int, default=0,
+                    help="latentes previos que ve el alumno (guia2); 0 = solo la condicion (guia1)")
+    ap.add_argument("--desde", type=int, default=6,
+                    help="con memoria, solo fotogramas >= este (antes manda la rampa del maestro)")
     a = ap.parse_args()
     random.seed(a.semilla)
     torch.manual_seed(a.semilla)
@@ -82,7 +121,13 @@ def main():
     maestro = modelo.model.prediction_head.eval()
     for p in maestro.parameters():
         p.requires_grad_(False)
-    alumno = copy.deepcopy(maestro).train()
+    alumno = copy.deepcopy(maestro)
+    if a.memoria:
+        alumno = AlumnoMemoria(alumno, a.memoria).to(d)
+    else:
+        alumno = AlumnoMemoria(alumno, 0).to(d)
+        alumno.proy = None
+    alumno.train()
     for p in alumno.parameters():
         p.requires_grad_(True)
     programa = modelo.model.noise_scheduler
@@ -96,11 +141,24 @@ def main():
     val_h = set(hablantes[: max(2, len(hablantes) // 30)])
 
     def apilar(sel):
-        return (torch.cat([r["cond"] for r in sel]).to(d).float(), torch.cat([r["cond_neg"] for r in sel]).to(d).float(),
-                torch.cat([r["lat"] for r in sel]).to(d).float())
-    C, CN, L = apilar([r for r in filas if (r["idioma"], r["hablante"]) not in val_h])
-    VC, VCN, VL = apilar([r for r in filas if (r["idioma"], r["hablante"]) in val_h])
+        if not a.memoria:
+            return (torch.cat([r["cond"] for r in sel]).to(d).float(), torch.cat([r["cond_neg"] for r in sel]).to(d).float(),
+                    torch.cat([r["lat"] for r in sel]).to(d).float(), None)
+        c, cn, l, h = [], [], [], []
+        k0 = max(a.desde, a.memoria)
+        for r in sel:
+            lat = r["lat"].float()
+            hi = historias(lat, a.memoria)
+            if hi is None or lat.shape[0] <= k0:
+                continue
+            desde = k0 - a.memoria                               # fila de hi del fotograma k0
+            c.append(r["cond"][k0:].float()); cn.append(r["cond_neg"][k0:].float())
+            l.append(lat[k0:]); h.append(hi[desde:])
+        return (torch.cat(c).to(d), torch.cat(cn).to(d), torch.cat(l).to(d), torch.cat(h).to(d))
+    C, CN, L, HI = apilar([r for r in filas if (r["idioma"], r["hablante"]) not in val_h])
+    VC, VCN, VL, VHI = apilar([r for r in filas if (r["idioma"], r["hablante"]) in val_h])
     VC, VCN = VC[:2048], VCN[:2048]
+    VHI = VHI[:2048] if VHI is not None else None
     print(f"[guia] alumno {n_param / 1e6:.1f} M parametros; {C.shape[0]} fotogramas de entrenamiento, "
           f"{VC.shape[0]} de validacion ({len(val_h)} lectores apartados)", flush=True)
     (sal / "config.json").write_text(json.dumps({**vars(a), "parametros_M": round(n_param / 1e6, 2),
@@ -123,7 +181,7 @@ def main():
         alumno.eval()
         with torch.no_grad():
             _, fin_m = trayectoria(programa, a.pasos_solver, x0_val, lambda x, t: maestro_v(x, t, VC, VCN))
-            _, fin_a = trayectoria(programa, a.pasos_solver, x0_val, lambda x, t: alumno(x, t, condition=VC))
+            _, fin_a = trayectoria(programa, a.pasos_solver, x0_val, lambda x, t: alumno(x, t, VC, VHI))
             _, fin_1 = trayectoria(programa, a.pasos_solver, x0_val, lambda x, t: maestro(x, t, condition=VC))
         alumno.train()
         den = (fin_m ** 2).sum()
@@ -142,23 +200,27 @@ def main():
     for paso in range(1, a.pasos + 1):
         i = torch.randint(0, C.shape[0], (a.lote,), device=d)
         c, cn, x0 = C[i], CN[i], L[i]
+        hi = HI[i] if HI is not None else None
         xs, ts, cs, cns = [], [], [], []
         # 1. trayectoria del maestro desde ruido
         with torch.no_grad():
             vis, _ = trayectoria(programa, a.pasos_solver, torch.randn_like(x0), lambda x, t: maestro_v(x, t, c, cn))
             # 2. trayectoria del alumno (lo que visitara al generar)
             alumno.eval()
-            vis_a, _ = trayectoria(programa, a.pasos_solver, torch.randn_like(x0), lambda x, t: alumno(x, t, condition=c))
+            vis_a, _ = trayectoria(programa, a.pasos_solver, torch.randn_like(x0), lambda x, t: alumno(x, t, c, hi))
             alumno.train()
+        his = []
         for x, t in vis + vis_a:
-            xs.append(x); ts.append(t); cs.append(c); cns.append(cn)
+            xs.append(x); ts.append(t); cs.append(c); cns.append(cn); his.append(hi)
         # 3. latentes reales con ruido en un paso del solver
         k = t_solver[torch.randint(0, len(t_solver), (a.lote,), device=d)]
         ab = alfa_bar[k.long()][:, None]
         xs.append(ab.sqrt() * x0 + (1 - ab).sqrt() * torch.randn_like(x0)); ts.append(k.float()); cs.append(c); cns.append(cn)
+        his.append(hi)
         X, T, CC, CCN = torch.cat(xs), torch.cat(ts), torch.cat(cs), torch.cat(cns)
+        HH = torch.cat(his) if hi is not None else None
         objetivo = maestro_v(X, T, CC, CCN)
-        perdida = torch.nn.functional.mse_loss(alumno(X, T, condition=CC), objetivo)
+        perdida = torch.nn.functional.mse_loss(alumno(X, T, CC, HH), objetivo)
         opt.zero_grad(set_to_none=True)
         perdida.backward()
         torch.nn.utils.clip_grad_norm_(alumno.parameters(), 1.0)
@@ -174,10 +236,11 @@ def main():
             print(f"[guia] validacion paso {paso}: {v}", flush=True)
             registro.write(json.dumps({"paso": paso, "val": v}) + "\n")
             registro.flush()
-            torch.save(alumno.state_dict(), sal / f"cabeza_{paso}.pt")
+            estado = alumno.cabeza.state_dict() if not a.memoria else {"memoria": a.memoria, "estado": alumno.state_dict()}
+            torch.save(estado, sal / f"cabeza_{paso}.pt")
             if v["err_alumno"] < mejor:
                 mejor = v["err_alumno"]
-                torch.save(alumno.state_dict(), sal / "cabeza_mejor.pt")
+                torch.save(estado, sal / "cabeza_mejor.pt")
     print(f"[guia] fin: {a.pasos} pasos en {(time.time() - t0) / 60:.1f} min; mejor error {mejor} "
           f"(sin guia {v0['err_sin_guia']})", flush=True)
 
