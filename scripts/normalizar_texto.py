@@ -72,7 +72,9 @@ def _hora(h, m, idioma, sufijo=""):
     return s
 
 
-def normalizar(texto, idioma="es"):
+def normalizar(texto, idioma="es", siglas=True):
+    """siglas=False no deletrea siglas ni codigos: en espanol la mejora fue pequena y un clip empeoro
+    (F2b del plan de mejora), y voz_stream.py lo usa asi para el espanol."""
     idioma = "es" if idioma.startswith("es") else "en"
     t = texto
     # horas: 23:45, 3:30 PM, 3.30 (lo que escribe whisper)
@@ -85,15 +87,55 @@ def normalizar(texto, idioma="es"):
     # ordinales en ingles (8th, 15th, 1st, 22nd, 3rd)
     if idioma == "en":
         t = re.sub(r"\b(\d+)(st|nd|rd|th)\b", lambda m: num2words(int(m.group(1)), lang="en", to="ordinal"), t)
-    # codigos alfanumericos (IB6843, UA-208M): se deletrean
-    t = re.sub(r"\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9-]{3,}\b",
-               lambda m: _deletrear(m.group(0).replace("-", ""), idioma), t)
-    # siglas en mayusculas (AWS, API): se deletrean, salvo las que se dicen como palabra
-    t = re.sub(r"\b[A-ZÑ]{2,5}\b", lambda m: m.group(0) if m.group(0) in COMO_PALABRA
-               else _deletrear(m.group(0), idioma), t)
+    if siglas:
+        # codigos alfanumericos (IB6843, UA-208M): se deletrean
+        t = re.sub(r"\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9-]{3,}\b",
+                   lambda m: _deletrear(m.group(0).replace("-", ""), idioma), t)
+        # siglas en mayusculas (AWS, API): se deletrean, salvo las que se dicen como palabra
+        t = re.sub(r"\b[A-ZÑ]{2,5}\b", lambda m: m.group(0) if m.group(0) in COMO_PALABRA
+                   else _deletrear(m.group(0), idioma), t)
     # numeros que queden
     t = re.sub(r"\d[\d.,]*\d|\d", lambda m: _numero(m.group(0).rstrip(".,"), idioma), t)
     return re.sub(r"\s+", " ", t).strip()
+
+
+_FUNCIONALES = {
+    "es": {"el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "por", "con", "para", "es", "del",
+           "se", "no", "su", "al", "lo", "como", "pero", "sus", "le", "ya", "muy", "hay", "esta", "este"},
+    "en": {"the", "of", "and", "to", "a", "in", "is", "it", "that", "for", "you", "with", "on", "this",
+           "are", "be", "at", "have", "was", "not", "but", "they", "from", "we", "an", "or", "will", "my"},
+}
+
+
+def idioma_probable(texto):
+    """'es' | 'en' | None por palabras funcionales exclusivas; None si no esta claro (hace falta el doble
+    de un idioma que del otro y al menos 2 palabras)."""
+    pal = re.findall(r"[a-záéíóúñü]+", texto.lower())
+    es = sum(p in _FUNCIONALES["es"] and p not in _FUNCIONALES["en"] for p in pal)
+    en = sum(p in _FUNCIONALES["en"] and p not in _FUNCIONALES["es"] for p in pal)
+    if es >= 2 and es >= 2 * en:
+        return "es"
+    if en >= 2 and en >= 2 * es:
+        return "en"
+    return None
+
+
+_HAY_ALGO = re.compile(r"\d|[$€%]|\b[A-ZÑ]{2,5}\b")
+
+
+def normalizar_para_motor(texto, modo="auto"):
+    """Lo que usa voz_stream.py: linea a linea (los saltos de linea y los parrafos se conservan: las
+    sesiones y la forma los usan) y SOLO en las lineas con cifras, simbolos o siglas; el resto sale
+    identico, byte a byte. modo: 'no', 'es', 'en' o 'auto' (idioma por palabras funcionales; si no
+    esta claro, no se toca). En espanol, sin deletrear siglas."""
+    if modo == "no" or not _HAY_ALGO.search(texto):
+        return texto
+    idioma = idioma_probable(texto) if modo == "auto" else modo
+    if idioma not in ("es", "en"):
+        return texto
+    lineas = texto.split("\n")
+    return "\n".join(normalizar(l, idioma, siglas=(idioma == "en")) if _HAY_ALGO.search(l) else l
+                      for l in lineas)
 
 
 if __name__ == "__main__":
