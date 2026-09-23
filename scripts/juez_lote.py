@@ -62,6 +62,13 @@ def a16(x, hz):
     return librosa.resample(x.astype(np.float32), orig_sr=hz, target_sr=16000)
 
 
+def _wav_temporal(x16):
+    import tempfile
+    f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    sf.write(f.name, x16, 16000)
+    return f.name
+
+
 class Jueces:
     def __init__(self, dispositivo="cpu", hilos=2, sonidos=False):
         import torch
@@ -82,6 +89,8 @@ class Jueces:
             self.sonidos = JS.Juez(dispositivo)
 
     def huella(self, x16):
+        # tope de 30 s: un clip desbocado (el modelo no para) de varios minutos agotaba la memoria de la T4
+        x16 = x16[:16000 * 30]
         with self.torch.inference_mode():
             e = self.ecapa.encode_batch(self.torch.from_numpy(np.ascontiguousarray(x16))[None].to(self.disp))
         e = e.squeeze().cpu().numpy()
@@ -91,6 +100,12 @@ class Jueces:
         x, hz = sf.read(str(c["audio"]), dtype="float32")
         x16 = a16(x, hz)
         m = {"dur": round(len(x16) / 16000, 3)}
+        if len(x16) > 16000 * 60:
+            # desbocado: el modelo no paro (23-09, la base en un clip frances: 340 s). Se mide el primer minuto
+            # (el WER contra el texto sigue siendo alto: es un fallo real) y no se agota la memoria de la GPU
+            m["desbocado"] = True
+            x16, x, hz = x16[:16000 * 60], x[:hz * 60], hz
+            c = {**c, "audio": None, "_x16": x16}
         if c.get("identidad") in centros and len(x16) > 12800:
             m["ecapa"] = round(float(self.huella(x16) @ centros[c["identidad"]]), 4)
         if c.get("texto"):
@@ -101,7 +116,7 @@ class Jueces:
             if normalizar:
                 idioma = c.get("idioma", "es")
                 m["wer_norm"] = round(wer(normalizar(c["texto"], idioma), normalizar(m["oido"], idioma)), 4)
-            oidos = self.fonemas.fonemas(c["audio"])
+            oidos = self.fonemas.fonemas(c["audio"] if c["audio"] else _wav_temporal(x16))
             m["per"], m["variedad"], _ = JA.per_idioma(c["texto"], c.get("idioma", "es"), oidos)
             m["per"] = round(m["per"], 4)
         with self.torch.inference_mode():
