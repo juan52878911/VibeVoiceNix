@@ -15,6 +15,20 @@ Restricciones que manda el proyecto y que este plan respeta:
 
 ---
 
+## Estado (2026-09-23, fases 0-6 sin intervención humana)
+
+| Fase | Resultado | Informe |
+|---|---|---|
+| F0 jueces | Juez de pronunciación (PER, solo comparable dentro de la misma voz) y de sonidos (AST); corpus congelado | [f0](bancos/2026-09-22-f0-jueces.md) |
+| F1 referencia y segundos | **Repetir un clip de 5 s pasa** en los dos hablantes; codo ≤ 12 s; la referencia por estilo no generaliza y el ritmo no se transfiere; el autoarranque no aporta | [f1](bancos/2026-09-23-f1-referencias.md) |
+| F2 texto | **El normalizador baja el WER real 4 puntos** (inglés 13 % → 6 %); **reintentar los clips malos: −27 % de WER con +21 % de síntesis**; el juez viejo inflaba el WER de los números | [f2 y f5](bancos/2026-09-23-f2-f5-texto-y-no-verbales.md) |
+| F3 acento por prefijo | No pasa: mezcla las voces | [f3](bancos/2026-09-23-f3-acento-prefijo.md) |
+| F4 acento por conversión | **Pasa en parte**: con minutos de audio real, identidad al 96-109 % del clon, acento mucho más nativo y más natural; con una nota de voz corta no. Solo para cambio de idioma (F4c) | [f4](bancos/2026-09-23-f4-conversion-acento.md) |
+| F5 no verbales por texto | No pasa: el modelo lee las marcas | [f2 y f5](bancos/2026-09-23-f2-f5-texto-y-no-verbales.md) |
+| F6 ambientes procedurales | No pasa como realismo; siguiente paso con decisión humana (CC0) | [f6](bancos/2026-09-23-f6-ambientes.md) |
+
+Gasto en GPU: 0,95 USD (1,7 h de g4dn.xlarge) de un tope de 20.
+
 ## 1. Diagnóstico: dónde está hoy el límite de cada eje
 
 ### 1.1 WER (inteligibilidad)

@@ -53,5 +53,7 @@ Las comparaciones son **pareadas**: mismo segmento y misma semilla. Tabla comple
    la hipótesis de la personalidad por referencia queda descartada.
 4. **Nunca una referencia leída o sin pausas:** la naturalidad cae 0,2-0,36 en los dos.
 
-Pendiente de esta fase: el **autoarranque** (el clon de 5 s genera más habla suya y se vuelve a
-clonar con ella), en síntesis.
+5. **El autoarranque no aporta** (5 s reales + ~35 s de habla generada por el propio clon de 5 s, vuelto a
+   clonar). Pareado: Carlos +0,046 [+0,009, +0,085] sobre los 5 s, igual que repetirlos (−0,008,
+   sin efecto); Liliana **−0,045** [−0,062, −0,028] sobre los 5 s y −0,065 frente a repetirlos.
+   Repetir el clip es más simple y gana en los dos: el autoarranque se cierra.

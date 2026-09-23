@@ -47,3 +47,19 @@ tercios), pero no lo iguala. Con una nota de voz corta y comprimida, la identida
 
 Muestra pequeña: 4 frases base por condición (8 con las de números). Antes de llevarlo a dobla hay
 que repetirlo con más frases y más hablantes, y medir el RTF en la VM.
+
+## F4c · ¿Y como vía general de calidad, en el mismo idioma? — no
+
+La F3 mostró que el modelo suena mejor con audio de estudio en el prefijo. Se probó generar en español con
+una voz de serie limpia (sp-Spk3 para Carlos, sp-Spk0 para Liliana) y convertir al timbre de la persona,
+con los mismos 12 segmentos y semillas que su clon directo de la F1 (pareado):
+
+| | Identidad | WER | UTMOS |
+|---|---|---|---|
+| Carlos, convertido − clon directo | **+0,036** [+0,008, +0,062] | −0,009 (sin efecto) | **−0,235** [−0,362, −0,101] |
+| Liliana, convertido − clon directo | +0,004 (sin efecto) | −0,016 (sin efecto) | **−0,097** [−0,174, −0,023] |
+
+En su propio idioma el clon directo ya es natural, y la conversión le añade artefactos del vocoder. La
+subida de naturalidad del inglés venía de que el clon habla inglés peor que una voz nativa. **La
+conversión se queda solo para el cambio de idioma.**
+
