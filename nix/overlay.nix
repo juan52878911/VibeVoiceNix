@@ -110,8 +110,10 @@ in
         extra.openvino = p: [ p.ocl-icd ];
       })
       # VibeVoice se instala desde git y su pyproject usa setuptools.build_meta,
-      # pero uv2nix construye sin aislamiento y no se lo encuentra.
-      (sistemasDeConstruccion { vibevoice = { setuptools = [ ]; }; })
+      # pero uv2nix construye sin aislamiento y no se lo encuentra. docopt (lo
+      # pide num2words, el normalizador de texto) solo publica sdist y tampoco
+      # declara setuptools.
+      (sistemasDeConstruccion { vibevoice = { setuptools = [ ]; }; docopt = { setuptools = [ ]; }; })
       arreglarSoundfile
     ];
   };
