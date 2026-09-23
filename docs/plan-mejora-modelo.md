@@ -26,8 +26,15 @@ Restricciones que manda el proyecto y que este plan respeta:
 | F4 acento por conversión | **Pasa en parte**: con minutos de audio real, identidad al 96-109 % del clon, acento mucho más nativo y más natural; con una nota de voz corta no. Solo para cambio de idioma (F4c) | [f4](bancos/2026-09-23-f4-conversion-acento.md) |
 | F5 no verbales por texto | No pasa: el modelo lee las marcas | [f2 y f5](bancos/2026-09-23-f2-f5-texto-y-no-verbales.md) |
 | F6 ambientes procedurales | No pasa como realismo; siguiente paso con decisión humana (CC0) | [f6](bancos/2026-09-23-f6-ambientes.md) |
+| F7 LoRA multilingüe | **No pasa, cerrada tras 3 corridas**: bucle validado (puertas 0 y 1), pero generando el WER no baja (base 4,4 %) y la identidad cae −0,008 a −0,012. Efecto consistente: las voces españolas en inglés suenan más nativas (UTMOS +0,2-0,5, PER −0,02-0,05) a costa de identidad; F4 lo hace mejor | [f7](bancos/2026-09-23-f7-lora.md) |
 
-Gasto en GPU: 0,95 USD (1,7 h de g4dn.xlarge) de un tope de 20.
+Gasto en GPU: 3,69 USD de un tope de 20 (F7: 5,1 h de g4dn.xlarge, 2,74 USD).
+
+Probado en dobla (rama `mejoras-modelo`): normalizador, repetir la referencia corta, reintento por QC
+y acento nativo por conversión, sin regresión en el caso de 4 voces (WER 0,316 → 0,306). La demo de
+una charla de 91 s a 5 idiomas con acento nativo costó ~0,11 USD en Batch spot (0,014 USD por minuto
+de vídeo e idioma); de paso aparecieron y se corrigieron dos fallos de dobla para fr/de/it/pt
+(la limpieza borraba ã ç è ß; la huella de reanudación no incluía el acento).
 
 ## 1. Diagnóstico: dónde está hoy el límite de cada eje
 
