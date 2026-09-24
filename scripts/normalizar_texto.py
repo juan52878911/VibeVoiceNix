@@ -99,24 +99,35 @@ def normalizar(texto, idioma="es", siglas=True):
     return re.sub(r"\s+", " ", t).strip()
 
 
+# Palabras funcionales EXCLUSIVAS de cada idioma: las compartidas ("de", "la", "que", "en", "in", "was",
+# "will"...) no cuentan. Con las compartidas, un texto frances salia "espanol" y uno aleman "ingles", y el
+# normalizador escribia cifras en otro idioma (medido el 23-09 con la charla doblada al frances).
 _FUNCIONALES = {
-    "es": {"el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "por", "con", "para", "es", "del",
-           "se", "no", "su", "al", "lo", "como", "pero", "sus", "le", "ya", "muy", "hay", "esta", "este"},
-    "en": {"the", "of", "and", "to", "a", "in", "is", "it", "that", "for", "you", "with", "on", "this",
-           "are", "be", "at", "have", "was", "not", "but", "they", "from", "we", "an", "or", "will", "my"},
+    "es": {"el", "los", "del", "pero", "muy", "hay", "usted", "eso", "esto", "porque", "cuando", "donde",
+           "entonces", "ahora", "nosotros", "ellos", "tiene", "puede", "tambien", "también", "algo", "mucho"},
+    "en": {"the", "and", "of", "that", "you", "with", "this", "they", "have", "from", "are", "is", "it",
+           "for", "not", "but", "we", "my", "be", "been", "would", "there", "their", "what", "which"},
+    "fr": {"le", "les", "des", "est", "et", "pour", "pas", "avec", "vous", "nous", "je", "qui", "dans",
+           "sur", "ce", "cette", "sont", "mais", "très", "au", "aux", "du", "ils", "elle"},
+    "de": {"der", "die", "das", "und", "ist", "nicht", "ich", "sie", "mit", "auf", "ein", "eine", "den",
+           "dem", "zu", "auch", "wir", "sind", "oder", "wie", "wenn"},
+    "it": {"il", "gli", "della", "che", "non", "sono", "questo", "anche", "molto", "perché", "ma", "ci",
+           "nel", "degli", "delle", "loro", "essere", "cosa"},
+    "pt": {"os", "não", "você", "isso", "então", "são", "está", "ao", "pelo", "pela", "uma", "com",
+           "muito", "também", "nós", "eles", "tem", "mais", "mas"},
 }
 
 
 def idioma_probable(texto):
-    """'es' | 'en' | None por palabras funcionales exclusivas; None si no esta claro (hace falta el doble
-    de un idioma que del otro y al menos 2 palabras)."""
-    pal = re.findall(r"[a-záéíóúñü]+", texto.lower())
-    es = sum(p in _FUNCIONALES["es"] and p not in _FUNCIONALES["en"] for p in pal)
-    en = sum(p in _FUNCIONALES["en"] and p not in _FUNCIONALES["es"] for p in pal)
-    if es >= 2 and es >= 2 * en:
-        return "es"
-    if en >= 2 and en >= 2 * es:
-        return "en"
+    """'es' | 'en' | None. Cuenta palabras funcionales exclusivas de es, en, fr, de, it y pt; decide solo si
+    gana es o en con al menos 2 palabras y el doble que cualquier otro idioma. Si no esta claro, None (y
+    el normalizador no toca nada)."""
+    pal = re.findall(r"[a-záéíóúñüàâçèêëîïôûœäößãõ]+", texto.lower())
+    cuenta = {k: sum(p in v for p in pal) for k, v in _FUNCIONALES.items()}
+    ganador = max(cuenta, key=cuenta.get)
+    resto = max(v for k, v in cuenta.items() if k != ganador)
+    if ganador in ("es", "en") and cuenta[ganador] >= 2 and cuenta[ganador] >= 2 * resto:
+        return ganador
     return None
 
 
