@@ -85,6 +85,29 @@ def instalar_freno(modelo, fi, alumno=None, desde=6):
     modelo.sample_speech_tokens = types.MethodType(sample_speech_tokens, modelo)
 
 
+@torch.no_grad()
+def cuantizar_como_produccion(modelo):
+    """Simula en torch lo que produccion hace con los pesos: el backbone TTS en OpenVINO INT4_SYM con grupos de
+    128 (convertir_lm_estado.py, nncf ratio 1,0) y el LM de texto en int8 (voz_stream: quantize_dynamic, aqui
+    por canal). Sirve para saber si una mejora (un LoRA fundido) sobrevive a la cuantizacion de produccion."""
+    def fq(w, bits, grupo):
+        q = 2 ** (bits - 1) - 1
+        if grupo:
+            o, i = w.shape
+            g = w.reshape(o, i // grupo, grupo)
+            s = g.abs().amax(-1, keepdim=True).clamp(min=1e-8) / q
+            return (torch.clamp(torch.round(g / s), -q - 1, q) * s).reshape(o, i)
+        s = w.abs().amax(-1, keepdim=True).clamp(min=1e-8) / q
+        return torch.clamp(torch.round(w / s), -q - 1, q) * s
+    n = 0
+    for rama, bits, grupo in (("tts_language_model", 4, 128), ("language_model", 8, None)):
+        for mod in getattr(modelo.model, rama).modules():
+            if isinstance(mod, torch.nn.Linear) and (not grupo or mod.in_features % grupo == 0):
+                mod.weight.copy_(fq(mod.weight.float(), bits, grupo).to(mod.weight.dtype))
+                n += 1
+    print(f"[eval] cuantizado como produccion: {n} capas (tts_lm int4 g128, lm int8)", flush=True)
+
+
 def cargar_alumno(modelo, ruta):
     """El alumno de destilar_guia.py: cabeza sola (guia1) o cabeza con memoria (guia2)."""
     from destilar_guia import AlumnoMemoria
@@ -131,6 +154,7 @@ def main():
     ap.add_argument("--cfg", type=float, default=3.0)
     ap.add_argument("--freno", type=float, default=0.0, help="freno de guia de produccion (0,75); 0 = upstream")
     ap.add_argument("--desde", type=int, default=6, help="fotogramas del maestro antes del alumno (la rampa)")
+    ap.add_argument("--cuantizar", action="store_true", help="simular la cuantizacion de produccion tras fundir el LoRA")
     ap.add_argument("--modelo", default=str(Path.home() / ".cache/vibevoice-nix/modelo"))
     ap.add_argument("--cache", default=str(Path.home() / ".cache/vibevoice-nix"))
     a = ap.parse_args()
@@ -145,6 +169,8 @@ def main():
         n, _ = LR.cargar(modelo, a.lora)
         LR.fundir(modelo)
         print(f"[eval] LoRA {a.lora}: {n} tensores fundidos", flush=True)
+    if a.cuantizar:
+        cuantizar_como_produccion(modelo)
     alumno = None
     if a.cabeza:
         alumno = cargar_alumno(modelo, a.cabeza)
