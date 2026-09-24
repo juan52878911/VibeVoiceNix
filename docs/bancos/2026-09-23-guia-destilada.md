@@ -1,8 +1,11 @@
-# Guía destilada: menos RTF quitando la rama negativa del CFG (2026-09-23, EN CURSO)
+# Guía destilada: menos RTF quitando la rama negativa del CFG (2026-09-23)
 
-**Estado: pausado a mitad.**
-- La primera corrida (guia1) **no pasa** por identidad.
-- La segunda (guia2, con memoria acústica) está entrenada, pero su evaluación generando no llegó a terminar: se paró para viajar.
+**Resultado: no pasa; se cierra con dos corridas.** Las dos variantes mantienen el WER, pero pierden
+~0,04 de identidad (más en los clones). Lo que la guía aporta a la voz no se recupera ni desde la
+condición positiva sola (guia1) ni con un resumen del audio ya generado (guia2).
+
+El código queda en producción apagado (`VIBEVOICE_GUIA_DESTILADA`) por si algún día se quiere un
+**modo rápido** que cambie identidad por velocidad: sería una decisión de producto, como bf16 en dobla.
 
 ## Idea
 
@@ -48,6 +51,14 @@ Se entrena una copia de la cabeza (el alumno) para que dé, con la condición PO
 
 El alumno se desvía tanto como apagar el freno. La meta sería ≲ 0,03, el orden de la rampa.
 
+**guia2 generando** (evaluado como producción: maestro en los 6 primeros fotogramas, alumno con memoria después; 192 pares):
+
+| | Diferencia | Puerta |
+|---|---|---|
+| WER | +21 % (0,033 → 0,040), IC [−0,006; +0,020] | ✓ por poco |
+| UTMOS | −0,034, IC [−0,068; +0,002] | ✗ |
+| **ECAPA** | **−0,041**, IC [−0,049; −0,034]; clones −0,04 a −0,10 | ✗ |
+
 **guia1 generando** (192 pares frente al maestro, en/es/de/fr + Juan, Carlos y Liliana):
 
 | | Diferencia | Puerta |
@@ -62,21 +73,16 @@ Lectura: la rama negativa solo ve el habla ya generada y es lo que sostiene la v
 - El ahorro grande es la pasada negativa del backbone (~20 ms de ~118). Sin medir de punta a punta: pide un segundo voz-stream y en la RAM de la VM solo cabe parando el de producción.
 - Estimado: RTF 0,885 → ~0,72.
 
-## Para retomar
+## Qué no se probó y por qué no compensa ahora
 
-1. **Evaluar guia2 generando.**
-   - Tiene `~/Documents/mejora-modelo/guia/gpu/guia2/cabeza_mejor.pt`, y del maestro ya existen `eval/maestro/medidas.json` y `lote.json`.
-   - En una g4dn, ~30 min: `evaluar.py --datos datos --voces voces.json --salida eval/alumno2 --cabeza guia2/cabeza_mejor.pt --cfg 3.0 --freno 0.75 --desde 6`, después `juez_lote.py` y `comparar.py` frente a `eval/maestro`.
-   - Los datos y las condiciones están bajados: no hay que regenerarlos.
-2. **Si no pasa, las siguientes palancas:**
-   - Una memoria mayor (un pequeño transformer causal sobre toda la historia).
-   - Entrenar más con lr 5e-5.
-   - Guía parcial: rama negativa cada 2 fotogramas con el maestro.
-3. **Si pasa:**
-   - Convertir en la VM: `VIBEVOICE_CABEZA_GUIA=... python convertir_difusion.py`.
-   - Medir el RTF de punta a punta con el servicio parado unos minutos.
-   - Pasar `banco_ab.py` y `ws_fidelidad`.
-   - Añadir la opción al módulo Nix.
+- **Una memoria mayor** (recurrente o un transformer causal sobre toda la historia): la memoria de 6
+  latentes no movió la identidad (−0,045 → −0,041, dentro del ruido). Nada indica que más memoria la cierre.
+- **Guía parcial** (rama negativa cada 2 fotogramas): ahorra la mitad y, con el mismo patrón, perdería
+  la mitad de identidad; sigue fuera de la puerta (±0,005). Es el `neg_cada`, ya medido y descartado.
+- **Destilar también en el backbone** (LoRA): obliga a refabricar las 61 voces y todos los clones, y la
+  F7 ya mostró que tocar el backbone cuesta identidad.
+
+Coste de la vía: 3,4 h de g4dn (~1,8 USD). Datos, cabezas y medidas en `~/Documents/mejora-modelo/guia/gpu/`.
 
 ## Otras medidas del mismo día
 
