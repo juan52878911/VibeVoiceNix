@@ -102,8 +102,11 @@
   # ------------------------------------------------------------------
   # Los tres motores de voz
   # ------------------------------------------------------------------
+  # APAGADOS el 24-09-2026 (pedido por Juan: la VM solo para el modelo). voz-api tuvo 6 peticiones entre el
+  # 15 y el 24-09 y ninguna desde el arranque del 21-09; homelab-whisper, ninguna. Juntos ocupaban ~1-1,5 GB de
+  # cache (el modelo large-v3 de whisper y Piper). Para volver a usarlos: enable = true.
   services.homelab-whisper = {
-    enable = true;
+    enable = false;
     modelo = "small";
     idioma = "es";
     # 4 y no 6, con prioridad baja (plan de rendimiento, A5): voz-stream ya usa los 6
@@ -116,7 +119,7 @@
   };
 
   services.voz-api = {
-    enable = true;
+    enable = false;
     puerto = 8080;
     voces = [ "es_MX-claude-high" "es_MX-ald-medium" "es_ES-davefx-medium" ];
     vozDefecto = "es_MX-claude-high";
