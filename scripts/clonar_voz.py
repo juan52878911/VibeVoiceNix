@@ -236,6 +236,14 @@ def a_cpu(salida):
     return salida
 
 
+# CLONAR CON POCO AUDIO (plan de mejora, F1, docs/bancos/2026-09-23-f1-referencias.md): repetir x2 los
+# clips en el prefijo sube la identidad y la naturalidad con 5 s (pareado, IC 95 %: Carlos +0,054
+# [+0,020, +0,088], Liliana +0,020 [+0,001, +0,040]; UTMOS de Liliana +0,224) sin empeorar el WER, y
+# Liliana con 5 s x2 iguala sus 30 s. Mismo umbral que dobla (REPETIR_BAJO_S en doblar_video.py): por
+# encima de 10 s no se ha medido y no se toca.
+REPETIR_BAJO_S = 10.0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -251,6 +259,8 @@ def main():
                     "{\"salida\": ruta.pt, \"refs\": [{\"audio\": ..., "
                     "\"transcripcion\": ...}, ...]}. Excluye --audio/"
                     "--transcripcion/--salida")
+    ap.add_argument("--sin-repetir", action="store_true",
+                    help=f"no repetir x2 una referencia de menos de {REPETIR_BAJO_S:.0f} s (se repite por defecto)")
     ap.add_argument("--sin-igualar-volumen", action="store_true",
                     help="no lleva todos los clips al mismo RMS antes de codificar")
     ap.add_argument("--semilla", type=int, default=11,
@@ -324,9 +334,9 @@ def main():
         g["total"] = sum(len(c) for c in clips) / RITMO
         if len(clips) > 1:
             print(f"  {len(clips)} muestras, {g['total']:.1f} s en total")
-        if g["total"] < 15:
-            print(f"[aviso] {g['total']:.1f} s en total. Las cifras de esta herramienta estan "
-                  f"medidas con 15,5 s y las voces oficiales llevan 22-33 s.")
+        if g["total"] < 5:
+            print(f"[aviso] {g['total']:.1f} s en total. Con 5 s repetidos x2 el clon ya llega al 97 % de "
+                  f"la identidad de 30 s (F1); por debajo de 5 s no esta medido.")
         avisar_heterogeneos(clips, g["audios"])
         if not args.sin_igualar_volumen and len(clips) > 1:
             clips = igualar_volumen(clips)
@@ -341,6 +351,13 @@ def main():
         if args.techo_minimo and (g["techo"] or 0) < args.techo_minimo:
             raise SystemExit(f"{g['salida']}: techo {g['techo']} por debajo de "
                              f"--techo-minimo {args.techo_minimo}: hace falta otra grabacion")
+        # la repeticion va DESPUES del techo: con clips duplicados el techo sale inflado (dobla lo midio:
+        # 0,876 con material duplicado frente a 0,66 real)
+        g["repetida"] = 1
+        if not args.sin_repetir and g["total"] < REPETIR_BAJO_S:
+            # la lista entera (clip, texto) dos veces, como en la F1 y en dobla
+            clips, g["textos"], g["repetida"] = clips * 2, list(g["textos"]) * 2, 2
+            print(f"  {g['total']:.1f} s: clips repetidos x2 en el prefijo (--sin-repetir para no hacerlo)")
         g["clips"] = clips
         g["texto"] = "".join(t if t.endswith("\n") else t + "\n"
                              for t in g["textos"])
@@ -427,7 +444,8 @@ def main():
         salida.with_suffix(".json").write_text(json.dumps({
             "techo": g["techo"], "segundos": round(g["total"], 1),
             "semilla_clon": g.get("semilla"),
-            "muestras": len(clips), "fuentes": [str(a) for a in g["audios"]],
+            "muestras": len(clips), "repetida": g.get("repetida", 1),
+            "fuentes": [str(a) for a in g["audios"]],
             "posiciones": n + M}, ensure_ascii=False, indent=1))
         print(f"\n{g['total']:.1f} s de referencia en {len(clips)} muestra(s) -> "
               f"{n} latentes + {M} tokens de texto = {n+M} posiciones")

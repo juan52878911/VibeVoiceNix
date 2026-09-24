@@ -93,6 +93,27 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from estirar import estirar  # noqa: E402
 import pausas as PAUSAS  # noqa: E402
+
+# NORMALIZADOR DE TEXTO (plan de mejora, F2, docs/bancos/2026-09-23-f2-f5-texto-y-no-verbales.md): el
+# modelo lee mal cifras, horas, monedas y siglas ("AWS" -> "Albol S"); escritas como se dicen, el WER real
+# bajo 4 puntos (en ingles, de 13 % a 6 %). Solo toca las lineas con cifras, simbolos o siglas: un texto
+# sin nada de eso llega al modelo byte a byte igual que antes. En espanol no deletrea siglas (F2b). El
+# modulo va junto a este fichero (scripts/normalizar_texto.py) y necesita num2words: sin el, no se aplica.
+NORMALIZAR_DEFECTO = os.environ.get("VIBEVOICE_NORMALIZAR", "auto")
+# en el repo (voz-stream-mac.sh) el modulo esta en scripts/; empaquetado, al lado de este fichero
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
+try:
+    from normalizar_texto import normalizar_para_motor as _normalizar_motor  # noqa: E402
+except ImportError as _e:
+    _normalizar_motor = None
+    print(f"[arranque] sin normalizador de texto ({_e})", flush=True)
+
+
+def normalizar_motor(texto, modo=None):
+    modo = modo or NORMALIZAR_DEFECTO
+    if _normalizar_motor is None or modo == "no":
+        return texto
+    return _normalizar_motor(texto, modo)
 import uvicorn
 from fastapi import (
     Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect,
@@ -222,7 +243,13 @@ IR_ACUSTICO = os.environ.get("VIBEVOICE_IR_ACUSTICO", "")
 # El bucle de difusion entero en un grafo (pkgs/vibevoice-ov/convertir_difusion.py). Opcional:
 # si no esta, o los pasos pedidos no son los suyos, se hace paso a paso como siempre.
 IR_DIFUSION = os.environ.get("VIBEVOICE_IR_DIFUSION", "")
-_DIFUSION = {"bucle": None}
+_DIFUSION = {"bucle": None, "guia": None}
+# GUIA DESTILADA (scripts/lora/destilar_guia.py): una cabeza que da, con la condicion POSITIVA sola, la
+# salida guiada de produccion (cfg 3 + freno). Pasada la rampa de arranque (que sigue con las dos ramas y
+# el cfg alto: es la que arregla la primera palabra) la difusion va por ella y la pasada negativa del
+# backbone se salta: ~1 pasada de backbone y media cabeza menos por fotograma. Apagada por defecto.
+# Con motor openvino: el IR difusion_guia_p6_int8.xml (convertir_difusion.py); con torch: el .pt.
+GUIA_DESTILADA = os.environ.get("VIBEVOICE_GUIA_DESTILADA", "")
 # Cuanto se frena la extrapolacion de la guia (0 = nada, 1 = del todo). Ver
 # frenar_guia(): sin esto, una locucion larga con cfg alto se desboca de
 # volumen hasta recortar. El defecto se midio ahi.
@@ -674,6 +701,13 @@ def cargar_modelo():
                       f"({_DIFUSION['bucle'].pasos} pasos)", flush=True)
             elif IR_DIFUSION:
                 print(f"[aviso] no esta {IR_DIFUSION}: difusion paso a paso", flush=True)
+            if GUIA_DESTILADA and Path(GUIA_DESTILADA).exists():
+                from motor import DifusionGuiaOV
+                _DIFUSION["guia"] = DifusionGuiaOV(GUIA_DESTILADA, HILOS)
+                print(f"[arranque] guia destilada: {Path(GUIA_DESTILADA).name} tras la rampa "
+                      f"(sin rama negativa)", flush=True)
+            elif GUIA_DESTILADA:
+                print(f"[aviso] no esta {GUIA_DESTILADA}: guia de siempre", flush=True)
             # El freno tambien aqui: sample_speech_tokens sigue siendo la de
             # torch con este motor (solo cambian los grafos que llama), y la
             # rampa de volumen se midio en LOS DOS motores.
@@ -1010,7 +1044,17 @@ def reforzar_guia_arranque(modelo) -> None:
     muestrear = modelo.sample_speech_tokens
     generar = modelo.generate
 
+    backbone = getattr(getattr(modelo, "model", None), "tts_language_model", None)
+    # la guia destilada entra cuando acaba la rampa (o desde el primer fotograma sin rampa)
+    guia_desde = CFG_ARRANQUE_FOTOGRAMAS if rampa else 0
+
+    def saltar_negativa(si):
+        if hasattr(backbone, "saltar_negativa"):
+            backbone.saltar_negativa = si
+
     def generate_reiniciado(*a, ruido_arranque=None, **kw):
+        saltar_negativa(False)
+        _ARRANQUE["historia"] = []
         _ARRANQUE["frame"] = 0
         _ARRANQUE["activo"] = None
         _ARRANQUE["gen"] = (torch.Generator(device="cpu").manual_seed(int(ruido_arranque))
@@ -1021,13 +1065,31 @@ def reforzar_guia_arranque(modelo) -> None:
         k = _ARRANQUE["frame"]
         _ARRANQUE["frame"] = k + 1
         _ARRANQUE["activo"] = _ARRANQUE["gen"] if k < RUIDO_ARRANQUE_FOTOGRAMAS else None
+        guia = _DIFUSION["guia"]
+        if guia is not None:
+            # la pasada negativa que sigue a este fotograma alimenta al SIGUIENTE: se salta si ese ya
+            # va por la guia destilada
+            saltar_negativa(k + 1 >= guia_desde)
+            hist = _ARRANQUE.setdefault("historia", [])
+            if k >= guia_desde and len(hist) >= max(1, guia.memoria):
+                h = None
+                if guia.memoria:
+                    # memoria acustica (guia2): los k ultimos latentes generados y la media de todos
+                    h = torch.cat([torch.stack(hist[-guia.memoria:]).reshape(1, -1),
+                                   torch.stack(hist).mean(0, keepdim=True)], 1)
+                sal = guia(condition, _ruido_difusion(condition.shape[0], modelo.config.acoustic_vae_dim), h)
+                hist.append(sal[0].detach())
+                return sal
         if rampa and k < CFG_ARRANQUE_FOTOGRAMAS and CFG_ARRANQUE > cfg_scale:
             # Rampa lineal: fotograma 0 con CFG_ARRANQUE, y de vuelta al
             # pedido al agotar la ventana. Sin escalon: el freno de guia ya
             # normaliza la energia, pero la prosodia agradece la suavidad.
             peso = (CFG_ARRANQUE_FOTOGRAMAS - k) / CFG_ARRANQUE_FOTOGRAMAS
             cfg_scale = cfg_scale + (CFG_ARRANQUE - cfg_scale) * peso
-        return muestrear(condition, neg_condition, cfg_scale)
+        sal = muestrear(condition, neg_condition, cfg_scale)
+        if _DIFUSION["guia"] is not None:
+            _ARRANQUE.setdefault("historia", []).append(sal[0].detach())
+        return sal
 
     modelo.generate = generate_reiniciado
     modelo.sample_speech_tokens = muestrear_reforzado
@@ -2498,6 +2560,8 @@ def foto_generacion() -> dict:
     gen = _ARRANQUE["gen"]
     return {"rng": torch.get_rng_state(),
             "arranque": _ARRANQUE["frame"],
+            # la memoria de la guia destilada (guia2) es de ESTA locucion
+            "historia": list(_ARRANQUE.get("historia", [])),
             "gen_arranque": gen.get_state() if gen is not None else None,
             "remate": dict(_REMATE)}
 
@@ -2508,6 +2572,7 @@ def reponer_generacion(foto: dict, pasos, neg_cada) -> None:
     _ajustar_pasos(pasos)
     _ajustar_neg_cada(neg_cada)
     _ARRANQUE["frame"] = foto["arranque"]
+    _ARRANQUE["historia"] = list(foto.get("historia", []))
     _ARRANQUE["activo"] = None
     if foto["gen_arranque"] is None:
         _ARRANQUE["gen"] = None
@@ -3670,6 +3735,9 @@ class PeticionTTS(BaseModel):
     # quita la sintonia de fondo que el modelo inventa en intros. Sin mandarlo,
     # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE (1 por defecto); null o 0 lo apaga.
     ruido_arranque: Optional[int] = Field(None, ge=0, lt=2**31)
+    # Normalizador de texto (bloque NORMALIZADOR): "auto" (idioma por palabras funcionales), "es", "en"
+    # o "no". None = VIBEVOICE_NORMALIZAR ("auto").
+    normalizar: Optional[Literal["auto", "es", "en", "no"]] = None
     # Formato del audio que viaja (ver FORMATOS_AUDIO): wav, ogg (Opus, notas de
     # voz de WhatsApp) o mp3. Solo cambia la codificacion de salida, nunca lo
     # que genera el modelo.
@@ -3708,6 +3776,8 @@ class PeticionSesion(BaseModel):
     # solo al CREAR; quita la sintonia de fondo que el modelo inventa en intros. Sin mandarlo,
     # el de la ficha <voz>.json o VIBEVOICE_RUIDO_ARRANQUE; null o 0 lo apaga.
     ruido_arranque: Optional[int] = Field(None, ge=0, lt=2**31)
+    # Normalizador de texto, como en PeticionTTS. Solo al CREAR la sesion.
+    normalizar: Optional[Literal["auto", "es", "en", "no"]] = None
     # Cerrar en la misma llamada que se manda la ultima frase, que es lo comun.
     fin: bool = False
 
@@ -3932,7 +4002,7 @@ async def tts_stream(pet: PeticionTTS, _=Depends(autorizar)) -> StreamingRespons
             lazo = asyncio.get_running_loop()
             # generate() es bloqueante -> hilo del executor.
             tarea = lazo.run_in_executor(
-                None, _sintetizar, pet.texto, pet.voz, pet.cfg_scale, streamer,
+                None, _sintetizar, normalizar_motor(pet.texto, pet.normalizar), pet.voz, pet.cfg_scale, streamer,
                 pet.semilla, pet.pasos, pet.neg_cada, ruido,
             )
             cod = CodificadorAudio(pet.formato, ritmo) if pet.formato != "wav" else None
@@ -4038,11 +4108,12 @@ async def sesion_texto(nombre: str, pet: PeticionSesion,
                        recorte_entrada=pet.recorte_entrada,
                        pausas=dist_pausas,
                        ruido_arranque=resolver_ruido_arranque(pet, pet.voz or VOZ_DEFECTO))
+        s.normalizar = pet.normalizar or NORMALIZAR_DEFECTO
         _SESIONES[nombre] = s
     elif pet.voz is not None and pet.voz != s.voz:
         raise HTTPException(409, f"sesion '{nombre}' esta en voz '{s.voz}'; "
                                  f"cierrala para cambiar de voz")
-    s.alimentar(pet.texto)
+    s.alimentar(normalizar_motor(pet.texto, getattr(s, "normalizar", None)))
     if nueva:
         # Despues de alimentar: el hilo termina si arranca sin nada que decir.
         s.arrancar()
@@ -4370,7 +4441,7 @@ async def sesion_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
                     await evento(tipo="error", texto="texto vacio")
                     continue
                 try:
-                    n = s.alimentar(cuerpo)
+                    n = s.alimentar(normalizar_motor(cuerpo, getattr(s, "normalizar", None)))
                 except HTTPException as e:
                     await evento(tipo="error", texto=str(e.detail))
                     continue

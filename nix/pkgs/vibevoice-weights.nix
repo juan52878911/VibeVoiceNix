@@ -161,6 +161,8 @@ rec {
     cp ${../../pkgs/vibevoice-cli/estirar.py} "$out/bin/estirar.py"
     # Las pausas por voz (forma), tambien importadas por ruta.
     cp ${../../pkgs/vibevoice-cli/pausas.py} "$out/bin/pausas.py"
+    # normalizador de texto (plan de mejora, F2): voz_stream.py lo importa por ruta, como estirar y pausas
+    cp ${../../scripts/normalizar_texto.py} "$out/bin/normalizar_texto.py"
     chmod +x "$out/bin/vibevoice-cli.py" "$out/bin/voz-stream.py"
   '';
 }

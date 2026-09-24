@@ -1,0 +1,33 @@
+{
+ "_": "Corpus congelado del plan de mejora (fase 0, 22-09-2026). No se cambia: todas las fases se miden contra estas frases.",
+ "es": [
+  "Bueno, hoy vamos a hablar de cómo la nube cambia la manera en que una empresa maneja sus datos.",
+  "Dentro de Amazon existen tres modelos de servicio, y cada uno resuelve un problema distinto.",
+  "Si tengo una aplicación en mi empresa, ¿qué pasa cuando de repente llegan mil usuarios al mismo tiempo?",
+  "La idea es que el equipo pueda enfocarse en el negocio y no en mantener servidores."
+ ],
+ "es_numeros": [
+  "La reunión es el 15 de marzo a las 3:30 de la tarde, en la sala 204.",
+  "El presupuesto subió un 12,5 % y ya supera los 40.000 dólares.",
+  "Configuramos la API con OAuth y la base de datos en AWS con 2 réplicas.",
+  "El vuelo IB6843 sale de Bogotá a las 23:45 y llega a Madrid el día 8."
+ ],
+ "en": [
+  "Today we are going to talk about how the cloud changes the way a company handles its data.",
+  "Inside Amazon there are three service models, and each one solves a different problem.",
+  "If I have an application in my company, what happens when a thousand users arrive at the same time?",
+  "The idea is that the team can focus on the business instead of maintaining servers."
+ ],
+ "en_numeros": [
+  "The meeting is on March 15th at 3:30 in the afternoon, in room 204.",
+  "The budget went up 12.5 percent and is now above 40,000 dollars.",
+  "We configured the API with OAuth and the database on AWS with 2 replicas.",
+  "Flight UA 1284 leaves Chicago at 11:45 PM and lands in Denver on the 8th."
+ ],
+ "no_verbales": [
+  "Ja, ja, ja, eso sí que no me lo esperaba.",
+  "Eh... bueno, déjame pensarlo un momento.",
+  "Mmm, no estoy seguro, pero creo que sí.",
+  "(respira) Vale, empecemos otra vez desde el principio."
+ ]
+}

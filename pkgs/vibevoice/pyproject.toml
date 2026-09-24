@@ -11,6 +11,8 @@ dependencies = [
     # fallo es un ImportError en mitad de la carga.
     "protobuf",
     "sentencepiece",
+    # Normalizador de texto de voz_stream.py (cifras, horas y monedas en palabras; plan de mejora, F2).
+    "num2words",
     # Motor alternativo de inferencia. Con el pipeline convertido a IR, el RTF
     # baja de 2,19 a 1,09 en el mismo hardware: el decodificador acustico pasa
     # de 165 a 66 ms por llamada porque el grafo compilado elimina el despacho

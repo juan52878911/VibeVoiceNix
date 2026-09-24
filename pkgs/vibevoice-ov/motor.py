@@ -66,7 +66,7 @@ import weakref
 import numpy as np
 import torch
 
-CRONO = {"tts_lm": [0.0, 0], "cabeza": [0.0, 0], "acustico": [0.0, 0],
+CRONO = {"tts_lm": [0.0, 0], "tts_lm_saltado": [0.0, 0], "cabeza": [0.0, 0], "acustico": [0.0, 0],
          # pasadas del backbone que el agrupado de la rama incondicional se
          # ahorro: cuentan el tiempo de acumular, no el de inferir
          "tts_lm_aplazado": [0.0, 0]}
@@ -180,6 +180,10 @@ class TtsLmOV(torch.nn.Module):
         self.comp = core.compile_model(ruta_xml, "CPU", config_cpu(hilos))
         self.n_capas = n_capas
         self.neg_cada = max(1, int(neg_cada))
+        # GUIA DESTILADA (destilar_guia.py): con la cabeza que ya no mira la rama negativa, sus pasadas
+        # sobran. voz_stream.py lo enciende pasada la rampa de arranque; la cache negativa se queda
+        # vieja, y da igual: nadie vuelve a leerla en esta locucion.
+        self.saltar_negativa = False
         self.device = torch.device("cpu")
 
     def _arrancar_flujo(self, cache_torch):
@@ -208,6 +212,13 @@ class TtsLmOV(torch.nn.Module):
         else:
             pos = np.arange(cache.longitud, cache.longitud + S, dtype=np.int64)[None]
         emb = np.ascontiguousarray(inputs_embeds.detach().float().numpy())
+
+        if (self.saltar_negativa and not cache._positivo and not estrenando
+                and cache._ultimo is not None):
+            cache.longitud += S
+            CRONO["tts_lm_saltado"][0] += time.perf_counter() - ini
+            CRONO["tts_lm_saltado"][1] += 1
+            return SalidaLM(cache._ultimo, cache)
 
         # ---- rama incondicional agrupada ----
         # Solo cuando ya hay un hidden anterior que devolver: la primera
@@ -297,6 +308,34 @@ class DifusionOV:
         res = self.pet.infer([condition.detach().float().numpy(), speech.detach().float().numpy(),
                               np.array(cfg_scale, dtype=np.float32), np.array(freno, dtype=np.float32)],
                              share_inputs=True, share_outputs=True)
+        salida = torch.from_numpy(np.array(res[self.comp.output(0)]))
+        CRONO["cabeza"][0] += time.perf_counter() - ini
+        CRONO["cabeza"][1] += 1
+        return salida
+
+
+class DifusionGuiaOV:
+    """El bucle de difusion con la GUIA DESTILADA en la cabeza (convertir_difusion.py con
+    VIBEVOICE_CABEZA_GUIA): UNA fila de condicion, sin rama negativa, sin cfg ni freno (van dentro
+    de los pesos). Entradas condition [1,896] y speech [1,64]; salida el latente [1,64]."""
+
+    def __init__(self, ruta_xml, hilos):
+        import re
+        import openvino as ov
+        self.comp = ov.Core().compile_model(ruta_xml, "CPU", config_cpu(hilos))
+        self.pet = self.comp.create_infer_request()
+        m = re.search(r"_p(\d+)_", ruta_xml)
+        self.pasos = int(m.group(1)) if m else None
+        # con memoria (guia2) el grafo tiene una tercera entrada: la historia [1, (k+1)*64]
+        self.memoria = (int(self.comp.inputs[2].get_partial_shape()[1].get_length()) // 64 - 1
+                        if len(self.comp.inputs) > 2 else 0)
+
+    def __call__(self, condition, speech, historia=None):
+        ini = time.perf_counter()
+        entradas = [condition.detach().float().numpy(), speech.detach().float().numpy()]
+        if self.memoria:
+            entradas.append(historia.detach().float().numpy())
+        res = self.pet.infer(entradas, share_inputs=True, share_outputs=True)
         salida = torch.from_numpy(np.array(res[self.comp.output(0)]))
         CRONO["cabeza"][0] += time.perf_counter() - ini
         CRONO["cabeza"][1] += 1
