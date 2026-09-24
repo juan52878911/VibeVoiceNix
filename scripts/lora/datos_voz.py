@@ -114,10 +114,14 @@ def main():
           f"(ECAPA >= {umbral:.3f}, mediana {np.median(sims):.3f})", flush=True)
     ids = sorted({t[0] for t in buenos})
     random.Random(0).shuffle(ids)
-    n_ap = max(1, int(round(len(ids) * a.apartar)))
+    n_ap = int(round(len(ids) * a.apartar))
+    if a.apartar > 0:
+        n_ap = max(1, n_ap)                 # con --apartar 0 todo entrena (la evaluacion va aparte)
     apartadas = set(ids[:n_ap])
     ent = [t for t in buenos if t[0] not in apartadas]
     ev = [t for t in buenos if t[0] in apartadas]
+    if not ev:
+        print("[voz] sin frases apartadas: la evaluacion va por otro lado", flush=True)
     # referencia de clonado para la evaluacion: los tramos de entrenamiento mas tipicos hasta ~30 s (como dobla)
     tipicos = sorted(ent, key=lambda t: -float(t[3] @ centro))
     refs, acum = [], 0.0

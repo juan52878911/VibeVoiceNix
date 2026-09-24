@@ -42,10 +42,16 @@ def _numero(txt, idioma):
     t = txt
     if re.fullmatch(rf"\d{{1,3}}(\{miles}\d{{3}})+", t):          # separador de miles
         return _entero(t.replace(miles, ""), idioma)
-    if decimal in t:
-        ent, dec = t.split(decimal, 1)
-        return f"{_entero(ent, idioma)} {COMA[idioma]} " + " ".join(_entero(d, idioma) for d in dec)
-    return _entero(t, idioma)
+    # decimal: el separador del idioma, o el otro si no forma miles ("8.1" en un texto espanol que viene del
+    # ingles, o lo que escribe whisper). Antes "8.1" en espanol reventaba en int().
+    for sep in (decimal, miles):
+        if sep in t:
+            ent, dec = t.rsplit(sep, 1)
+            ent = ent.replace(miles, "").replace(decimal, "")
+            if ent.isdigit() and dec.isdigit():
+                return f"{_entero(ent, idioma)} {COMA[idioma]} " + " ".join(_entero(d, idioma) for d in dec)
+    t = re.sub(r"\D", "", t)
+    return _entero(t, idioma) if t else ""
 
 
 def _deletrear(tok, idioma):
