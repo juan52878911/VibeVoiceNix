@@ -27,8 +27,10 @@ Restricciones que manda el proyecto y que este plan respeta:
 | F5 no verbales por texto | No pasa: el modelo lee las marcas | [f2 y f5](bancos/2026-09-23-f2-f5-texto-y-no-verbales.md) |
 | F6 ambientes procedurales | No pasa como realismo; siguiente paso con decisión humana (CC0) | [f6](bancos/2026-09-23-f6-ambientes.md) |
 | F7 LoRA multilingüe | **No pasa, cerrada tras 3 corridas**: bucle validado (puertas 0 y 1), pero generando el WER no baja (base 4,4 %) y la identidad cae −0,008 a −0,012. Efecto consistente: las voces españolas en inglés suenan más nativas (UTMOS +0,2-0,5, PER −0,02-0,05) a costa de identidad; F4 lo hace mejor | [f7](bancos/2026-09-23-f7-lora.md) |
+| **F8 LoRA por voz** | **Pasa** (Carlos, 10,8 min mezclados con lectura, al 75 % de fuerza): identidad +0,049, estilo −0,21 desviaciones suyas, UTMOS +0,08, WER igual; sobrevive a int4; con 5 min también. Falta llevarlo a producción (IR por voz) y validarlo con otra persona | [f8](bancos/2026-09-24-f8-lora-por-voz.md) |
+| Guía destilada | No pasa (identidad −0,04 en dos corridas); código apagado como posible modo rápido | [guía](bancos/2026-09-23-guia-destilada.md) |
 
-Gasto en GPU: 3,69 USD de un tope de 20 (F7: 5,1 h de g4dn.xlarge, 2,74 USD).
+Gasto en GPU: 8,32 USD de un tope de 20 (F7 2,74; guía destilada ~1,8; F8 ~2,25).
 
 Probado en dobla (rama `mejoras-modelo`): normalizador, repetir la referencia corta, reintento por QC
 y acento nativo por conversión, sin regresión en el caso de 4 voces (WER 0,316 → 0,306). La demo de
