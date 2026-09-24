@@ -113,7 +113,11 @@ def normalizar_motor(texto, modo=None):
     modo = modo or NORMALIZAR_DEFECTO
     if _normalizar_motor is None or modo == "no":
         return texto
-    return _normalizar_motor(texto, modo)
+    try:
+        return _normalizar_motor(texto, modo)
+    except Exception as e:           # el normalizador nunca tumba una sintesis: se dice el texto tal cual
+        print(f"[normalizador] fallo con {texto[:60]!r}: {e}", flush=True)
+        return texto
 import uvicorn
 from fastapi import (
     Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect,
