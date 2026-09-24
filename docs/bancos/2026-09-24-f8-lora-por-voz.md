@@ -1,10 +1,17 @@
 # F8 · LoRA por voz: identidad y personalidad de un clon (2026-09-24)
 
-**Resultado: primera palanca del plan que sube la identidad sin coste de inteligibilidad.** Un LoRA
-entrenado con ~10 min de la persona, **aplicado al 50 % de su fuerza**:
-- acerca el clon a Carlos en timbre (ECAPA +0,03) y en estilo (distancia −0,16 a −0,25 desviaciones suyas);
-- no mueve el WER de forma significativa;
-- con **5 min** de audio da lo mismo.
+**Resultado: primera mejora de pesos del plan que pasa la puerta.** Un LoRA por voz, entrenado con
+~10 min de la persona mezclados con lectura general, **aplicado al 75 % de su fuerza** (receta al final):
+
+| Frente al clon de hoy | Sin cuantizar | Con la cuantización de producción |
+|---|---|---|
+| Identidad (ECAPA) | **+0,049** [+0,036; +0,062] | **+0,045** [+0,029; +0,061] |
+| Estilo (desviaciones de la persona) | **−0,209** [−0,305; −0,119] | **−0,168** [−0,282; −0,055] |
+| Naturalidad (UTMOS) | **+0,080** [+0,014; +0,142] | **+0,158** [+0,076; +0,241] |
+| WER | −0,001 [−0,024; +0,021] | −0,004 [−0,027; +0,020] |
+
+En inglés, que Carlos nunca grabó, la identidad sube todavía más. Con **5 min** de audio también pasa
+(al 50 %); con 2 min no.
 
 Aplicado entero (100 %), la identidad sube más (+0,053), pero el WER pasa de 2,5 % a 9,5 %: el clon
 empieza a hablar como Carlos en su charla espontánea, que whisper transcribe con un WER de 0,289.
@@ -72,3 +79,52 @@ Puerta de la 3b: juez de estilo con IC > 0, ECAPA ≥ −0,005, UTMOS con IC inf
 **La mejora sobrevive a la cuantización.** Esta simulación es más dura que la de nncf: le cuesta a la base
 WER +0,037, UTMOS −0,21 y ECAPA −0,035, cuando el int4 real del backbone pasó en su día `banco_ab`. Así
 que vale para comparar base y LoRA en igualdad de condiciones, no como medida absoluta del coste de int4.
+
+## Rondas 7-10: más fuerza con la mezcla, rango y pasos (75 clips)
+
+| Frente a la base | WER | UTMOS | ECAPA | Estilo |
+|---|---|---|---|---|
+| Mezcla r16 al 65 % | −0,007 | +0,073 [−0,000; +0,144] | **+0,048** | **−0,188** |
+| **Mezcla r16 al 75 %** | −0,001 [−0,024; +0,021] | **+0,080** [+0,014; +0,142] | **+0,049** [+0,036; +0,062] | **−0,209** |
+| Mezcla r16 al 85 % | +0,014 [−0,010; +0,037] (> 0,5 puntos) | +0,048 | +0,056 | −0,231 |
+| Mezcla r32 al 75 % | +0,005 [−0,018; +0,027] | **+0,141** | **+0,050** | **−0,260** |
+| Mezcla r16 con 1000 pasos, al 75 % | +0,005 | +0,042 | +0,041 | −0,217 |
+| Solo 2 min, al 50 % | +0,037 [−0,018; +0,128] | +0,099 | +0,015 | −0,117 |
+
+**Con la cuantización de producción:**
+- Mezcla r16 al 75 %: WER −0,004, UTMOS +0,158, ECAPA +0,045, estilo −0,168. **Pasa.**
+- Mezcla r32 al 75 %: WER +0,014 [−0,016; +0,045], UTMOS +0,144, ECAPA +0,048, estilo −0,236, contorno +0,056.
+
+**Lectura:**
+- La mezcla con lectura limpia es lo que permite subir la fuerza: el LoRA solo, al 75 %, ya subía el WER
+  (+0,028). Con la mezcla, al 75 % no lo toca.
+- El techo está en el 75 %: al 85 % el WER empieza a subir.
+- Rango 32 suena mejor en estilo y naturalidad, pero cuantizado roza el WER. 1000 pasos no aportan.
+- **2 min se quedan cortos; 5 min es el mínimo útil.**
+
+## Receta
+
+1. **Datos de la persona** (≥ 5 min, mejor ~10): `datos_voz.py --apartar 0` sobre sus grabaciones.
+   Whisper large-v3 con marcas por palabra corta en pausas. **No** usar el texto de una anotación con
+   tiempos aproximados.
+2. **Repaso:** lectura general en/es con `datos.py --idiomas en,es --hablantes 20` (unos 360 ejemplos por
+   idioma). A la persona se le pone `idioma = "voz"`, para que cada paso tenga un tercio de ella.
+3. **Entrenamiento:** `entrenar.py --rango 16 --alfa 32 --lr 1e-4 --pasos 600 --acumular 4 --cada 50`.
+   Solo los dos LM, sin cabeza. Unos 14 min en una g4dn (~0,12 USD).
+4. **Uso:** fundir con `alfa 24` (75 % de la fuerza) y cuantizar como siempre.
+
+## Para producción (no hecho)
+
+- **El LoRA va fundido en los pesos:** cada voz necesita su propio IR del backbone (int4, ~150-300 MB) y
+  su LM de texto. Se genera una vez al dar de alta la voz y se guarda con ella (`voces/<id>/` en S3).
+- **dobla:** si una voz del vídeo tiene IR propio, el motor tiene que cargar ese backbone para sus
+  segmentos. Hoy voz-stream carga uno solo al arrancar; con varias voces con LoRA hace falta un backbone
+  por voz en memoria (int4: ~150 MB cada uno) o un servidor por voz.
+- **Validar con una segunda persona:** con Liliana no hubo material aparte de su evaluación (0,7 min). Las
+  notas de WhatsApp de Juan (≥ 5 min) son la siguiente prueba.
+- **Consentimiento:** el LoRA es un modelo de la voz de la persona; solo con su permiso expreso para eso.
+
+## Coste
+
+4,2 h de g4dn.xlarge (~2,25 USD) para 10 rondas. Gasto de GPU del plan: 8,32 de 20 USD. LoRA, medidas y
+muestra de escucha en `~/Documents/mejora-modelo/f8/` (fuera del repo: llevan la voz de Carlos).
