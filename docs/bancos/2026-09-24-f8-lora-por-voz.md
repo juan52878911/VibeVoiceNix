@@ -128,3 +128,24 @@ que vale para comparar base y LoRA en igualdad de condiciones, no como medida ab
 
 4,2 h de g4dn.xlarge (~2,25 USD) para 10 rondas. Gasto de GPU del plan: 8,32 de 20 USD. LoRA, medidas y
 muestra de escucha en `~/Documents/mejora-modelo/f8/` (fuera del repo: llevan la voz de Carlos).
+
+## Coste y decisión (24-09-2026)
+
+| Concepto (por voz) | Coste | Fuente |
+|---|---|---|
+| Preparar datos (~10 min de audio) | ~9 min de g4dn, ~0,08 USD | medido |
+| Entrenar el LoRA (600 pasos, mezcla) | ~14 min de g4dn, ~0,12 USD | medido |
+| Lectura general para la mezcla | una vez, compartida por todas las voces | medido |
+| Convertir el backbone de la voz a OpenVINO int4 | ~15 min de CPU, ~0,02 USD en AWS | estimado |
+| **Total por voz, una sola vez** | **~0,20-0,25 USD y ~40 min** | |
+| Guardarla (~200-300 MB) | ~0,005 USD al mes | estimado |
+| Usarla en cada doblaje | segundos (bajar y compilar); **el RTF no cambia** | estimado |
+
+Lo caro no es el cómputo:
+- **Ingeniería, una sola vez:** un backbone por voz en voz-stream y dobla, y el entrenamiento al dar de alta la voz.
+- **Pedir ≥ 5 min de audio limpio** y el permiso expreso de la persona para modelar su voz.
+- **Memoria:** un backbone por voz en los vídeos con varias voces con LoRA.
+
+**Decisión de Juan (24-09): no se hacen versiones por voz por ahora.** Queda documentado para cuando
+haya un producto de «voz propia» (personas que narran o doblan a menudo con su voz). Antes de
+integrarlo, validarlo con una segunda persona.
