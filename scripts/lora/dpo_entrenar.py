@@ -39,7 +39,8 @@ TOPE_T = 400          # fotogramas como mucho por muestra (53 s): el prefijo de 
 
 
 class Muestras:
-    """Carga perezosa de latentes y condiciones de referencia (LoRA apagado) por clave."""
+    """Carga perezosa de latentes y condiciones de referencia (LoRA apagado) por clave. Las claves llevan
+    delante la carpeta ("d1/en-4719__t0__s11"): D0 y D1 repiten lector y numero de texto con textos distintos."""
 
     def __init__(self, carpetas, dispositivo):
         self.d = dispositivo
@@ -49,16 +50,17 @@ class Muestras:
             hs = json.loads((c / "hablantes.json").read_text())
             for f in sorted(c.glob("lote.*.json")):
                 for m in json.loads(f.read_text()):
-                    h = hs[m["identidad"]]
-                    self.meta[m["clave"]] = {"txt": m["texto"], "ref_txt": h["ref_txt"], "identidad": m["identidad"]}
-                    self.ruta[m["clave"]] = c
+                    k = f"{c.name}/{m['clave']}"
+                    self.meta[k] = {"txt": m["texto"], "ref_txt": hs[m["identidad"]]["ref_txt"], "identidad": f"{c.name}/{m['identidad']}"}
+                    self.ruta[k] = (c, m["clave"])
             for ident in hs:
-                self.ref[ident] = torch.load(c / "hablantes" / ident / "ref_lat.pt", map_location="cpu").float()
+                self.ref[f"{c.name}/{ident}"] = torch.load(c / "hablantes" / ident / "ref_lat.pt", map_location="cpu").float()
         self.lat, self.cond_ref = {}, {}
 
     def ejemplo(self, clave):
         if clave not in self.lat:
-            lat = torch.load(self.ruta[clave] / "lat" / f"{clave}.pt", map_location="cpu")["lat"].float()
+            c, k = self.ruta[clave]
+            lat = torch.load(c / "lat" / f"{k}.pt", map_location="cpu")["lat"].float()
             self.lat[clave] = lat[:TOPE_T]
         m = self.meta[clave]
         return {"ref_lat": self.ref[m["identidad"]], "ref_txt": m["ref_txt"], "lat": self.lat[clave], "txt": m["txt"]}
@@ -145,7 +147,12 @@ def main():
     params = LR.congelar_salvo_lora(modelo)
     carpetas = a.datos.split(",")
     mues = Muestras(carpetas, d)
-    pares = [json.loads(l) for c in carpetas for l in open(Path(c) / "pares.jsonl")]
+    pares = []
+    for c in carpetas:
+        n = Path(c).name
+        for l in open(Path(c) / "pares.jsonl"):
+            p = json.loads(l)
+            pares.append({**p, "ganador": f"{n}/{p['ganador']}", "perdedor": f"{n}/{p['perdedor']}", "grupo": f"{n}/{p['grupo']}"})
     pares = [p for p in pares if p["ganador"] in mues.meta and p["perdedor"] in mues.meta]
     idents = sorted({p["identidad"] for p in pares})
     random.Random(1).shuffle(idents)

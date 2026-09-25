@@ -103,6 +103,8 @@ def preparar(a, sal):
         lectura = sorted({t for t in lectura if parte_de(t) == a.parte})
         rng.shuffle(lectura)
         dificil = [t for t in textos["dificil"].get(idioma, []) if parte_de(t) == a.parte]
+        if a.parte == "puerta":
+            dificil += textos.get("dificil_puerta", {}).get(idioma, [])
         qc = [t for t in textos.get("qc", {}).get(idioma, []) if parte_de(t) == a.parte]
         rng.shuffle(dificil)
         rng.shuffle(qc)
@@ -235,6 +237,7 @@ def main():
         torch.manual_seed(11)                          # como evaluar.py: el mismo prefijo en base y LoRA
         lat_ref = FZ.latentes(modelo, sf.read(h["ref"], dtype="float32")[0], d, muestrear=True)
         if not ruta_ref.exists():
+            ruta_ref.parent.mkdir(parents=True, exist_ok=True)
             torch.save(lat_ref.cpu(), ruta_ref)
         pref = prefijo(modelo, tok, lat_ref, h["ref_txt"], d)
         modo = h["idioma"] if h["idioma"] in ("es", "en") else "no"

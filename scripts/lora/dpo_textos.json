@@ -1,5 +1,5 @@
 {
- "_nota": "Textos para DPO (plan de preferencias, 24-09). dificil: numeros, siglas, nombres propios, frases largas, preguntas y habla conversacional como la de dobla; en es y en las cifras se escriben con digitos porque el generador pasa el texto por normalizar_para_motor, como voz-stream. qc: tramos de dobla que fallaron el QC (WER > 0,15 o reintento), solo el texto. La parte de la puerta se elige por hash del texto (dpo_generar.parte_de). En fr, de, it y pt no hay cifras ni cantidades: el normalizador del juez solo cubre es y en, y whisper escribe '2,5kg' donde el modelo dijo 'dois quilos e meio' (D0, 25-09).",
+ "_nota": "Textos para DPO (plan de preferencias, 24-09). dificil: numeros, siglas, nombres propios, frases largas, preguntas y habla conversacional como la de dobla; en es y en las cifras se escriben con digitos porque el generador pasa el texto por normalizar_para_motor, como voz-stream. qc: tramos de dobla que fallaron el QC (WER > 0,15 o reintento), solo el texto. La parte de la puerta se elige por hash del texto (dpo_generar.parte_de). En fr, de, it y pt no hay cifras ni cantidades: el normalizador del juez solo cubre es y en, y whisper escribe '2,5kg' donde el modelo dijo 'dois quilos e meio' (D0, 25-09). dificil_puerta: textos solo para la puerta (--parte puerta), que por hash se quedaba con 1-3 dificiles por idioma.",
  "dificil": {
   "en": [
    "The meeting moved from 3:30 PM to 11:15 AM on March 8th, so please update your calendar.",
@@ -121,6 +121,50 @@
    "Do you see a profile and is it possible to compensate the lack of work experience with certifications, courses on learning platforms?",
    "Dani is an international coach, specializing in helping teams reach their full potential. He offers consulting services to assist your entire team, just as you would, rather than just walking and eating.",
    "Can you see a profile where it's feasible to make up for a lack of work experience through certifications and courses on learning platforms?"
+  ]
+ },
+ "dificil_puerta": {
+  "en": [
+   "The quarterly report shows 18% growth in Brazil, but only 4% in Germany.",
+   "Could you ask Dr. Abernathy whether the MRI results arrived before 9:30?",
+   "My grandmother moved from Guadalajara to Saskatchewan in 1972, and she never learned to ski.",
+   "Wait, so you're telling me the whole server went down because somebody unplugged the wrong cable?",
+   "The GPU costs about $0.53 an hour, which is cheap, but only if you remember to turn it off."
+  ],
+  "es": [
+   "El informe trimestral muestra un crecimiento del 18% en Brasil, pero solo del 4% en Alemania.",
+   "¿Le puedes preguntar a la doctora Echeverría si llegaron los resultados de la resonancia antes de las 9:30?",
+   "Mi abuela se mudó de Guadalajara a Valladolid en 1972 y nunca aprendió a esquiar.",
+   "Espera, ¿me estás diciendo que se cayó todo el servidor porque alguien desenchufó el cable equivocado?",
+   "La verdad es que al principio no entendía nada, pero poco a poco le fui cogiendo el truco."
+  ],
+  "fr": [
+   "Attends, tu es en train de me dire que tout le serveur est tombé parce que quelqu'un a débranché le mauvais câble ?",
+   "Ma grand-mère a quitté Clermont-Ferrand pour s'installer à Chicoutimi, et elle n'a jamais appris à skier.",
+   "Est-ce que tu pourrais demander au docteur Lefebvre si les résultats sont arrivés ce matin ?",
+   "Au début je ne comprenais rien, mais petit à petit j'ai fini par trouver le truc.",
+   "Honnêtement, je pense que si on continue comme ça, on va devoir tout réécrire l'année prochaine."
+  ],
+  "de": [
+   "Moment, willst du mir sagen, dass der ganze Server ausgefallen ist, weil jemand das falsche Kabel gezogen hat?",
+   "Meine Großmutter ist von Mönchengladbach nach Klagenfurt gezogen und hat nie Skifahren gelernt.",
+   "Könntest du Doktor Schwarzenberger fragen, ob die Ergebnisse heute Morgen angekommen sind?",
+   "Am Anfang habe ich gar nichts verstanden, aber nach und nach habe ich den Dreh herausbekommen.",
+   "Ehrlich gesagt glaube ich, dass wir alles neu schreiben müssen, wenn wir so weitermachen."
+  ],
+  "it": [
+   "Aspetta, mi stai dicendo che tutto il server è andato giù perché qualcuno ha staccato il cavo sbagliato?",
+   "Mia nonna si è trasferita da Caltanissetta a Bolzano e non ha mai imparato a sciare.",
+   "Potresti chiedere al dottor Castiglioni se i risultati sono arrivati stamattina?",
+   "All'inizio non capivo niente, ma piano piano ho trovato il modo di farlo.",
+   "Sinceramente credo che, se andiamo avanti così, l'anno prossimo dovremo riscrivere tutto."
+  ],
+  "pt": [
+   "Espera, você está me dizendo que o servidor inteiro caiu porque alguém desligou o cabo errado?",
+   "A minha avó se mudou de Itaquaquecetuba para Coimbra e nunca aprendeu a esquiar.",
+   "Você poderia perguntar ao doutor Albuquerque se os resultados chegaram hoje de manhã?",
+   "No começo eu não entendia nada, mas aos poucos fui pegando o jeito.",
+   "Sinceramente, acho que se continuarmos assim, vamos ter que reescrever tudo no ano que vem."
   ]
  }
 }
