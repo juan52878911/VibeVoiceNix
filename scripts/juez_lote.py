@@ -70,18 +70,19 @@ def _wav_temporal(x16):
 
 
 class Jueces:
-    def __init__(self, dispositivo="cpu", hilos=2, sonidos=False):
+    def __init__(self, dispositivo="cpu", hilos=2, sonidos=False, whisper="large-v3", rapido=False):
         import torch
         from faster_whisper import WhisperModel
         from speechbrain.inference.speaker import EncoderClassifier
         self.torch, self.disp = torch, dispositivo
         gpu = dispositivo.startswith("cuda")
-        self.whisper = WhisperModel("large-v3", device="cuda" if gpu else "cpu",
+        self.whisper = WhisperModel(whisper, device="cuda" if gpu else "cpu",
                                     compute_type="float16" if gpu else "int8", cpu_threads=hilos)
         self.ecapa = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
                                                     savedir=str(Path.home() / ".cache/asistente-huellas/ecapa"),
                                                     run_opts={"device": dispositivo})
-        self.fonemas = JA.Reconocedor(dispositivo)
+        self.rapido = rapido
+        self.fonemas = None if rapido else JA.Reconocedor(dispositivo)
         self.utmos = torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).to(dispositivo).eval()
         self.sonidos = None
         if sonidos:
@@ -116,14 +117,16 @@ class Jueces:
             if normalizar:
                 idioma = c.get("idioma", "es")
                 m["wer_norm"] = round(wer(normalizar(c["texto"], idioma), normalizar(m["oido"], idioma)), 4)
+        if c.get("texto") and self.fonemas:
             oidos = self.fonemas.fonemas(c["audio"] if c["audio"] else _wav_temporal(x16))
             m["per"], m["variedad"], _ = JA.per_idioma(c["texto"], c.get("idioma", "es"), oidos)
             m["per"] = round(m["per"], 4)
         with self.torch.inference_mode():
             m["utmos"] = round(float(self.utmos(self.torch.from_numpy(x16)[None].to(self.disp), 16000).item()), 3)
-        p = PVOC.perfil(x, hz, c.get("texto"))
-        m["pausas_min"] = p.get("pausas_min")
-        m["silabas_s"] = p.get("silabas_s")
+        if not self.rapido:
+            p = PVOC.perfil(x, hz, c.get("texto"))
+            m["pausas_min"] = p.get("pausas_min")
+            m["silabas_s"] = p.get("silabas_s")
         if self.sonidos:
             m["sonidos"] = {k: v["max"] for k, v in self.sonidos.medir(x, hz).items()}
         return m
@@ -137,6 +140,8 @@ def main():
     ap.add_argument("--dispositivo", default="cpu")
     ap.add_argument("--hilos", type=int, default=2)
     ap.add_argument("--sonidos", action="store_true")
+    ap.add_argument("--whisper", default="large-v3", help="la recompensa de DPO usa medium; las puertas, large-v3")
+    ap.add_argument("--rapido", action="store_true", help="sin fonemas (PER) ni perfil vocal")
     a = ap.parse_args()
     lote = json.loads(Path(a.lote).read_text(encoding="utf-8"))
     sal = Path(a.salida)
@@ -145,7 +150,7 @@ def main():
     print(f"[juez] {len(lote)} clips, {len(pendientes)} pendientes, en {a.dispositivo}", flush=True)
     if not pendientes:
         return 0
-    j = Jueces(a.dispositivo, a.hilos, a.sonidos)
+    j = Jueces(a.dispositivo, a.hilos, a.sonidos, a.whisper, a.rapido)
     centros = {}
     if a.identidades:
         for d in sorted(Path(a.identidades).iterdir()):

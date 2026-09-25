@@ -29,8 +29,10 @@ VENTANA_TEXTO = 5
 VENTANA_VOZ = 6
 
 
-def disposicion(n_texto, n_voz):
-    """Orden de las posiciones del objetivo en el tts_lm: lista de ('t', k) y ('v', j)."""
+def disposicion(n_texto, n_voz, cortar=False):
+    """Orden de las posiciones del objetivo en el tts_lm: lista de ('t', k) y ('v', j). Con cortar=True, un
+    audio que se acaba antes que el texto no se descarta: es lo que pasa al generar cuando el clasificador de
+    fin salta antes de tiempo (un corte), y la secuencia es justo el prefijo que vio generate()."""
     orden, k, j = [], 0, 0
     while k < n_texto or j < n_voz:
         if k < n_texto:
@@ -44,7 +46,7 @@ def disposicion(n_texto, n_voz):
             orden.append(("v", j))
             j += 1
         if j >= n_voz and k < n_texto:
-            return None            # el audio se acaba antes que el texto: ejemplo raro, se descarta
+            return orden if cortar else None   # audio mas corto que el texto: raro en audio real, se descarta
     return orden
 
 
@@ -76,7 +78,7 @@ def latentes(modelo, x, dispositivo, muestrear=True):
         return ((z + m.speech_bias_factor) * m.speech_scaling_factor)[0, :n].float()
 
 
-def estados(modelo, tok, ej):
+def estados(modelo, tok, ej, cortar=False):
     """Las dos ramas forzadas de un ejemplo: (lat [T,64], cond [T,896], cond_neg [T,896], h, idx), o None.
     Son las mismas operaciones que validó la puerta 0; las usan pasada() y la destilacion de la guia."""
     m = modelo.model
@@ -84,7 +86,7 @@ def estados(modelo, tok, ej):
     ref_ids = tok.encode(ej["ref_txt"], add_special_tokens=False)
     txt_ids = tok.encode(ej["txt"].strip() + "\n", add_special_tokens=False)
     lat_ref, lat = ej["ref_lat"].to(d), ej["lat"].to(d)
-    orden = disposicion(len(txt_ids), lat.shape[0])
+    orden = disposicion(len(txt_ids), lat.shape[0], cortar)
     if orden is None:
         return None
     # 1. lm sobre [texto de referencia ; texto a decir], de corrido (causal, igual que su cache)
