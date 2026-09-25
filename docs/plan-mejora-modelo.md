@@ -31,6 +31,7 @@ Restricciones que manda el proyecto y que este plan respeta:
 | Guía destilada | No pasa (identidad −0,04 en dos corridas); código apagado como posible modo rápido | [guía](bancos/2026-09-23-guia-destilada.md) |
 | Decodificador destilado | No pasa: el mismo WER, pero UTMOS 3,34 → 1,24 e identidad 0,82 → 0,44 (alumno a mitad de canales, desde cero, sin discriminador). Si se retoma: quitar bloques de la etapa 0 partiendo del maestro | [decodificador](bancos/2026-09-25-decodificador-destilado.md) |
 | QC con whisper medium | No mejora (WER 0,311 frente a 0,225 de small, identidad −0,06): se queda small | [decodificador](bancos/2026-09-25-decodificador-destilado.md) |
+| Preferencias (Diffusion-DPO) | **No pasa, cerrada en D3**: hay varianza entre semillas (D0: 70 % de grupos con par útil), pero el LoRA memoriza los pares (acierto 0,97) y en lectores nuevos se queda en el azar (0,45-0,62). En la puerta (large-v3, 378 clips) los tramos con WER > 0,15 siguen en 2,65 %; lo demás, igual. El reintento de dobla sigue siendo la palanca. 2,74 USD | [dpo](bancos/2026-09-25-dpo-preferencias.md) |
 
 Gasto en GPU: 9,74 USD de un tope de 20 (F7 2,74; guía destilada ~1,8; F8 ~2,25; decodificador destilado y juez del QC 1,35).
 
