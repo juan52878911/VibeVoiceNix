@@ -1,5 +1,5 @@
 {
- "_nota": "Textos para DPO (plan de preferencias, 24-09). dificil: numeros, siglas, nombres propios, frases largas, preguntas y habla conversacional como la de dobla; en es y en las cifras se escriben con digitos porque el generador pasa el texto por normalizar_para_motor, como voz-stream. qc: tramos de dobla que fallaron el QC (WER > 0,15 o reintento), solo el texto. La parte de la puerta se elige por hash del texto (dpo_generar.parte_de).",
+ "_nota": "Textos para DPO (plan de preferencias, 24-09). dificil: numeros, siglas, nombres propios, frases largas, preguntas y habla conversacional como la de dobla; en es y en las cifras se escriben con digitos porque el generador pasa el texto por normalizar_para_motor, como voz-stream. qc: tramos de dobla que fallaron el QC (WER > 0,15 o reintento), solo el texto. La parte de la puerta se elige por hash del texto (dpo_generar.parte_de). En fr, de, it y pt no hay cifras ni cantidades: el normalizador del juez solo cubre es y en, y whisper escribe '2,5kg' donde el modelo dijo 'dois quilos e meio' (D0, 25-09).",
  "dificil": {
   "en": [
    "The meeting moved from 3:30 PM to 11:15 AM on March 8th, so please update your calendar.",
@@ -56,44 +56,44 @@
    "Y ahí fue cuando dije, bueno, si nadie lo va a hacer, pues lo hago yo, y así empezó todo."
   ],
   "fr": [
-   "La réunion a été déplacée de quinze heures trente à onze heures quinze, le huit mars.",
    "Est-ce que tu as déjà envoyé la facture, ou est-ce que je demande à Ségolène de le faire avant vendredi ?",
    "Le professeur Nakamura et la docteure Oyelaran ont présenté leurs résultats à Reykjavik puis à Wrocław.",
    "Quand la tempête est enfin passée, les villageois sont descendus à la rivière, ont compté les bateaux abîmés et ont commencé à réparer le vieux pont de bois.",
    "Franchement, ce n'est pas que le cours soit mauvais, c'est qu'il ne te prépare pas vraiment à ce que les entreprises demandent aujourd'hui.",
-   "Pourquoi quelqu'un choisirait-il l'option la moins chère si la garantie ne dure que quatre-vingt-dix jours ?",
-   "Le colis pèse deux kilos et demi et coûte dix-huit euros pour l'envoyer à Montréal.",
-   "Alors voilà, j'ai commencé comme développeur débutant, puis je suis passé aux données, et maintenant j'aide surtout les équipes avec le cloud."
+   "Alors voilà, j'ai commencé comme développeur débutant, puis je suis passé aux données, et maintenant j'aide surtout les équipes avec le cloud.",
+   "Tu te souviens de ce restaurant près de la gare, celui où Anne-Laure avait oublié son parapluie ?",
+   "Il faut vraiment que l'équipe comprenne pourquoi on change d'outil, sinon personne ne va l'utiliser.",
+   "Les chercheurs de Grenoble et de Louvain-la-Neuve ont travaillé ensemble pendant plusieurs années."
   ],
   "de": [
-   "Das Treffen wurde von halb vier auf Viertel nach elf am achten März verschoben.",
    "Hast du die Rechnung schon verschickt, oder soll ich Gudrun bitten, das vor Freitag zu erledigen?",
    "Professor Nakamura und Doktor Oyelaran stellten ihre Ergebnisse in Reykjavík und später in Breslau vor.",
    "Als der Sturm endlich vorüber war, gingen die Dorfbewohner zum Fluss hinunter, zählten die beschädigten Boote und begannen, die alte Holzbrücke zu reparieren.",
    "Ehrlich gesagt ist der Kurs nicht schlecht, er bereitet einen nur nicht wirklich auf das vor, was die Firmen heute verlangen.",
-   "Warum sollte jemand die billigere Variante wählen, wenn die Garantie nur neunzig Tage gilt?",
-   "Das Paket wiegt zweieinhalb Kilo und der Versand nach Zürich kostet achtzehn Euro.",
-   "Also, ich habe als Junior-Entwickler angefangen, bin dann in den Datenbereich gewechselt und helfe jetzt vor allem Teams mit ihrer Cloud."
+   "Also, ich habe als Junior-Entwickler angefangen, bin dann in den Datenbereich gewechselt und helfe jetzt vor allem Teams mit ihrer Cloud.",
+   "Erinnerst du dich an das Restaurant am Bahnhof, wo Hans-Jürgen seinen Regenschirm vergessen hat?",
+   "Das Team muss wirklich verstehen, warum wir das Werkzeug wechseln, sonst benutzt es niemand.",
+   "Die Forscher aus Göttingen und Innsbruck haben mehrere Jahre lang zusammengearbeitet."
   ],
   "it": [
-   "La riunione è stata spostata dalle quindici e trenta alle undici e un quarto dell'otto marzo.",
    "Hai già mandato la fattura, o chiedo a Gianfranco di farlo prima di venerdì?",
    "Il professor Nakamura e la dottoressa Oyelaran hanno presentato i risultati a Reykjavík e poi a Breslavia.",
    "Quando la tempesta finalmente passò, gli abitanti scesero al fiume, contarono le barche danneggiate e cominciarono a riparare il vecchio ponte di legno.",
    "Sinceramente, non è che il corso sia fatto male, è che non ti prepara davvero a quello che le aziende chiedono oggi.",
-   "Perché qualcuno dovrebbe scegliere l'opzione più economica se la garanzia dura solo novanta giorni?",
-   "Il pacco pesa due chili e mezzo e spedirlo a Buenos Aires costa diciotto euro.",
-   "Allora, ho cominciato come sviluppatore junior, poi sono passato ai dati, e adesso aiuto soprattutto i team con il cloud."
+   "Allora, ho cominciato come sviluppatore junior, poi sono passato ai dati, e adesso aiuto soprattutto i team con il cloud.",
+   "Ti ricordi quel ristorante vicino alla stazione, quello dove Gianluigi aveva dimenticato l'ombrello?",
+   "Il gruppo deve capire davvero perché cambiamo strumento, altrimenti nessuno lo userà.",
+   "I ricercatori di Bressanone e di Castellammare hanno lavorato insieme per diversi anni."
   ],
   "pt": [
-   "A reunião foi transferida das quinze e trinta para as onze e quinze do dia oito de março.",
    "Você já mandou a fatura, ou eu peço para o Joaquim fazer isso antes de sexta-feira?",
    "O professor Nakamura e a doutora Oyelaran apresentaram os resultados em Reykjavík e depois em Breslávia.",
    "Quando a tempestade finalmente passou, os moradores desceram até o rio, contaram os barcos danificados e começaram a consertar a velha ponte de madeira.",
    "Sinceramente, não é que o curso seja ruim, é que ele não te prepara de verdade para o que as empresas pedem hoje.",
-   "Por que alguém escolheria a opção mais barata se a garantia dura só noventa dias?",
-   "O pacote pesa dois quilos e meio e custa dezoito reais para enviar a Florianópolis.",
-   "Então, eu comecei como desenvolvedor júnior, depois fui para a área de dados, e agora ajudo principalmente as equipes com a nuvem."
+   "Então, eu comecei como desenvolvedor júnior, depois fui para a área de dados, e agora ajudo principalmente as equipes com a nuvem.",
+   "Você lembra daquele restaurante perto da estação, onde a Conceição esqueceu o guarda-chuva?",
+   "A equipe precisa entender de verdade por que estamos mudando de ferramenta, senão ninguém vai usar.",
+   "Os pesquisadores de Guaratinguetá e de Vila Nova de Gaia trabalharam juntos durante vários anos."
   ]
  },
  "qc": {

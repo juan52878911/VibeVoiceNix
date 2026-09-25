@@ -9,7 +9,7 @@ Grupo = misma voz y mismo texto, semillas distintas. Por muestra:
   ecapa   contra los audios REALES del lector;  utmos
   dur     duracion con los silencios de los bordes recortados, frente a la esperada: silabas del texto a la
           velocidad del propio lector (silabas por segundo de sus clips reales)
-  catastrofe: WER > 0,5, corte (duracion < 0,6 de la esperada) o repeticion (> 1,6, o el tope de fotogramas)
+  catastrofe: WER > 0,5, corte (duracion < 0,6 de la esperada y WER > 0,15) o repeticion (> 1,6, o el tope de fotogramas)
 Recompensa: -1,0 wer + 1,0 ecapa + 0,5 utmos - penalizacion de duracion (lo que sale de [0,8; 1,25]),
 restada la media del grupo y dividida por su desviacion. Par (ganador, perdedor) con recompensa mayor y
 margen: WER >= 0,05 mejor (sin perder ECAPA >= 0,03), ECAPA >= 0,03 mejor (sin perder WER > 0,02) o el
@@ -48,6 +48,17 @@ def dur_util(ruta):
     return len(y) / hz
 
 
+def ruta(carpeta, r):
+    """Las rutas de lote y hablantes.json son absolutas de la maquina que genero: se reubican en la carpeta."""
+    r = Path(r)
+    if r.exists():
+        return r
+    for ancla in ("identidades", "wav", "hablantes"):
+        if ancla in r.parts:
+            return carpeta / Path(*r.parts[r.parts.index(ancla):])
+    return carpeta / r
+
+
 def ic(v, n=4000):
     r = random.Random(0)
     b = sorted(sum(r.choices(v, k=len(v))) / len(v) for _ in range(n))
@@ -55,7 +66,8 @@ def ic(v, n=4000):
 
 
 def catastrofe(m):
-    return m["wer"] > 0.5 or m["razon"] < 0.6 or m["razon"] > 1.6 or m["tope"]
+    # un corte pierde palabras: rapido pero completo (razon < 0,6 con WER 0 en D0) no es un corte
+    return m["wer"] > 0.5 or (m["razon"] < 0.6 and m["wer"] > 0.15) or m["razon"] > 1.6 or m["tope"]
 
 
 def util(w, l):
@@ -81,7 +93,7 @@ def medir(carpeta, medidas="medidas.json"):
     velocidad = {}
     for ident, h in hablantes.items():
         sil = sum(silabas(r["texto"]) for r in h["reales"])
-        velocidad[ident] = sil / sum(dur_util(carpeta / r["audio"]) for r in h["reales"])
+        velocidad[ident] = sil / sum(dur_util(ruta(carpeta, r["audio"])) for r in h["reales"])
     import torch
     grupos = defaultdict(list)
     for c in lote:
@@ -93,7 +105,7 @@ def medir(carpeta, medidas="medidas.json"):
         mu = {"clave": c["clave"], "grupo": c["grupo"], "tipo": c["tipo"], "idioma": c["idioma"],
               "identidad": c["identidad"], "texto": c["texto"], "oido": m.get("oido"),
               "wer": m.get("wer_norm", m["wer"]), "ecapa": m.get("ecapa"), "utmos": m["utmos"],
-              "dur": round(dur_util(c["audio"]), 3), "T": int(lat["lat"].shape[0]), "tope": bool(lat["tope"])}
+              "dur": round(dur_util(ruta(carpeta, c["audio"])), 3), "T": int(lat["lat"].shape[0]), "tope": bool(lat["tope"])}
         mu["razon"] = round(mu["dur"] / esperada, 3)
         mu["pen_dur"] = round(max(0.0, 0.8 - mu["razon"]) + max(0.0, mu["razon"] - 1.25), 3)
         mu["catastrofe"] = catastrofe(mu)
