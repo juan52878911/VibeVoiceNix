@@ -72,10 +72,11 @@ def util(w, l):
     return None
 
 
-def main():
-    carpeta = Path(sys.argv[1])
+def medir(carpeta, medidas="medidas.json"):
+    """Por muestra de una carpeta de dpo_generar ya juzgada: WER, ECAPA, UTMOS, duracion, catastrofe y
+    recompensa sin normalizar. Devuelve {grupo: [muestra]}."""
     lote = [c for f in sorted(carpeta.glob("lote.*.json")) for c in json.loads(f.read_text())]
-    medidas = json.loads((carpeta / "medidas.json").read_text())
+    medidas = json.loads((carpeta / medidas).read_text())
     hablantes = json.loads((carpeta / "hablantes.json").read_text())
     velocidad = {}
     for ident, h in hablantes.items():
@@ -99,6 +100,12 @@ def main():
         mu["r"] = (PESOS["wer"] * mu["wer"] + PESOS["ecapa"] * (mu["ecapa"] or 0.0)
                    + PESOS["utmos"] * mu["utmos"] + PESOS["dur"] * mu["pen_dur"])
         grupos[c["grupo"]].append(mu)
+    return grupos
+
+
+def main():
+    carpeta = Path(sys.argv[1])
+    grupos = medir(carpeta)
     pares, muestras = [], []
     por_grupo = {}
     for g, ms in grupos.items():
