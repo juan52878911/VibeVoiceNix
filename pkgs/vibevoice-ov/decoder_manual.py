@@ -120,13 +120,13 @@ class SubidaTr(nn.Module):
         #
         # El estado conserva sus k-1 entradas aunque solo se lea la ultima: asi
         # las formas del IR y las fotos de estado de motor.py no cambian.
-        T = x.shape[2]
+        B, T = x.shape[0], x.shape[2]           # B = 1 en produccion; >1 al entrenar un alumno
         c_sal = self.w.shape[1]
         h = full[:, :, -(T + 1):].transpose(1, 2)                   # [1, T+1, C_in]
         m = self.matriz()                                           # [C_out*k, C_in]
-        z = F.linear(h, m).reshape(1, T + 1, c_sal, self.k)
+        z = F.linear(h, m).reshape(B, T + 1, c_sal, self.k)
         y = z[:, 1:, :, : self.s] + z[:, :-1, :, self.s:]           # [1, T, C_out, s]
-        y = y.permute(0, 2, 1, 3).reshape(1, c_sal, T * self.s)
+        y = y.permute(0, 2, 1, 3).reshape(B, c_sal, T * self.s)
         return y + self.b[None, :, None], nuevo
 
 

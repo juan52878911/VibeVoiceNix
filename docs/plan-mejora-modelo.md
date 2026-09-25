@@ -29,8 +29,10 @@ Restricciones que manda el proyecto y que este plan respeta:
 | F7 LoRA multilingüe | **No pasa, cerrada tras 3 corridas**: bucle validado (puertas 0 y 1), pero generando el WER no baja (base 4,4 %) y la identidad cae −0,008 a −0,012. Efecto consistente: las voces españolas en inglés suenan más nativas (UTMOS +0,2-0,5, PER −0,02-0,05) a costa de identidad; F4 lo hace mejor | [f7](bancos/2026-09-23-f7-lora.md) |
 | **F8 LoRA por voz** | **Pasa** (Carlos, 10,8 min mezclados con lectura, al 75 % de fuerza): identidad +0,049, estilo −0,21 desviaciones suyas, UTMOS +0,08, WER igual; sobrevive a int4; con 5 min también. Falta llevarlo a producción (IR por voz) y validarlo con otra persona | [f8](bancos/2026-09-24-f8-lora-por-voz.md) |
 | Guía destilada | No pasa (identidad −0,04 en dos corridas); código apagado como posible modo rápido | [guía](bancos/2026-09-23-guia-destilada.md) |
+| Decodificador destilado | No pasa: el mismo WER, pero UTMOS 3,34 → 1,24 e identidad 0,82 → 0,44 (alumno a mitad de canales, desde cero, sin discriminador). Si se retoma: quitar bloques de la etapa 0 partiendo del maestro | [decodificador](bancos/2026-09-25-decodificador-destilado.md) |
+| QC con whisper medium | No mejora (WER 0,311 frente a 0,225 de small, identidad −0,06): se queda small | [decodificador](bancos/2026-09-25-decodificador-destilado.md) |
 
-Gasto en GPU: 8,32 USD de un tope de 20 (F7 2,74; guía destilada ~1,8; F8 ~2,25).
+Gasto en GPU: 9,74 USD de un tope de 20 (F7 2,74; guía destilada ~1,8; F8 ~2,25; decodificador destilado y juez del QC 1,35).
 
 Probado en dobla (rama `mejoras-modelo`): normalizador, repetir la referencia corta, reintento por QC
 y acento nativo por conversión, sin regresión en el caso de 4 voces (WER 0,316 → 0,306). La demo de
