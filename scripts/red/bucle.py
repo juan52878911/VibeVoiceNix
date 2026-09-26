@@ -39,7 +39,8 @@ class Generador:
         base = copy.deepcopy(base)
         if neg_tts_lm is not None:
             base["neg_tts_lm"] = neg_tts_lm
-        self.ids = torch.tensor([ids_texto], dtype=torch.long)
+        self.d = next(modelo.parameters()).device      # cpu o cuda; lo que se registra vuelve siempre a cpu
+        self.ids = torch.tensor([ids_texto], dtype=torch.long, device=self.d)
         self.c_lm, self.c_tts = _cache_viva(base["lm"].past_key_values), _cache_viva(base["tts_lm"].past_key_values)
         self.c_neg_lm, self.c_neg = _cache_viva(base["neg_lm"].past_key_values), _cache_viva(base["neg_tts_lm"].past_key_values)
         self.h_tts = base["tts_lm"].last_hidden_state.float()
@@ -84,8 +85,8 @@ class Generador:
 
     def _lm(self, ids):
         S = ids.shape[1]
-        pos = torch.arange(self.L_lm, self.L_lm + S)[None]
-        out = self.m.forward_lm(input_ids=ids, attention_mask=torch.ones(1, self.L_lm + S, dtype=torch.long),
+        pos = torch.arange(self.L_lm, self.L_lm + S, device=self.d)[None]
+        out = self.m.forward_lm(input_ids=ids, attention_mask=torch.ones(1, self.L_lm + S, dtype=torch.long, device=self.d),
                                 position_ids=pos, cache_position=pos[0], past_key_values=self.c_lm, use_cache=True, return_dict=True)
         self.c_lm = out.past_key_values
         self.L_lm += S
@@ -94,13 +95,13 @@ class Generador:
     def _tts(self, emb, tipo_texto, negativo=False):
         S = emb.shape[1]
         L = self.L_neg if negativo else self.L_tts
-        pos = torch.arange(L, L + S)[None]
+        pos = torch.arange(L, L + S, device=self.d)[None]
         self._res = []
         self._en_negativo = negativo
-        out = self.m.forward_tts_lm(input_ids=torch.full((1, S), IMAGE_PAD, dtype=torch.long),
-                                    attention_mask=torch.ones(1, L + S, dtype=torch.long), position_ids=pos, cache_position=pos[0],
+        out = self.m.forward_tts_lm(input_ids=torch.full((1, S), IMAGE_PAD, dtype=torch.long, device=self.d),
+                                    attention_mask=torch.ones(1, L + S, dtype=torch.long, device=self.d), position_ids=pos, cache_position=pos[0],
                                     past_key_values=self.c_neg if negativo else self.c_tts, use_cache=True, return_dict=True,
-                                    lm_last_hidden_state=emb, tts_text_masks=torch.full((1, 1), int(tipo_texto), dtype=torch.long),
+                                    lm_last_hidden_state=emb, tts_text_masks=torch.full((1, 1), int(tipo_texto), dtype=torch.long, device=self.d),
                                     output_attentions=self.atenciones and not negativo)
         if negativo:
             self.c_neg, self.L_neg, self.h_neg = out.past_key_values, L + S, out.last_hidden_state
@@ -133,13 +134,14 @@ class Generador:
             cond, neg = self.al_condicion(cond, neg, self.fotograma)
         lat = self.m.sample_speech_tokens(cond, neg, cfg_scale=self.cfg).unsqueeze(1)
         z = lat / m.speech_scaling_factor - m.speech_bias_factor
-        trozo = m.acoustic_tokenizer.decode(z, cache=self.acustica, sample_indices=torch.LongTensor([0]), use_cache=True)
-        self.audio.append(trozo[0].detach().clone())
+        trozo = m.acoustic_tokenizer.decode(z, cache=self.acustica, sample_indices=torch.tensor([0], device=self.d), use_cache=True)
+        self.audio.append(trozo[0].detach().cpu().clone())
         if self.registrar:
-            self.reg.append(dict(cond=cond[0].detach().clone(), neg=neg[0].detach().clone(), lat=lat[0, 0].detach().clone(),
-                                 ventana=self.ventana - 1,
-                                 res=torch.stack(self._ultimas_res) if self.residuales and self._ultimas_res else None,
-                                 att=self._resumen_atencion() if self.atenciones else None))
+            att = self._resumen_atencion() if self.atenciones else None
+            self.reg.append(dict(cond=cond[0].detach().cpu().clone(), neg=neg[0].detach().cpu().clone(),
+                                 lat=lat[0, 0].detach().cpu().clone(), ventana=self.ventana - 1,
+                                 res=torch.stack(self._ultimas_res).cpu() if self.residuales and self._ultimas_res else None,
+                                 att=att.cpu() if att is not None else None))
         emb = m.acoustic_connector(lat)
         out = self._tts(emb, 0)
         self._tts(emb, 0, negativo=True)
@@ -162,7 +164,7 @@ class Generador:
         filas = []
         detalle = self.atenciones == "detalle"
         if detalle:
-            tipos = torch.tensor(self._tipos_gen[:-1] if self._tipos_gen else [], dtype=torch.long)
+            tipos = torch.tensor(self._tipos_gen[:-1] if self._tipos_gen else [], dtype=torch.long, device=self.d)
         for a in self._ultimas_att:            # [1, cabezas, 1, L]
             w = a[0, :, -1, :]
             if detalle:

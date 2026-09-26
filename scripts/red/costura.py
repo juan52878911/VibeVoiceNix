@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--margen", type=float, default=2.0)
     ap.add_argument("--corpus", default=f"{AQUI.parent / 'corpus_mejora.json'},{AQUI / 'corpus_duraciones.json'}")
     ap.add_argument("--hilos", type=int, default=4)
+    ap.add_argument("--dispositivo", default="cpu", help="cuda: whisper en float16 y UTMOS en la GPU (como juez_lote.py)")
     a = ap.parse_args()
     import torch
     from faster_whisper import WhisperModel
@@ -86,8 +87,9 @@ def main():
     carpeta = Path(a.carpeta)
     t0 = a.desde * HOP / HZ
     v0, v1 = t0 - a.margen, t0 + a.margen
-    whisper = WhisperModel("large-v3", device="cpu", compute_type="int8", cpu_threads=a.hilos)
-    utmos = torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).eval()
+    gpu = a.dispositivo.startswith("cuda")
+    whisper = WhisperModel("large-v3", device="cuda" if gpu else "cpu", compute_type="float16" if gpu else "int8", cpu_threads=a.hilos)
+    utmos = torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).to(a.dispositivo).eval()
     med = {}
     for w in sorted(carpeta.glob("*.wav")):
         p = partes(w.stem)
@@ -112,7 +114,7 @@ def main():
             import librosa
             seg16 = librosa.resample(x[a0:a1], orig_sr=hz, target_sr=16000)
             with torch.inference_mode():
-                u = round(float(utmos(torch.from_numpy(seg16)[None], 16000).item()), 3)
+                u = round(float(utmos(torch.from_numpy(seg16)[None].to(a.dispositivo), 16000).item()), 3)
         med[w.stem] = dict(p, palabras_ventana=tot, errores_ventana=err, wer_ventana=(err / tot if tot else None),
                            utmos_ventana=u, dur=round(len(x) / hz, 2))
         print(w.stem, med[w.stem]["wer_ventana"], u, flush=True)

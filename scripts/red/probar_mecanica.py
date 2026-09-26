@@ -77,13 +77,15 @@ def main():
     def parar():
         vueltas["n"] += 1
         return vueltas["n"] > 2          # dos vueltas del bucle externo = 12 fotogramas
+    dv = next(m.parameters()).device
     with torch.no_grad():
-        sal = m.generate(input_ids=torch.full((1, L_lm), MO.IMAGE_PAD), attention_mask=torch.ones(1, L_lm, dtype=torch.long),
-                         tts_lm_input_ids=torch.full((1, L_tts), MO.IMAGE_PAD), tts_lm_attention_mask=torch.ones(1, L_tts, dtype=torch.long),
-                         tts_text_ids=torch.tensor([ids]), all_prefilled_outputs=copy.deepcopy(base), tokenizer=tok,
+        sal = m.generate(input_ids=torch.full((1, L_lm), MO.IMAGE_PAD, device=dv), attention_mask=torch.ones(1, L_lm, dtype=torch.long, device=dv),
+                         tts_lm_input_ids=torch.full((1, L_tts), MO.IMAGE_PAD, device=dv),
+                         tts_lm_attention_mask=torch.ones(1, L_tts, dtype=torch.long, device=dv),
+                         tts_text_ids=torch.tensor([ids], device=dv), all_prefilled_outputs=copy.deepcopy(base), tokenizer=tok,
                          cfg_scale=3.0, generation_config={"do_sample": False}, max_new_tokens=None, return_speech=True,
                          show_progress_bar=False, stop_check_fn=parar)
-    suyo = sal.speech_outputs[0].flatten()
+    suyo = sal.speech_outputs[0].flatten().cpu()
     resultados["paridad"] = igual(mio, suyo, K * FR) and suyo.shape[0] >= K * FR
     print(f"paridad: {resultados['paridad']} (mio {mio.shape[0]} muestras, generate {suyo.shape[0]}; {time.time() - t:.0f} s)", flush=True)
 
@@ -103,7 +105,7 @@ def main():
           f"prefijo comun {igual(B, A, 6 * FR)}, continuacion distinta {not igual(B[6 * FR:], A[6 * FR:])})", flush=True)
 
     # 3. dirigir
-    d = torch.randn(896)
+    d = torch.randn(896).to(dv)   # del generador de CPU, como antes: el mismo d en cpu y en cuda
     d = d / d.norm()
 
     def suma(lam, ambas):

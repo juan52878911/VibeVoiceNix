@@ -91,7 +91,7 @@ def main():
     sal = Path(a.salida)
     sal.mkdir(parents=True, exist_ok=True)
     m, tok = MO.cargar(a.modelo, aleatorio=a.aleatorio)
-    d = torch.tensor(np.load(a.direcciones)[a.clave], dtype=torch.float32)
+    d = torch.tensor(np.load(a.direcciones)[a.clave], dtype=torch.float32, device=next(m.parameters()).device)
     sitio = a.clave.split("/")[0]
     corpus = json.loads(Path(a.corpus).read_text())
     medidas = json.loads((sal / "medidas.json").read_text()) if (sal / "medidas.json").exists() else {}

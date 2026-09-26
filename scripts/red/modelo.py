@@ -22,6 +22,20 @@ CAPAS_TTS = 20
 # Escala y sesgo con que la cabeza ve los latentes en el 0.5B (docs/clonado-de-voz.md §4.1).
 ESCALA_05B, SESGO_05B = 0.2334, -0.0703
 IMAGE_PAD = 151655
+# Dispositivo de la sintesis: cpu por defecto (el Mac y los spot); RED_DISPOSITIVO=cuda en la g4dn. Siempre fp32:
+# fp16 en GPU es otro audio (docs/ec2-y-coste.md §4). El ruido de la difusion sale del generador de CPU
+# (sample_speech_tokens hace randn en CPU y lo mueve), asi que la semilla da el mismo ruido en los dos.
+DISPOSITIVO = os.environ.get("RED_DISPOSITIVO", "cpu")
+
+
+def _cuda_determinista():
+    """fp32 de verdad y repetible en GPU: sin TF32 y con algoritmos deterministas (la puerta es pareada)."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 class TokFalso:
@@ -43,7 +57,10 @@ class TokFalso:
         return torch.randint(1000, 100000, (n,), generator=g).tolist()
 
 
-def cargar(ruta=None, aleatorio=False, atencion="sdpa", dtype=torch.float32):
+def cargar(ruta=None, aleatorio=False, atencion="sdpa", dtype=torch.float32, dispositivo=None):
+    dispositivo = dispositivo or DISPOSITIVO
+    if dispositivo.startswith("cuda"):
+        _cuda_determinista()
     from vibevoice.modular.modeling_vibevoice_streaming_inference import (
         VibeVoiceStreamingForConditionalGenerationInference as M)
     if aleatorio:
@@ -53,7 +70,7 @@ def cargar(ruta=None, aleatorio=False, atencion="sdpa", dtype=torch.float32):
                                        diffusion_head_config=dict(hidden_size=896, head_layers=4, latent_size=64))
         cfg._attn_implementation = atencion
         torch.manual_seed(0)
-        m = M(cfg).eval()
+        m = M(cfg).eval().to(dispositivo)
         m.model.speech_scaling_factor.fill_(ESCALA_05B)
         m.model.speech_bias_factor.fill_(SESGO_05B)
         m.set_ddpm_inference_steps(6)
@@ -61,7 +78,7 @@ def cargar(ruta=None, aleatorio=False, atencion="sdpa", dtype=torch.float32):
     from vibevoice.processor.vibevoice_streaming_processor import VibeVoiceStreamingProcessor
     ruta = os.path.expanduser(ruta)
     proc = VibeVoiceStreamingProcessor.from_pretrained(ruta)
-    m = M.from_pretrained(ruta, dtype=dtype, device_map="cpu", attn_implementation=atencion).eval()
+    m = M.from_pretrained(ruta, dtype=dtype, device_map=dispositivo, attn_implementation=atencion).eval()
     m.model.tts_language_model.embed_tokens = m.model.language_model.embed_tokens
     m.set_ddpm_inference_steps(6)
     return m, proc.tokenizer
@@ -69,7 +86,7 @@ def cargar(ruta=None, aleatorio=False, atencion="sdpa", dtype=torch.float32):
 
 def prefijo(ruta):
     """El .pt de una voz: dict lm / tts_lm / neg_lm / neg_tts_lm con BaseModelOutputWithPast (KV en bf16)."""
-    return torch.load(os.path.expanduser(ruta), map_location="cpu", weights_only=False)
+    return torch.load(os.path.expanduser(ruta), map_location=DISPOSITIVO, weights_only=False)
 
 
 def copia(base):

@@ -21,13 +21,18 @@ AMI="${AMI:-ami-012ba162b9cd2729c}"    # Deep Learning OSS Nvidia Driver AMI GPU
 CLAVE=mejora-modelo
 LLAVE="$HOME/.ssh/$CLAVE.pem"
 SG_NOMBRE=mejora-modelo-ssh
-LIBRO="$HOME/Documents/mejora-modelo/aws_gasto.json"
+LIBRO="${LIBRO:-$HOME/Documents/mejora-modelo/aws_gasto.json}"   # otro con LIBRO=... (ver abajo)
 tarifa() {   # USD/h bajo demanda en us-east-1, consultadas en la API de precios el 22-09-2026
   case "$1" in g4dn.xlarge) echo 0.526;; g4dn.2xlarge) echo 0.752;; g6.xlarge) echo 0.8048;;
                g5.xlarge) echo 1.006;; *) echo "";; esac; }
 A=(aws --region "$REGION")
-mkdir -p "$(dirname "$LIBRO")"
-[[ -f "$LIBRO" ]] || echo '{"tandas": []}' > "$LIBRO"
+# Sin libro no hay tope: ~/Documents/mejora-modelo es un enlace a un disco externo y, si no esta montado, un
+# libro vacio haria creer que no se ha gastado nada. Se para; con LIBRO=<otro> se sigue, y ese libro tiene que
+# llevar el gasto de antes (una tanda de arrastre) hasta fusionarlo con el de siempre.
+if [[ ! -f "$LIBRO" ]]; then
+  echo "[gpu] NO: no encuentro el libro de gasto $LIBRO (¿disco externo sin montar?). Pasa LIBRO=<ruta> con el gasto acumulado." >&2
+  exit 4
+fi
 
 gastado() { python3 -c "import json;print(round(sum(t['usd'] for t in json.load(open('$LIBRO'))['tandas']),3))"; }
 viva() { "${A[@]}" ec2 describe-instances --filters "Name=tag:proyecto,Values=mejora-modelo" \
