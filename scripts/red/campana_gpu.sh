@@ -74,10 +74,13 @@ FIN_PY
 )
   paso "mejor capa para f0_st por frase apartada: $CAPA"
   local DIRS="$R/sondas/direcciones.npz"
+  # dos colas a la vez: la GPU no pasa del 25 % con una (manda el Python), y el tope de horas aprieta
+  barrido f0_ambas_desde40 --direcciones "$DIRS" --clave condicion/f0_st --rama ambas --desde 40 --corpus "$DUR" --grupos largas &
+  local LARGA=$!
   barrido f0_ambas --direcciones "$DIRS" --clave condicion/f0_st --rama ambas --grupos es
   barrido f0_pos --direcciones "$DIRS" --clave condicion/f0_st --rama pos --grupos es
   barrido "${CAPA}_f0_ambas" --direcciones "$DIRS" --clave "$CAPA/f0_st" --rama ambas --grupos es
-  barrido f0_ambas_desde40 --direcciones "$DIRS" --clave condicion/f0_st --rama ambas --desde 40 --corpus "$DUR" --grupos largas
+  wait $LARGA
   fi
   for v in sp-Spk1_man sp-Spk0_woman carlos liliana; do
     [[ -f "$R/atencion/${v}_detalle.json" ]] && continue
@@ -133,9 +136,10 @@ medida() {
   paso "medida hecha"
 }
 
-sintesis &
-PS=$!
-medida &
-PM=$!
-wait $PS $PM
+# PARTE=sintesis|medida relanza un solo carril (p. ej. la sintesis tras arreglar las sondas, sin duplicar la medida)
+PARTE="${PARTE:-ambas}"
+PIDS=()
+[[ "$PARTE" == medida ]] || { rm -f "$R/.sintesis_hecha"; sintesis & PIDS+=($!); }
+[[ "$PARTE" == sintesis ]] || { medida & PIDS+=($!); }
+wait "${PIDS[@]}"
 paso "campana acabada"

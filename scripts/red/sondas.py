@@ -27,7 +27,8 @@ en 0,98. Con pesos reales hay que usar clips de duraciones distintas y fiarse so
 del reloj (f0_st, energia_db, pausa, pregunta), mirando siempre la fila "posicion".
 
 Por sitio (condicion final, negativa, residual de cada capa) y etiqueta: ridge con la media por clip restada
-(intra-clip, para que la direccion no lleve la voz), R^2 por clip apartado promediado (o exactitud para las binarias).
+(intra-clip, para que la direccion no lleve la voz), R^2 agregado sobre todo lo apartado: 1 - suma SSE / suma SST
+(o exactitud agregada para las binarias). Los clips mas cortos que las columnas de reloj + 4 no entran en las continuas.
 Guarda R^2 por capa y la direccion unitaria de cada (sitio, etiqueta) en <salida>/direcciones.npz, lista para
 dirigir.py.
 
@@ -133,9 +134,12 @@ def main():
             for c in clips:
                 xs, ys = c["sitios"][sitio], c["et"][e]
                 ok = np.isfinite(ys)
-                if ok.sum() < 4:
-                    continue
                 P = posicion(len(ys))[ok]
+                # sin tendencia de reloj, un clip con menos fotogramas que columnas de P (+4) se queda sin senal:
+                # su varianza residual es ~1e-30 y su R2 por clip daba -1e28 (medido en las frases cortas, 27-09)
+                minimo = 4 if (e in binarias or a.con_posicion) else P.shape[1] + 4
+                if ok.sum() < minimo:
+                    continue
                 X = P if xs is None else (xs[ok] - xs[ok].mean(0)).astype(np.float64)
                 if e in binarias:
                     yy = np.where(ys[ok] > 0.5, 1.0, -1.0)
@@ -163,15 +167,23 @@ def main():
                 return w, mx, my
 
             def puntuar(ds, w, mx, my):
+                """(numerador, denominador) por clip apartado: aciertos/fotogramas, o SSE/SST. Se AGREGAN con
+                puntaje(): R2 = 1 - suma SSE / suma SST sobre todo lo apartado (el promedio de R2 por clip se
+                hundia con un solo clip de varianza casi nula)."""
                 out = []
                 for d in ds:
                     p_ = (d["X"] - mx) @ w + my
                     if e in binarias:
-                        out.append(float((np.sign(p_) == d["y"]).mean()))
+                        out.append((float((np.sign(p_) == d["y"]).sum()), float(len(p_))))
                     else:
-                        ss = ((d["y"] - d["y"].mean()) ** 2).sum()
-                        out.append(1 - ((d["y"] - p_) ** 2).sum() / ss if ss > 0 else 0.0)
+                        out.append((float(((d["y"] - p_) ** 2).sum()), float(((d["y"] - d["y"].mean()) ** 2).sum())))
                 return out
+
+            def puntaje(pts):
+                num, den = sum(x[0] for x in pts), sum(x[1] for x in pts)
+                if den <= 0:
+                    return None
+                return num / den if e in binarias else 1 - num / den
 
             def elegir_k(grupos):
                 """k por validacion INTERNA: 5 trozos de los grupos de entrenamiento (nunca ve el grupo apartado)."""
@@ -189,8 +201,9 @@ def main():
                         if resto["n"] < 20:
                             continue
                         pts += puntuar(ds, *ajustar(**resto, k=k))
-                    if pts and np.mean(pts) > mejor_p:
-                        mejor, mejor_p = k, float(np.mean(pts))
+                    sc = puntaje(pts) if pts else None
+                    if sc is not None and sc > mejor_p:
+                        mejor, mejor_p = k, sc
                 return mejor
             tot = suma(datos)
             ks_elegidas = []
@@ -208,7 +221,8 @@ def main():
                     if m == modos[0]:
                         ks_elegidas.append(k)
                     puntos += puntuar(ds, *ajustar(**resto, k=k))
-                res[m][sitio][e] = round(float(np.mean(puntos)), 3) if puntos else None
+                sc = puntaje(puntos) if puntos else None
+                res[m][sitio][e] = round(float(sc), 3) if sc is not None else None
             if sitio != "posicion":
                 k = max(set(ks_elegidas), key=ks_elegidas.count) if ks_elegidas else a.ks[0]
                 w, _, _ = ajustar(**tot, k=k)
