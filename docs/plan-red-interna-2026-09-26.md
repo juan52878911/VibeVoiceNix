@@ -27,6 +27,11 @@ Las tres preguntas de Juan, con la respuesta corta:
 
 ---
 
+**Estado (26-09):** herramientas escritas en `scripts/red/` y probadas; lo que se pudo medir sin los pesos (los 25
+prefijos como estados internos: la identidad tiene forma de U por capa, mínima en las 9-11; el sexo es lineal y
+generaliza) y lo que queda para el Mac está en
+[bancos/2026-09-26-red-interna-entorno.md](bancos/2026-09-26-red-interna-entorno.md).
+
 ## 1. La familia VibeVoice, vista desde este proyecto
 
 | | Realtime-0.5B (producción) | VibeVoice-1.5B | VibeVoice-ASR (7B) y ASR-BitNet | AcousticTokenizer |
