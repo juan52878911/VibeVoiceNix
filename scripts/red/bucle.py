@@ -53,9 +53,7 @@ class Generador:
         self.audio, self.reg = [], []
         self._res = []
         self._tipos_gen = []              # tipo (1 texto, 0 latente) de cada posicion generada en la rama positiva
-        if residuales:
-            for capa in self.m.model.tts_language_model.layers:
-                capa.register_forward_hook(self._guardar_residual)
+        self._ganchos = []                # los enganches de residuales viven SOLO mientras corre correr()
 
     @staticmethod
     def h_lm_len(base):
@@ -176,11 +174,35 @@ class Generador:
                 filas.append(torch.stack([w[:, :N].sum(-1), w[:, N:N + M].sum(-1), w[:, N + M:].sum(-1)], -1))
         return torch.stack(filas)              # [capas, cabezas, 3 o 5]
 
+    def _enganchar(self):
+        """Registra los enganches de residuales y devuelve una funcion que los quita.
+
+        Antes se registraban en __init__ y no se quitaban nunca: cada Generador nuevo sumaba 20 enganches que
+        mantenian vivos a todos los anteriores (caches KV, audio, registro con residuales). instrumentar.py se
+        ralentizaba de 15 a 30 s por clip y murio por memoria (SIGKILL) al clip 95 (medido, 27-09).
+        """
+        if self.residuales and not self._ganchos:
+            self._ganchos = [capa.register_forward_hook(self._guardar_residual)
+                             for capa in self.m.model.tts_language_model.layers]
+
+    def _desenganchar(self):
+        for h in self._ganchos:
+            h.remove()
+        self._ganchos = []
+
     @torch.no_grad()
     def correr(self, max_fotogramas=600, parar_en=None):
         """Genera hasta el fin (o `parar_en` fotogramas). Devuelve la onda [muestras]."""
-        self.L_tts_prefijo = self.L_tts
-        self.L_tts_prefijo_latentes = self.L_tts - self.L_lm
+        self._enganchar()
+        try:
+            return self._correr(max_fotogramas, parar_en)
+        finally:
+            self._desenganchar()
+
+    def _correr(self, max_fotogramas, parar_en):
+        if not hasattr(self, "L_tts_prefijo"):          # el prefijo es el de la PRIMERA llamada (bifurcar llama varias veces)
+            self.L_tts_prefijo = self.L_tts
+            self.L_tts_prefijo_latentes = self.L_tts - self.L_lm
         while self.fotograma < max_fotogramas:
             if parar_en is not None and self.fotograma >= parar_en:
                 break

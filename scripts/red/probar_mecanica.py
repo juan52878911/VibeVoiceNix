@@ -129,8 +129,11 @@ def main():
     reg = gr.reg
     ok_reg = (len(reg) == K and reg[0]["cond"].shape == (896,) and reg[0]["res"].shape == (MO.CAPAS_TTS, 896)
               and reg[0]["lat"].shape == (64,) and all(0 <= x["p_fin"] <= 1 for x in reg))
-    resultados["registro"] = ok_reg and igual(r, mio)
-    print(f"registro: {resultados['registro']} ({len(reg)} fotogramas, residual {tuple(reg[0]['res'].shape)})", flush=True)
+    # los enganches de residuales se quitan al acabar correr(): antes se acumulaban y instrumentar.py murio por memoria
+    ganchos = sum(len(c._forward_hooks) for c in m.model.tts_language_model.layers)
+    resultados["registro"] = ok_reg and igual(r, mio) and ganchos == 0
+    print(f"registro: {resultados['registro']} ({len(reg)} fotogramas, residual {tuple(reg[0]['res'].shape)}, "
+          f"enganches vivos al acabar {ganchos})", flush=True)
     lat = torch.stack([x["lat"] for x in reg])
     neg = PN.construir(m, tok, lat)
     _, n = gen(neg_tts_lm=neg)
