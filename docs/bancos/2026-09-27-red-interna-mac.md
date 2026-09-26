@@ -8,7 +8,7 @@ Segunda parte del [plan de la red por dentro](../plan-red-interna-2026-09-26.md)
 > **Estado (26-09, noche UTC): campaña completa, terminada en una g4dn.** Empezó en el Mac y siguió en AWS con los
 > datos en el prefijo `red-interna/` del bucket de dobla. **I1 pasa** (el tono, la energía y la pausa inminente se
 > leen con R² 0,32-0,69 por frase apartada). **I2 no pasa** en el conjunto: con λ ≤ 0,2 solo Carlos, en la capa 16,
-> mueve el tono y pasa la puerta (+0,16 st, casi inaudible). La
+> mueve el tono y pasa la puerta (+0,16 st, casi inaudible). La costura del mando en vivo pasa con λ ≤ 0,1. La
 > sorpresa no predice el WER. La atención separa cabezas de identidad, un alineador de texto y cabezas que se miran
 > a sí mismas. La sección de puertas se escribió y se subió ANTES de ver ningún resultado de la campaña.
 
@@ -216,7 +216,19 @@ semillas = 24 parejas por λ. Tono = mediana de F0 en semitonos frente a la base
 ### Mando en tiempo real, `--desde 40` (M)
 
 Tono en la condición, ambas ramas, desde el fotograma 40 (5,3 s) sobre las 4 frases largas: +0,05 st
-[−0,05, +0,15] con λ = 0,2. No se mueve. Costura: PENDIENTE_COSTURA
+[−0,05, +0,15] con λ = 0,2. No se mueve, pero la calidad se conserva (ECAPA −0,001, UTMOS −0,019 de IC inferior,
+WER igual).
+
+**Costura** (`costura.py`, ventana de ±2 s alrededor del fotograma 40, 24 parejas):
+
+| λ | WER de la ventana (IC 95 %) | UTMOS de la ventana (IC 95 %) | Rotos | Veredicto |
+|---|---|---|---|---|
+| 0,05 | −0,38 pts [−1,14, +0,00] | +0,004 [−0,006, +0,015] | 0 | pasa |
+| 0,1 | −0,68 pts [−1,73, +0,00] | +0,002 [−0,006, +0,011] | 0 | pasa |
+| 0,2 | −0,68 pts [−1,73, +0,00] | −0,014 [−0,048, +0,014] | 0 | no: UTMOS |
+
+Cambiar el mando en mitad de una locución no deja cicatriz con λ ≤ 0,1. El mecanismo del tiempo real está
+listo; lo que falta es una dirección que mueva algo.
 
 ### Sorpresa frente al WER (M): **no sirve para ordenar re-tiradas**
 
