@@ -155,6 +155,10 @@ objetivo **emocional** sale justo el par que se busca.
 
 ### 3.3 E2 · Direcciones de emoción sobre la condición (sin pesos, tiempo real, 0 en RTF)
 
+Cómo encontrar estas direcciones sin corpus de emociones, sondeando la red capa a capa, y qué otros
+mandos salen de mirar dentro (rama negativa, arranque, énfasis por ficha, caché bifurcada): [plan de
+la red por dentro](plan-red-interna-2026-09-26.md).
+
 **Idea.** Para cada emoción E, la dirección `d_E` = media sobre pares de (condición del fotograma
 emocional − condición del fotograma neutro del mismo actor y frase), normalizada. Al generar:
 
