@@ -205,6 +205,73 @@ Obsidian.
 
 ---
 
+## 10. La campaña de la red en spot (26-09-2026)
+
+Tres guiones en [`scripts/red/`](../scripts/red/) para correr las herramientas de la red por dentro (torch en
+CPU, sin OpenVINO) en una máquina spot, reanudables ante una interrupción:
+
+| Guion | Qué hace |
+|---|---|
+| `spot_ec2.sh lanzar [tipo] [horas]` · `ip` · `subir` · `credenciales` · `gasto` · `terminar` | calcado de `gpu_ec2.sh`: solicitud spot de una sola vez (terminate al interrumpir), Ubuntu 22.04 de Canonical, zona más barata del momento, apagado a las N horas, mismo tope y libro de gasto con la tarifa spot leída al lanzar. `credenciales` deja en la máquina credenciales temporales de STS (caducan solas), nunca las del Mac |
+| `spot_entorno.sh` (dentro) | el `uv.lock` de `pkgs/vibevoice` (torch 2.13.0+cpu, transformers 4.57.6, VibeVoice al commit fijado) más los jueces de CPU; modelo, codificador comunitario y prefijos oficiales; voces y patrón desde S3 con la ruta en variables de entorno; f32 estricto en cada proceso (`sitecustomize`) comprobado con un matmul contra f64; y `probar_mecanica.py --modelo` con las ocho pruebas |
+| `campana.sh` (dentro) | instrumentar → sondas → dirigir → jueces (`juez_lote.py` y `puerta_dirigir.py`, con costura en los barridos `--desde`), con los parámetros y puertas de [la campaña del Mac](bancos/2026-09-27-red-interna-mac.md). Al arrancar baja el trabajo de S3 y borra lo truncado; sube cada 2 min, al acabar cada paso y con el SIGTERM del aviso de spot |
+
+**Tanda corta (M):** solo paridad, porque la campaña la midió la otra sesión en el Mac. Fueron dos máquinas: la
+primera se terminó a propósito después de instrumentar, y la segunda reanudó desde S3.
+
+| | Máquina 1 | Máquina 2 |
+|---|---|---|
+| Tipo | c8a.2xlarge, AMD EPYC 9R45, 8 núcleos (1 hilo por núcleo), AVX-512 y AVX512_BF16 sin AMX | igual |
+| Zona y tarifa spot | us-east-1a, 0,2068 $/h (la subred por defecto cayó en la zona cara; desde entonces se elige la más barata) | us-east-1f, 0,1406 $/h |
+| Minutos y USD | 15,9 min, 0,075 USD | 17,9 min, 0,062 USD |
+| Entorno montado y probado | 238 s, de ellos 145 s de `probar_mecanica` | 248 s (y 141 s al repetirlo con el arreglo de 821e7a8) |
+| Mecánica con los pesos reales | 8/8 | 8/8, con 0 enganches vivos al acabar |
+| Interrupciones | ninguna de AWS; terminada a mano tras subir el clip | ninguna; reanudó sin rehacer el clip y corrió la paridad |
+
+Total: **0,137 USD** para las dos máquinas, cada una con 0,02 USD fijos de disco y S3. La reanudación también
+se probó con un `.npz` truncado en S3: se detecta al arrancar y el clip se rehace.
+
+**RTF de torch fp32 en la c8a.2xlarge (M), 8 hilos:**
+
+| Clip | RTF |
+|---|---|
+| Con el registro de residuales de `instrumentar.py`, en caliente | **1,8-2,0** (10 s de reloj para 5,1-5,3 s de audio; 14 s para 7,9 s) |
+| El mismo clip, primero del proceso, en frío | 3,5 |
+| Sin residuales, en caliente | 1,7 (9 s para 5,2 s) |
+
+Es la misma escala que los 235 ms por fotograma de la máquina de 4 vCPU del
+[banco sin modelo](bancos/2026-09-26-red-interna-entorno.md). Con estos números, la campaña completa (4 voces
+× 20 frases × 2 semillas en instrumentar, cinco barridos de dirigir) son unas 2-3 h de c8a.2xlarge en spot:
+**≈ 0,3-0,6 USD (E)**, jueces aparte.
+
+**La paridad con el clip del Mac no pasa, y no es bf16 (M).** El clip de `sp-Spk1_man`, `es0`, semilla 11 sale
+con la misma longitud que el del Mac (124 800 muestras, 39 fotogramas), pero a 20,2 dB de SNR (diferencia
+máxima 0,20). Para separar la causa se regeneró en la máquina 2:
+
+| Variante en la máquina 2 | Frente a la máquina 1 | Frente al Mac |
+|---|---|---|
+| f32, 8 hilos | **md5 idéntico** | 20,2 dB |
+| `ONEDNN_DEFAULT_FPMATH_MODE=BF16` y sin forzar f32 | **md5 idéntico** | 20,2 dB |
+| f32, 4 hilos | 23,6 dB | 16,5 dB |
+
+- **torch en CPU no pasa a bf16 por su cuenta** en Zen 5, ni forzando el modo bf16 de oneDNN. La trampa del §4
+  es de OpenVINO. El matmul f32 da un error relativo de 3,6·10⁻⁷ frente a f64.
+- **La diferencia es el orden de las sumas**, amplificado porque el latente vuelve al LM (§5). Cambiar solo el
+  número de hilos en la misma máquina separa el audio tanto como pasar del Mac a x86.
+- **La puerta entre máquinas es la del §5:** que la máquina sea consistente consigo misma y que
+  `probar_mecanica.py` pase allí. Las dos cosas se cumplen: las dos c8a dan el mismo md5 y la paridad de
+  `probar_mecanica` es muestra a muestra. «md5 o SNR > 60 dB frente al Mac» no se puede cumplir entre ISAs.
+- **Consecuencia para cualquier campaña:** λ = 0 y λ > 0 tienen que salir de la misma máquina **y con el mismo
+  número de hilos**. Si no, la diferencia pareada mezcla el mando con la numérica.
+
+**El libro de gasto** vive en `~/Documents/mejora-modelo`, un enlace a un disco externo que el 26-09 no estaba
+montado. `spot_ec2.sh` se niega a arrancar sin libro, porque uno vacío haría creer que no se ha gastado nada.
+Con `LIBRO=<ruta>` se usa otro, que tiene que llevar el gasto previo como una tanda de arrastre. Las dos tandas
+de hoy están en un libro provisional con el arrastre de 12,48 USD, y hay que fusionarlas con el de siempre
+cuando se monte el disco.
+
+---
+
 ## Documentos relacionados
 
 | Documento | Qué añade |
