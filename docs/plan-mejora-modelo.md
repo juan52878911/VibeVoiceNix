@@ -34,6 +34,8 @@ Restricciones que manda el proyecto y que este plan respeta:
 
 Gasto en GPU: 9,74 USD de un tope de 20 (F7 2,74; guía destilada ~1,8; F8 ~2,25; decodificador destilado y juez del QC 1,35).
 
+Siguiente plan, de lectura (26-09): [emoción e intención controlables al generar y en tiempo real](plan-emocion-intencion-2026-09-26.md).
+
 Probado en dobla (rama `mejoras-modelo`): normalizador, repetir la referencia corta, reintento por QC
 y acento nativo por conversión, sin regresión en el caso de 4 voces (WER 0,316 → 0,306). La demo de
 una charla de 91 s a 5 idiomas con acento nativo costó ~0,11 USD en Batch spot (0,014 USD por minuto
