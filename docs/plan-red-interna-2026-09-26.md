@@ -32,6 +32,13 @@ prefijos como estados internos: la identidad tiene forma de U por capa, mínima 
 generaliza) y lo que queda para el Mac está en
 [bancos/2026-09-26-red-interna-entorno.md](bancos/2026-09-26-red-interna-entorno.md).
 
+**Estado (26-09, noche UTC):** campaña con pesos reales hecha (Mac y g4dn, 1,30 USD), en
+[bancos/2026-09-27-red-interna-mac.md](bancos/2026-09-27-red-interna-mac.md). **I1 pasa:** tono, energía y pausa
+inminente se leen con R² 0,32-0,69 por frase apartada, sobre todo en las capas 11-19. **I2 no pasa** en el
+conjunto con λ ≤ 0,2: solo Carlos, en la capa 16, pasa con +0,16 st. La sorpresa no predice el WER. La atención
+separa cabezas de identidad (18-19), el alineador de texto (11.x y 8.1) y cabezas que se miran a sí mismas. Lo
+siguiente: λ 0,5-1,0 en la capa 16 y en las 11-14, y parchear.
+
 ## 1. La familia VibeVoice, vista desde este proyecto
 
 | | Realtime-0.5B (producción) | VibeVoice-1.5B | VibeVoice-ASR (7B) y ASR-BitNet | AcousticTokenizer |
