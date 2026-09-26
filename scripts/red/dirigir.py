@@ -94,7 +94,7 @@ def main():
     d = torch.tensor(np.load(a.direcciones)[a.clave], dtype=torch.float32)
     sitio = a.clave.split("/")[0]
     corpus = json.loads(Path(a.corpus).read_text())
-    medidas = {}
+    medidas = json.loads((sal / "medidas.json").read_text()) if (sal / "medidas.json").exists() else {}
     try:
         import perfil_vocal as PV
         import soundfile as sf
@@ -108,6 +108,9 @@ def main():
                     for lam in (float(x) for x in a.lambdas.split(",")):
                         nombre = f"{voz}__{g}{k}__s{s}__l{lam:g}{'q' if a.quitar else ''}"
                         if (sal / f"{nombre}.wav").exists():
+                            if PV is not None and nombre not in medidas:      # reanudar: el perfil de lo ya generado
+                                x, hz = sf.read(str(sal / f"{nombre}.wav"), dtype="float32")
+                                medidas[nombre] = PV.perfil(x, hz, texto)
                             continue
                         torch.manual_seed(s)
                         gen = Generador(m, base, MO.fichas(texto, tok), cfg_scale=a.cfg,
@@ -121,6 +124,7 @@ def main():
                             x, hz = sf.read(str(sal / f"{nombre}.wav"), dtype="float32")
                             medidas[nombre] = PV.perfil(x, hz, texto)
                         print(nombre, f"{onda.shape[0] / 24000:.1f} s", flush=True)
+                        json.dump(medidas, open(sal / "medidas.json", "w"), indent=1)
     json.dump(medidas, open(sal / "medidas.json", "w"), indent=1)
 
 

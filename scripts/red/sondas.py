@@ -27,9 +27,19 @@ en 0,98. Con pesos reales hay que usar clips de duraciones distintas y fiarse so
 del reloj (f0_st, energia_db, pausa, pregunta), mirando siempre la fila "posicion".
 
 Por sitio (condicion final, negativa, residual de cada capa) y etiqueta: ridge con la media por clip restada
-(intra-clip, para que la direccion no lleve la voz), validacion dejando un CLIP fuera, R^2 (o exactitud para
-las binarias). Guarda R^2 por capa y la direccion unitaria de cada (sitio, etiqueta) en <salida>/direcciones.npz,
-lista para dirigir.py.
+(intra-clip, para que la direccion no lleve la voz), R^2 por clip apartado promediado (o exactitud para las binarias).
+Guarda R^2 por capa y la direccion unitaria de cada (sitio, etiqueta) en <salida>/direcciones.npz, lista para
+dirigir.py.
+
+PLIEGUES (--pliegues, 27-09): 'texto' aparta TODOS los clips de una frase (todas las voces y semillas) y es el que
+decide la puerta; 'voz' aparta una voz entera; 'clip' aparta un clip (lo del ensayo en seco). Con 'clip' la misma
+frase dicha con otra semilla o por otra voz queda en el entrenamiento y su contorno es casi el mismo: la sonda puede
+aprenderse la frase en vez de leer la prosodia. El ajuste es ridge en forma cerrada con las matrices de Gram
+acumuladas por pliegue (igual que sklearn Ridge con intercepto; 160 clips x 22 sitios en minutos, no en horas).
+ALFA RELATIVA (27-09): la varianza por dimension de la condicion es ~250 veces la de los residuales, asi que un alfa
+fijo regulariza mucho un sitio y nada el otro (la condicion daba R^2 negativo por sobreajuste con alfa 10). Aqui
+alfa = k * traza(G)/D con k elegido DENTRO de cada pliegue externo por 5 trozos internos; la direccion final usa
+el k mas elegido en los pliegues por texto.
 """
 import argparse
 import json
@@ -84,11 +94,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inst", required=True)
     ap.add_argument("--salida", required=True)
-    ap.add_argument("--alfa", type=float, default=10.0)
+    ap.add_argument("--ks", default="0.01,0.1,1,10,100", help="alfa = k * traza(G)/D; k elegido por validacion interna")
     ap.add_argument("--con-posicion", action="store_true", help="no quitar la tendencia con la posicion")
+    ap.add_argument("--pliegues", default="texto,voz", help="texto (decide la puerta), voz, clip (lento)")
     a = ap.parse_args()
+    a.ks = [float(x) for x in a.ks.split(",")]
     import soundfile as sf
-    from sklearn.linear_model import Ridge, RidgeClassifier
     sal = Path(a.salida)
     sal.mkdir(parents=True, exist_ok=True)
     clips = []
@@ -102,59 +113,116 @@ def main():
         if d["res"].size:
             for c in range(d["res"].shape[1]):
                 sitios[f"capa{c:02d}"] = d["res"][:, c].astype(np.float32)
-        clips.append(dict(nombre=f.stem, sitios=sitios, et=et))
+        clips.append(dict(nombre=f.stem, sitios=sitios, et=et, texto=str(d["texto"]), voz=str(d["voz"])))
     print(f"{len(clips)} clips, {sum(c['et']['pausa'].shape[0] for c in clips)} fotogramas")
     nombres_sitios = ["posicion"] + list(clips[0]["sitios"])
     for c in clips:
         c["sitios"]["posicion"] = None
     etiq = list(clips[0]["et"])
     binarias = {"pausa", "pregunta"}
-    res, direcciones = {}, {}
+    modos = a.pliegues.split(",")
+    grupo_de = dict(clip=lambda c: c["nombre"], texto=lambda c: c["texto"], voz=lambda c: c["voz"])
+    res = {m: {} for m in modos}
+    direcciones, alfas = {}, {}
     for sitio in nombres_sitios:
-        res[sitio] = {}
+        for m in modos:
+            res[m][sitio] = {}
         for e in etiq:
-            X, y, g = [], [], []
-            for i, c in enumerate(clips):
+            # por clip: X intra-clip, y (sin tendencia de posicion) o y en {-1, 1} para las binarias
+            datos = []
+            for c in clips:
                 xs, ys = c["sitios"][sitio], c["et"][e]
                 ok = np.isfinite(ys)
                 if ok.sum() < 4:
                     continue
                 P = posicion(len(ys))[ok]
-                xs = P if xs is None else xs[ok] - xs[ok].mean(0)   # intra-clip: fuera la voz y el texto medio
-                yy = ys[ok] if e in binarias else ys[ok] - ys[ok].mean()
-                if e not in binarias and not a.con_posicion:
-                    yy = yy - P @ np.linalg.lstsq(P, yy, rcond=None)[0]
-                X.append(xs); y.append(yy); g.append(np.full(ok.sum(), i))
-            if not X:
-                continue
-            X, y, g = np.concatenate(X), np.concatenate(y), np.concatenate(g)
-            if e in binarias and len(np.unique(y)) < 2:
-                continue
-            puntos = []
-            for k in np.unique(g):
-                tr, te = g != k, g == k
+                X = P if xs is None else (xs[ok] - xs[ok].mean(0)).astype(np.float64)
                 if e in binarias:
-                    if len(np.unique(y[tr])) < 2 or te.sum() == 0:
-                        continue
-                    clf = RidgeClassifier(alpha=a.alfa).fit(X[tr], y[tr])
-                    puntos.append((clf.predict(X[te]) == y[te]).mean())
+                    yy = np.where(ys[ok] > 0.5, 1.0, -1.0)
                 else:
-                    rg = Ridge(alpha=a.alfa).fit(X[tr], y[tr])
-                    p = rg.predict(X[te])
-                    ss = ((y[te] - y[te].mean()) ** 2).sum()
-                    puntos.append(1 - ((y[te] - p) ** 2).sum() / ss if ss > 0 else 0.0)
-            if sitio != "posicion":
-                modelo = (RidgeClassifier if e in binarias else Ridge)(alpha=a.alfa).fit(X, y)
-                w = np.ravel(modelo.coef_)
-                direcciones[f"{sitio}/{e}"] = w / (np.linalg.norm(w) + 1e-9)
-            res[sitio][e] = round(float(np.mean(puntos)), 3) if puntos else None
-    json.dump(res, open(sal / "r2_por_sitio.json", "w"), indent=1)
-    np.savez(sal / "direcciones.npz", **direcciones)
-    print("R2 (exactitud en pausa/pregunta), deja-un-clip-fuera:")
-    print("sitio      " + " ".join(f"{e[:10]:>10}" for e in etiq))
-    for s in nombres_sitios:
-        print(f"{s:10} " + " ".join(f"{res[s].get(e, float('nan')) if res[s].get(e) is not None else float('nan'):10.3f}" for e in etiq))
+                    yy = ys[ok] - ys[ok].mean()
+                    if not a.con_posicion:
+                        yy = yy - P @ np.linalg.lstsq(P, yy, rcond=None)[0]
+                datos.append(dict(c=c, X=X, y=yy, G=X.T @ X, b=X.T @ yy, sx=X.sum(0), sy=yy.sum(), n=len(yy)))
+            if not datos:
+                continue
+            if e in binarias and len(np.unique(np.concatenate([d["y"] for d in datos]))) < 2:
+                continue
+            D = datos[0]["X"].shape[1]
+            CLAVES = ("G", "b", "sx", "sy", "n")
 
+            def suma(ds):
+                return {k: sum(d[k] for d in ds) for k in CLAVES}
+
+            def ajustar(G, b, sx, sy, n, k):
+                mx, my = sx / n, sy / n
+                Gc = G - n * np.outer(mx, mx)
+                bc = b - n * mx * my
+                alfa = k * np.trace(Gc) / D                   # alfa relativa a la escala del sitio
+                w = np.linalg.solve(Gc + alfa * np.eye(D), bc)
+                return w, mx, my
+
+            def puntuar(ds, w, mx, my):
+                out = []
+                for d in ds:
+                    p_ = (d["X"] - mx) @ w + my
+                    if e in binarias:
+                        out.append(float((np.sign(p_) == d["y"]).mean()))
+                    else:
+                        ss = ((d["y"] - d["y"].mean()) ** 2).sum()
+                        out.append(1 - ((d["y"] - p_) ** 2).sum() / ss if ss > 0 else 0.0)
+                return out
+
+            def elegir_k(grupos):
+                """k por validacion INTERNA: 5 trozos de los grupos de entrenamiento (nunca ve el grupo apartado)."""
+                claves = sorted(grupos)
+                if len(claves) < 2 or len(a.ks) == 1:
+                    return a.ks[0]
+                trozos = [claves[i::min(5, len(claves))] for i in range(min(5, len(claves)))]
+                tot_i = suma([d for g in claves for d in grupos[g]])
+                mejor, mejor_p = a.ks[0], -np.inf
+                for k in a.ks:
+                    pts = []
+                    for tr in trozos:
+                        ds = [d for g in tr for d in grupos[g]]
+                        resto = {c: tot_i[c] - v for c, v in suma(ds).items()}
+                        if resto["n"] < 20:
+                            continue
+                        pts += puntuar(ds, *ajustar(**resto, k=k))
+                    if pts and np.mean(pts) > mejor_p:
+                        mejor, mejor_p = k, float(np.mean(pts))
+                return mejor
+            tot = suma(datos)
+            ks_elegidas = []
+            for m in modos:
+                por_grupo = {}
+                for d in datos:
+                    por_grupo.setdefault(grupo_de[m](d["c"]), []).append(d)
+                puntos = []
+                for g, ds in por_grupo.items():
+                    resto_g = {h: v for h, v in por_grupo.items() if h != g}
+                    resto = {c: tot[c] - v for c, v in suma(ds).items()}
+                    if resto["n"] < 20:
+                        continue
+                    k = elegir_k(resto_g)
+                    if m == modos[0]:
+                        ks_elegidas.append(k)
+                    puntos += puntuar(ds, *ajustar(**resto, k=k))
+                res[m][sitio][e] = round(float(np.mean(puntos)), 3) if puntos else None
+            if sitio != "posicion":
+                k = max(set(ks_elegidas), key=ks_elegidas.count) if ks_elegidas else a.ks[0]
+                w, _, _ = ajustar(**tot, k=k)
+                direcciones[f"{sitio}/{e}"] = (w / (np.linalg.norm(w) + 1e-12)).astype(np.float32)
+                alfas[f"{sitio}/{e}"] = k
+        print(f"  {sitio} listo", flush=True)
+    json.dump(dict(pliegues=modos, n_clips=len(clips), ks=a.ks, k_por_direccion=alfas, r2=res), open(sal / "r2_por_sitio.json", "w"), indent=1)
+    np.savez(sal / "direcciones.npz", **direcciones)
+    for m in modos:
+        print(f"\nR2 (exactitud en pausa/pregunta), pliegues por {m}:")
+        print("sitio      " + " ".join(f"{e[:10]:>10}" for e in etiq))
+        for s_ in nombres_sitios:
+            fila = res[m][s_]
+            print(f"{s_:10} " + " ".join(f"{fila[e] if fila.get(e) is not None else float('nan'):10.3f}" for e in etiq))
 
 if __name__ == "__main__":
     main()

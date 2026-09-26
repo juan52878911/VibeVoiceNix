@@ -1,0 +1,15 @@
+{
+ "_": "Frases de duraciones distintas para las sondas de scripts/red (I0/I1): la red codifica la posicion exacta y con clips de la misma duracion la sonda lee el reloj. Se usan ADEMAS de corpus_mejora.json, que no se toca.",
+ "largas": [
+  "Cuando llegamos a la oficina aquella mañana, nadie sabía todavía que el sistema llevaba tres horas caído, que los clientes estaban llamando sin parar y que el equipo de guardia se había quedado sin batería en el teléfono, así que empezamos por lo más sencillo: revisar los registros del servidor uno por uno.",
+  "La nube no es un lugar ni una máquina concreta, sino una forma de repartir el trabajo entre muchos ordenadores que nadie ve, de manera que cuando una empresa guarda sus datos allí, en realidad los está confiando a una red de centros repartidos por el mundo que se coordinan entre sí sin descanso.",
+  "Mi abuela decía que las cosas importantes se cuentan despacio, con todos los detalles y sin prisa, porque quien escucha necesita tiempo para imaginarse la escena; por eso, cada vez que explico un proyecto nuevo, empiezo por el principio, describo el problema y solo al final digo cómo lo resolvimos.",
+  "Después de revisar los números del trimestre, de comparar lo previsto con lo real y de escuchar a cada responsable de área, la conclusión fue la misma que el año pasado: vendemos bien, cobramos tarde, y la caja se resiente justo en los meses en que más falta hace invertir."
+ ],
+ "cortas": [
+  "Sí, claro.",
+  "¿Ahora?",
+  "No lo sé.",
+  "Vale, gracias."
+ ]
+}

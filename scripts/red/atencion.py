@@ -38,23 +38,31 @@ def main():
     ap.add_argument("--semilla", type=int, default=11)
     ap.add_argument("--max-fotogramas", type=int, default=120)
     ap.add_argument("--salida", required=True)
+    ap.add_argument("--detalle", action="store_true", help="partir lo generado en texto leido, latentes propios y posicion actual")
     a = ap.parse_args()
     m, tok = MO.cargar(a.modelo, aleatorio=a.aleatorio, atencion="eager")
     base = MO.prefijo(Path(a.voces) / f"{a.voz}.pt")
     torch.manual_seed(a.semilla)
-    g = Generador(m, base, MO.fichas(a.texto, tok), registrar=True, atenciones=True)
+    g = Generador(m, base, MO.fichas(a.texto, tok), registrar=True, atenciones="detalle" if a.detalle else True)
     g.correr(max_fotogramas=a.max_fotogramas)
-    att = torch.stack([r["att"] for r in g.reg if r["att"] is not None]).mean(0)   # [capas, cabezas, 3]
-    res = dict(voz=a.voz, fotogramas=len(g.reg), regiones=["prefijo_latentes", "prefijo_texto", "generado"],
+    att = torch.stack([r["att"] for r in g.reg if r["att"] is not None]).mean(0)   # [capas, cabezas, 3 o 5]
+    regiones = (["prefijo_latentes", "prefijo_texto", "texto_leido", "latentes_propios", "posicion_actual"] if a.detalle
+                else ["prefijo_latentes", "prefijo_texto", "generado"])
+    res = dict(voz=a.voz, fotogramas=len(g.reg), regiones=regiones,
                por_capa=[[round(float(x), 3) for x in att[c].mean(0)] for c in range(att.shape[0])],
                cabezas_identidad=mejores(att, 0), cabezas_texto=mejores(att, 2))
+    if a.detalle:
+        res.update(cabezas_latentes_propios=mejores(att, 3), cabezas_posicion_actual=mejores(att, 4),
+                   por_cabeza=[[[round(float(x), 3) for x in att[c, h]] for h in range(att.shape[1])] for c in range(att.shape[0])])
     Path(a.salida).parent.mkdir(parents=True, exist_ok=True)
     json.dump(res, open(a.salida, "w"), indent=1)
     print("masa media por capa [prefijo_latentes, prefijo_texto, generado]:")
     for c, fila in enumerate(res["por_capa"]):
         print(f"  capa {c:2d}: {fila}")
     print("cabezas que mas miran el prefijo de voz (capa, cabeza, masa):", res["cabezas_identidad"][:5])
-    print("cabezas que mas miran lo generado:", res["cabezas_texto"][:5])
+    print("cabezas que mas miran " + ("el texto leido:" if a.detalle else "lo generado:"), res["cabezas_texto"][:5])
+    if a.detalle:
+        print("cabezas que mas miran la posicion actual:", res["cabezas_posicion_actual"][:5])
 
 
 if __name__ == "__main__":

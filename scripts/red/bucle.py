@@ -52,6 +52,7 @@ class Generador:
         self._en_negativo = False
         self.audio, self.reg = [], []
         self._res = []
+        self._tipos_gen = []              # tipo (1 texto, 0 latente) de cada posicion generada en la rama positiva
         if residuales:
             for capa in self.m.model.tts_language_model.layers:
                 capa.register_forward_hook(self._guardar_residual)
@@ -107,6 +108,7 @@ class Generador:
             self.c_neg, self.L_neg, self.h_neg = out.past_key_values, L + S, out.last_hidden_state
         else:
             self.c_tts, self.L_tts, self.h_tts = out.past_key_values, L + S, out.last_hidden_state
+            self._tipos_gen += [int(tipo_texto)] * S
             self._ultimas_res = list(self._res)
             self._ultimas_att = out.attentions
         return out
@@ -150,16 +152,29 @@ class Generador:
         return fin
 
     def _resumen_atencion(self):
-        """Masa de atencion de cada cabeza (capa x cabeza) sobre [latentes del prefijo, texto del prefijo, lo generado]."""
+        """Masa de atencion de cada cabeza (capa x cabeza) sobre [latentes del prefijo, texto del prefijo, lo generado].
+
+        Con atenciones="detalle", lo generado se parte en [texto leido, latentes propios anteriores, la posicion
+        actual]: una cabeza con toda la masa en "lo generado" puede estar mirandose a si misma, no leyendo el texto.
+        """
         if not self._ultimas_att:
             return None
         N = self.L_tts_prefijo_latentes
         M = self.L_tts_prefijo - N
         filas = []
+        detalle = self.atenciones == "detalle"
+        if detalle:
+            tipos = torch.tensor(self._tipos_gen[:-1] if self._tipos_gen else [], dtype=torch.long)
         for a in self._ultimas_att:            # [1, cabezas, 1, L]
             w = a[0, :, -1, :]
-            filas.append(torch.stack([w[:, :N].sum(-1), w[:, N:N + M].sum(-1), w[:, N + M:].sum(-1)], -1))
-        return torch.stack(filas)              # [capas, cabezas, 3]
+            if detalle:
+                g = w[:, N + M:-1]
+                t = tipos[: g.shape[1]]
+                filas.append(torch.stack([w[:, :N].sum(-1), w[:, N:N + M].sum(-1), g[:, t == 1].sum(-1), g[:, t == 0].sum(-1),
+                                          w[:, -1]], -1))
+            else:
+                filas.append(torch.stack([w[:, :N].sum(-1), w[:, N:N + M].sum(-1), w[:, N + M:].sum(-1)], -1))
+        return torch.stack(filas)              # [capas, cabezas, 3 o 5]
 
     @torch.no_grad()
     def correr(self, max_fotogramas=600, parar_en=None):
