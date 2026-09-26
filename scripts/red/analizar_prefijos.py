@@ -82,6 +82,10 @@ for n in nombres:
     h = voces[n]['h_lat']; k = len(h) // 3
     ter.append([h[i * k:(i + 1) * k].norm(dim=-1).mean().item() for i in range(3)])
 res['norma_por_tercio_del_prefijo'] = [round(float(v), 1) for v in np.mean(ter, 0)]
-json.dump(res, open(sys.argv[2] if len(sys.argv) > 2 else 'prefijos.json', 'w'), indent=1, ensure_ascii=False)
+salida = sys.argv[2] if len(sys.argv) > 2 else 'prefijos.json'
+json.dump(res, open(salida, 'w'), indent=1, ensure_ascii=False)
+# la direccion global de registro (sexo) en la condicion, lista para dirigir.py --clave condicion/sexo
+w = np.ravel(RidgeClassifier(alpha=10.0).fit(X, ys).coef_)
+np.savez(salida.replace('.json', '') + '_direcciones.npz', **{'condicion/sexo': w / np.linalg.norm(w)})
 print(json.dumps({k: v for k, v in res.items() if k not in ('vecino_mas_cercano',)}, indent=1, ensure_ascii=False))
 print('vecinos:', vec)

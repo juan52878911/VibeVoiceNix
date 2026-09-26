@@ -136,7 +136,7 @@ campaña de sondas aquí: unos 2 s de CPU por segundo de audio.
 | RTF y memoria de cualquier cambio | no es la máquina de producción | VM voz, `banco_rtf_vm.sh` y `/crono` |
 | Direcciones de emoción de pares reales (CREMA-D, guion con consentimiento) | sin datos ni red | Mac + g4dn, plan de emoción §3.2 |
 | El 1.5B como maestro (§5.9) | 5,4 GB en huggingface.co, denegado | g4dn con `scripts/deriva/gen15b.py` |
-| Sexo/tono como dirección global: ¿mueve el tono sin mover la persona? | la dirección existe (§1) pero sin pesos no se puede generar | Mac: `dirigir.py --clave condicion/…` con la dirección de sexo de `analizar_prefijos.py` (falta guardarla: una línea) |
+| Sexo/tono como dirección global: ¿mueve el tono sin mover la persona? | la dirección existe (§1) pero sin pesos no se puede generar | Mac: `dirigir.py --clave condicion/…` con la dirección de sexo que `analizar_prefijos.py` deja en `<salida>_direcciones.npz` (`--clave condicion/sexo`) |
 
 ## 5. Qué cambia en el plan después de esto
 
