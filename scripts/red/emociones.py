@@ -223,6 +223,25 @@ def direcciones(a):
     print("normas de la condicion:", {k: v for k, v in info["norma"].items() if k.startswith("condicion")})
 
 
+def contraste(a):
+    """Direcciones que parten de como lee el modelo, no de un actor neutro. El juez de emocion califica la voz de
+    base del 0.5B como alegre (0,82 medido): sumar tristeza - neutro a una voz que ya suena alegre apenas se nota.
+    <E>_rel = delta(E) - delta(alegria) lleva de alegre a E; CALM = -delta(alegria) quita la alegria."""
+    D = dict(np.load(a.direcciones))
+    nuevos = {}
+    for k in list(D):
+        sitio, emo = k.split("/")
+        if emo != "HAP":
+            continue
+        for e in ("ANG", "SAD", "FEA", "DIS"):
+            if f"{sitio}/{e}" in D:
+                nuevos[f"{sitio}/{e}_rel"] = (D[f"{sitio}/{e}"] - D[k]).astype(np.float32)
+        nuevos[f"{sitio}/CALM"] = (-D[k]).astype(np.float32)
+    D.update(nuevos)
+    np.savez(a.direcciones, **D)
+    print({k: round(float(np.linalg.norm(v)), 2) for k, v in nuevos.items() if k.startswith("condicion/")})
+
+
 # --------------------------------------------------------------------------------------------- generar
 class Mando:
     """Suma nivel * delta en la condicion (enganche de bucle.Generador) o en el residual de una capa."""
@@ -332,7 +351,45 @@ class JuezEmocion:
         return {mapa[l]: round(float(v), 4) for l, v in zip(labs, p)}
 
 
-CLASE = {"ANG": "angry", "HAP": "happy", "SAD": "sad", "FEA": "fearful", "DIS": "disgusted", "NEU": "neutral"}
+CLASE = {"ANG": "angry", "HAP": "happy", "SAD": "sad", "FEA": "fearful", "DIS": "disgusted", "NEU": "neutral", "CALM": "neutral"}
+
+
+class JuezDimensional:
+    """Activacion, dominancia y valencia (0-1) del modelo de audEERING (MSP-Podcast). CC BY-NC-SA: SOLO juez."""
+
+    def __init__(self, dispositivo):
+        import torch.nn as nn
+        from transformers import Wav2Vec2Processor
+        from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model, Wav2Vec2PreTrainedModel
+
+        class Cabeza(nn.Module):
+            def __init__(self, c):
+                super().__init__()
+                self.dense, self.dropout = nn.Linear(c.hidden_size, c.hidden_size), nn.Dropout(c.final_dropout)
+                self.out_proj = nn.Linear(c.hidden_size, c.num_labels)
+
+            def forward(self, x):
+                return self.out_proj(self.dropout(torch.tanh(self.dense(self.dropout(x)))))
+
+        class Modelo(Wav2Vec2PreTrainedModel):
+            def __init__(self, c):
+                super().__init__(c)
+                self.wav2vec2, self.classifier = Wav2Vec2Model(c), Cabeza(c)
+                self.init_weights()
+
+            def forward(self, x):
+                return self.classifier(self.wav2vec2(x)[0].mean(1))
+
+        nombre = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
+        self.proc = Wav2Vec2Processor.from_pretrained(nombre)
+        self.m = Modelo.from_pretrained(nombre).to(dispositivo).eval()
+        self.d = dispositivo
+
+    def __call__(self, x16):
+        v = self.proc(x16, sampling_rate=16000, return_tensors="pt").input_values.to(self.d)
+        with torch.inference_mode():
+            a, d, val = self.m(v)[0].tolist()
+        return dict(activacion=round(a, 4), dominancia=round(d, 4), valencia=round(val, 4))
 
 
 def juzgar(a):
@@ -357,6 +414,7 @@ def juzgar(a):
                                                savedir=str(Path.home() / ".cache/asistente-huellas/ecapa"))
         utmos = torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).to(a.dispositivo).eval()
         emo = JuezEmocion(a.dispositivo)
+        dim = JuezDimensional(a.dispositivo)
         tmp = Path(tempfile.mkdtemp())
         for n, w in enumerate(wavs, 1):
             voz, fr, s, e, nv = w.stem.split("__")
@@ -377,7 +435,7 @@ def juzgar(a):
                                wer=round(JL.wer(normalizar(texto, idioma), normalizar(oido, idioma)), 4),
                                utmos=round(u, 3), huella=[round(float(v), 5) for v in hue / np.linalg.norm(hue)],
                                hz=p.get("hz"), recorrido=p.get("recorrido"), rango_db=p.get("rango_db"),
-                               silabas_s=p.get("silabas_s"), pausas_min=p.get("pausas_min"), emocion_juez=emo(r16))
+                               silabas_s=p.get("silabas_s"), pausas_min=p.get("pausas_min"), emocion_juez=emo(r16), **dim(x16))
             if n % 10 == 0 or n == len(wavs):
                 sal.write_text(json.dumps(med, ensure_ascii=False))
                 print(f"[juez] {n}/{len(wavs)}", flush=True)
@@ -393,12 +451,12 @@ def resumen(carpeta, med):
         if not b or m["nivel"] == 0:
             continue
         f = filas[(m["emocion"], m["nivel"])]
-        clase = CLASE[m["emocion"]]
+        clase = CLASE[m["emocion"].split("_")[0]]
         f["p_emocion"].append(m["emocion_juez"].get(clase, 0.0) - b["emocion_juez"].get(clase, 0.0))
         f["gana"].append(float(max(m["emocion_juez"], key=m["emocion_juez"].get) == clase))
         if m["hz"] and b["hz"]:
             f["tono_st"].append(12 * math.log2(m["hz"] / b["hz"]))
-        for k in ("recorrido", "rango_db", "silabas_s"):
+        for k in ("recorrido", "rango_db", "silabas_s", "activacion", "valencia", "dominancia"):
             if m.get(k) is not None and b.get(k) is not None:
                 f[k].append(m[k] - b[k])
         f["wer"].append(100 * (m["wer"] - b["wer"]))
@@ -407,13 +465,14 @@ def resumen(carpeta, med):
         f["rotos"].append(float(m["wer"] > 0.25 and b["wer"] <= 0.10))
     out = {}
     print(f"{'emocion':8} {'nivel':>5} {'n':>3} {'p(emo) dif':>10} {'gana':>5} {'tono st':>8} {'recorr':>7} {'rango dB':>8} "
-          f"{'sil/s':>6} {'WER pts':>8} {'UTMOS':>7} {'ECAPA':>6} {'rotos':>5}")
+          f"{'sil/s':>6} {'activ':>6} {'valen':>6} {'WER pts':>8} {'UTMOS':>7} {'ECAPA':>6} {'rotos':>5}")
     for (e, nv), f in sorted(filas.items()):
         r = {k: round(float(np.mean(v)), 3) for k, v in f.items() if v}
         r["n"] = len(f["wer"])
         out[f"{e}/{nv:g}"] = r
         print(f"{e:8} {nv:5g} {r['n']:3d} {r.get('p_emocion', 0):+10.3f} {r.get('gana', 0):5.2f} {r.get('tono_st', 0):+8.2f} "
-              f"{r.get('recorrido', 0):+7.2f} {r.get('rango_db', 0):+8.2f} {r.get('silabas_s', 0):+6.2f} {r.get('wer', 0):+8.2f} "
+              f"{r.get('recorrido', 0):+7.2f} {r.get('rango_db', 0):+8.2f} {r.get('silabas_s', 0):+6.2f} "
+              f"{r.get('activacion', 0):+6.3f} {r.get('valencia', 0):+6.3f} {r.get('wer', 0):+8.2f} "
               f"{r.get('utmos', 0):+7.3f} {r.get('ecapa_base', 0):6.3f} {r.get('rotos', 0):5.2f}")
     (carpeta / "resumen.json").write_text(json.dumps(out, indent=1))
 
@@ -447,13 +506,15 @@ def main():
     j = sub.add_parser("juzgar")
     j.add_argument("--carpeta", required=True)
     j.add_argument("--dispositivo", default="cpu")
+    c = sub.add_parser("contraste")
+    c.add_argument("--direcciones", required=True)
     r = sub.add_parser("resumen")
     r.add_argument("--carpeta", required=True)
     a = ap.parse_args()
     if a.orden == "resumen":
         resumen(Path(a.carpeta), json.loads((Path(a.carpeta) / "juez.json").read_text()))
     else:
-        {"extraer": extraer, "direcciones": direcciones, "generar": generar, "juzgar": juzgar}[a.orden](a)
+        {"extraer": extraer, "direcciones": direcciones, "generar": generar, "juzgar": juzgar, "contraste": contraste}[a.orden](a)
 
 
 if __name__ == "__main__":
