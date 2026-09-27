@@ -6,7 +6,9 @@
 #   FASE=piloto  CREMA-D completo -> extraer (91 actores) -> direcciones -> tres formas de sumar la direccion
 #                (condicion rama natural, condicion rama pos, residual de la capa 14) con 2 voces x 2 frases x 5
 #                emociones x varios niveles -> juez (emotion2vec+, whisper large-v3, ECAPA, UTMOS, F0/energia/ritmo)
-#   FASE=final   con NIVELES_<EMO> y SITIO/RAMA elegidos en el piloto: 4 voces x 4 frases x 5 emociones x 5 niveles
+#   FASE=final   con NIVELES='{"HAP": [..], "ANG_rel": [..], ...}' y SITIO/RAMA elegidos en los pilotos:
+#                4 voces x 4 frases x cada emocion con sus niveles (las claves son las de direcciones.npz, con los
+#                contrastes de `emociones.py contraste`)
 #
 # Dos sintesis a la vez (la GPU no pasa del 25 % con una) y el juez DESPUES: juez + dos sintesis no caben en la T4.
 # Sube ~/emo a S3 cada 3 min y al salir; se reanuda relanzando (cada paso se salta lo hecho).
@@ -73,7 +75,7 @@ if [[ "$FASE" == final ]]; then
   paso "final: $SITIO rama $RAMA, niveles $NIVELES"
   printf '%s' "$NIVELES" > "$E/niveles_final.json"
   mitad() {   # mitad <voces...>: cada emocion con sus niveles, en una carpeta comun
-    for emo in ANG HAP SAD FEA DIS; do
+    for emo in $(python -c "import json;print(' '.join(json.load(open('$E/niveles_final.json'))))"); do
       NV=$(python -c "import json;print(','.join(['0'] + [str(x) for x in json.load(open('$E/niveles_final.json'))['$emo']]))")
       local args=(); for v in "$@"; do args+=(--voz "$v"); done
       gen final "${args[@]}" --emociones "$emo" --niveles "$NV" --sitio "$SITIO" --rama "$RAMA"
