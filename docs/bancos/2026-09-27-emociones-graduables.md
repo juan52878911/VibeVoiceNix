@@ -6,11 +6,15 @@ Etiquetas: **(M)** medido, **(E)** estimado, **(S)** supuesto. Código: [`script
 y [`scripts/red/emociones_gpu.sh`](../../scripts/red/emociones_gpu.sh). Audio fuera del repo, en el prefijo `emo/`
 del bucket de dobla.
 
-> **Resultado:** hay emociones graduables por niveles sin tocar pesos ni añadir coste por fotograma. Alegría,
-> enojo, tristeza, asco, miedo y calma se mueven de forma monótona con el nivel, con el WER intacto dentro de su
-> zona segura. Tienen dos límites. El juez categórico de emoción no separa bien las emociones sobre esta voz.
-> Y las emociones que suben la activación (enojo, alegría, miedo) cuestan naturalidad: UTMOS −0,4 a −1,5 en los
-> niveles altos.
+> **Resultado, corregido tras la escucha de Juan (27-09): NO da emociones.** Los números del juez decían que el
+> tono y la activación se movían de forma monótona con el nivel, y es verdad. Pero al oído no se reconoce ninguna
+> emoción. Algunos clips cambian sutilmente, otros suben el tono de forma fea al final de la frase, y la voz pierde
+> su identidad rápido. La medida lo confirma: el efecto **se acumula a lo largo de la locución**, porque lo sumado
+> en el residual de la capa 14 entra en la caché y se arrastra. Diferencia de tono en el nivel 4 frente al neutro,
+> primer tercio frente a último tercio: alegría +3,4 → +5,5 st, miedo +1,6 → +6,1, tristeza −0,9 → −3,4, calma
+> −2,7 → −5,0. Lo que mueve esta vía es el **registro** (más agudo o más grave, que además deriva), no la
+> emoción: ni el contorno, ni el ritmo, ni la calidad de voz. Como mando de emoción queda **cerrada**. Lo que sigue
+> son los números tal como se midieron.
 
 ## Qué cambia frente a los barridos que no movieron nada
 
